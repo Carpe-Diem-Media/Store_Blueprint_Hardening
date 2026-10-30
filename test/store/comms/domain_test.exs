@@ -377,6 +377,103 @@ defmodule Store.Comms.DomainTest do
     assert first.template_kind == :access_ended
   end
 
+  test "caller-proven cancellation evidence avoids mutable plan reads and keeps existing outbox behavior" do
+    customer = SubscriptionsFixtures.create_customer!("jc247_c_proven_email")
+    %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
+
+    plan =
+      SubscriptionsFixtures.create_subscription_plan!(%{
+        name: "Original Membership Name",
+        entitlement_kind: :membership_access,
+        entitlement_scope_key: "membership:original"
+      })
+
+    SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
+
+    %{subscription: subscription} =
+      SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{})
+
+    plan
+    |> Ash.Changeset.for_update(
+      :update,
+      %{
+        name: "Changed Plan",
+        entitlement_kind: :digital_library,
+        entitlement_scope_key: "library:changed"
+      },
+      context: %{system?: true}
+    )
+    |> Ash.update!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+
+    {result, plan_query_count} =
+      capture_subscription_plan_reads(fn ->
+        Store.Comms.enqueue_membership_access_ended_for_system(
+          subscription.id,
+          "canceled_now",
+          membership_access_proven?: true,
+          provider: :swoosh
+        )
+      end)
+
+    assert {:ok, first} = result
+    assert plan_query_count == 0
+    assert first.subscription_id == subscription.id
+    assert first.template_kind == :access_ended
+    assert first.to_email == to_string(customer.email)
+    assert first.subject == "Membership access ended"
+    assert first.provider == :swoosh
+
+    assert first.idempotency_key =~
+             "membership_access_ended:sub:#{subscription.id}:reason:canceled_now:period_end:"
+
+    assert first.template_assigns["subscription_plan_id"] == subscription.subscription_plan_id
+    assert first.template_assigns["reason"] == "canceled_now"
+
+    assert {:ok, second} =
+             Store.Comms.enqueue_membership_access_ended_for_system(
+               subscription.id,
+               "canceled_now",
+               membership_access_proven?: true,
+               provider: :swoosh
+             )
+
+    assert second.id == first.id
+
+    assert_enqueued(
+      worker: DeliverEmailOutboxWorker,
+      args: %{"email_outbox_id" => first.id},
+      queue: "comms"
+    )
+  end
+
+  defp capture_subscription_plan_reads(fun) do
+    counter_key = {__MODULE__, :subscription_plan_reads, make_ref()}
+    handler_id = "comms_plan_read_count_#{System.unique_integer([:positive])}"
+    Process.put(counter_key, 0)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :repo, :query],
+        fn _event, _measurements, metadata, config ->
+          query = Map.get(metadata, :query, "")
+
+          if is_binary(query) and String.contains?(String.downcase(query), "subscription_plans") do
+            Process.put(config.counter_key, Process.get(config.counter_key, 0) + 1)
+          end
+        end,
+        %{counter_key: counter_key}
+      )
+
+    try do
+      result = fun.()
+      {result, Process.get(counter_key, 0)}
+    after
+      :telemetry.detach(handler_id)
+      Process.delete(counter_key)
+    end
+  end
+
   defp create_finalized_order!(user_id) do
     order =
       Order

@@ -3999,7 +3999,8 @@ defmodule Store.Subscriptions.Facade do
        %{
          subscription: canceled,
          effective_mode: effective_mode,
-         inventory_variant_ids: inventory_variant_ids
+         inventory_variant_ids: inventory_variant_ids,
+         cancellation_access: cancellation_access
        }, notifications} ->
         _ = Orders.invalidate_inventory_availability_for_variants(inventory_variant_ids)
 
@@ -4016,7 +4017,7 @@ defmodule Store.Subscriptions.Facade do
 
         case {effective_mode, canceled.status, canceled.canceled_reason} do
           {:now, _status, _reason} ->
-            finalize_immediate_cancellation(canceled, subscription)
+            finalize_immediate_cancellation(canceled, cancellation_access)
 
           {:period_end, :canceled, "canceled_period_end"} ->
             _ = enqueue_scheduled_cancellation_email(canceled)
@@ -4072,21 +4073,43 @@ defmodule Store.Subscriptions.Facade do
   defp reload_authorized_subscription(:admin, actor, subscription_id),
     do: get_subscription_for_admin(actor, subscription_id)
 
-  defp finalize_immediate_cancellation(canceled, subscription) do
-    plan =
-      case fetch_plan(subscription.subscription_plan_id) do
-        {:ok, fetched_plan} -> fetched_plan
-        _ -> nil
-      end
-
-    _ =
-      EntitlementsFacade.revoke_subscription_entitlements_for_system(
-        canceled.id,
-        "canceled_now"
-      )
-
-    _ = maybe_enqueue_membership_access_ended_email(canceled, plan, "canceled_now")
+  defp finalize_immediate_cancellation(
+         %Subscription{},
+         %{access_effect: %{id: effect_id, disposition: :effective}}
+       ) do
+    _ = execute_effective_access_effect_for_system(effect_id)
+    :ok
   end
+
+  defp finalize_immediate_cancellation(
+         %Subscription{} = canceled,
+         %{
+           access_effect: %{id: effect_id, disposition: :non_effective},
+           membership_access_ended_email?: true
+         }
+       ) do
+    case execute_suspension_access_effect_for_system(effect_id) do
+      {:ok, outcome} when outcome in [:applied, :applied_projection_pending] ->
+        _ =
+          Comms.enqueue_membership_access_ended_for_system(
+            canceled.id,
+            "canceled_now",
+            membership_access_proven?: true
+          )
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp finalize_immediate_cancellation(
+         %Subscription{},
+         %{access_effect: %{disposition: :non_effective}}
+       ) do
+    :ok
+  end
+
+  defp finalize_immediate_cancellation(%Subscription{}, _cancellation_access), do: :ok
 
   defp cancel_subscription_in_transaction(subscription, requested_mode, attrs, actor) do
     with :ok <- lock_subscription_aggregate_version(subscription),
@@ -4103,6 +4126,7 @@ defmodule Store.Subscriptions.Facade do
              renewal_attempt,
              payment_application_status
            ),
+         :ok <- ensure_cancel_now_source_state(effective_mode, subscription),
          {:ok, target_attrs} <-
            cancellation_target_attrs(
              effective_mode,
@@ -4129,12 +4153,13 @@ defmodule Store.Subscriptions.Facade do
            maybe_transition_contract_change(current_target, :cancel),
          {:ok, canceled, subscription_notifications} <-
            update_subscription_contract_change(subscription, action, attrs, actor),
-         {:ok, _effect} <-
+         {:ok, cancellation_access} <-
            maybe_establish_immediate_cancellation_access_effect(effective_mode, canceled) do
       {:ok,
        %{
          subscription: canceled,
          effective_mode: effective_mode,
+         cancellation_access: cancellation_access,
          notifications:
            attempt_notifications ++ transition_notifications ++ subscription_notifications,
          inventory_variant_ids:
@@ -7771,15 +7796,43 @@ defmodule Store.Subscriptions.Facade do
   defp datetime_equal?(_, _), do: false
 
   defp maybe_establish_immediate_cancellation_access_effect(:now, %Subscription{} = canceled) do
-    attrs = AccessEffectTargetOrder.immediate_cancellation_establish_attrs(canceled)
-
-    with {:ok, input} <- EstablishAccessEffectInput.new(attrs) do
-      establish_access_effect_for_system(input)
+    with {:ok, funded_revision} <- fetch_plan_revision(canceled.current_plan_revision_id),
+         {:ok, target} <-
+           AccessEffectTargetOrder.derive_cancel_now_target(canceled, funded_revision),
+         attrs <-
+           Map.merge(
+             %{
+               subscription_id: canceled.id,
+               source_version: canceled.aggregate_version
+             },
+             target
+           ),
+         {:ok, input} <- EstablishAccessEffectInput.new(attrs),
+         {:ok, effect} <- establish_access_effect_for_system(input) do
+      {:ok,
+       %{
+         access_effect: %{id: effect.id, disposition: effect.disposition},
+         membership_access_ended_email?: funded_revision.entitlement_kind == :membership_access
+       }}
     end
   end
 
   defp maybe_establish_immediate_cancellation_access_effect(_effective_mode, _canceled),
     do: {:ok, nil}
+
+  defp ensure_cancel_now_source_state(:now, %Subscription{status: status})
+       when status in [:active, :past_due, :suspended],
+       do: :ok
+
+  defp ensure_cancel_now_source_state(:now, %Subscription{}) do
+    {:error,
+     Error.new(
+       "VALIDATION_ERROR",
+       "cancel-now requires an active, past_due, or suspended Subscription"
+     )}
+  end
+
+  defp ensure_cancel_now_source_state(_effective_mode, %Subscription{}), do: :ok
 
   defp terminalize_late_reconciled_cancellation(
          %Subscription{} = previous,

@@ -238,6 +238,9 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
   test "cancel-now establishes current NON_EFFECTIVE target before transaction commit" do
     fixture = create_sandboxed_subscription_fixture!("cancel_effect_atomic")
 
+    assert fixture.revision.access_on_cancel == :remove_immediately
+    assert fixture.subscription.current_plan_revision_id == fixture.revision.id
+
     assert {:ok, canceled} =
              Repo.transaction(fn ->
                assert {:ok, canceled} =
@@ -272,6 +275,9 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
 
   test "cancel-now rolls back when NON_EFFECTIVE AccessEffect establishment fails" do
     fixture = create_sandboxed_subscription_fixture!("cancel_effect_rollback")
+
+    assert fixture.revision.access_on_cancel == :remove_immediately
+    assert fixture.subscription.current_plan_revision_id == fixture.revision.id
 
     {trigger_name, function_name} = fail_cancel_access_effect_insert!()
     before = fetch_subscription!(fixture.subscription_id)
@@ -638,15 +644,25 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
     unique = "#{suffix}_#{Ecto.UUID.generate()}"
     customer = SubscriptionsFixtures.create_customer!("jc245_#{unique}")
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
-    plan = SubscriptionsFixtures.create_subscription_plan!()
+
+    plan =
+      SubscriptionsFixtures.create_subscription_plan!(%{
+        access_on_cancel: :remove_immediately
+      })
+
     SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
 
-    %{subscription: subscription} =
+    %{subscription: subscription, revision: revision} =
       SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
         provider_billing_ref: "pm_jc245_#{unique}"
       })
 
-    %{customer: customer, subscription_id: subscription.id}
+    %{
+      customer: customer,
+      revision: revision,
+      subscription: subscription,
+      subscription_id: subscription.id
+    }
   end
 
   defp cleanup_committed_fixture!(fixture) do
