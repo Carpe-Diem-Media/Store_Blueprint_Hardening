@@ -61,6 +61,7 @@ defmodule Store.Payments.Providers do
   def renewal_collection_request_reference(provider, collection_attempt_id)
       when is_binary(collection_attempt_id) do
     with {:ok, module} <- adapter(provider),
+         true <- Code.ensure_loaded?(module),
          true <- function_exported?(module, :renewal_collection_request_reference, 1) do
       module.renewal_collection_request_reference(collection_attempt_id)
     else
@@ -122,6 +123,7 @@ defmodule Store.Payments.Providers do
           :authoritative_success | :terminal_non_success | :non_terminal | :unknown
   def classify_payment_finality(provider, %ProviderObservation{} = observation) do
     with {:ok, module} <- adapter(provider),
+         true <- Code.ensure_loaded?(module),
          true <- function_exported?(module, :classify_payment_finality, 1) do
       module.classify_payment_finality(observation)
     else
