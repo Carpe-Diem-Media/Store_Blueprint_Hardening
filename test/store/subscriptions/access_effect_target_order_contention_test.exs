@@ -268,12 +268,13 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
 
   defp assert_final_non_effective_target!(fixture) do
     subscription = fetch_subscription!(fixture.subscription.id)
-    effect = latest_effect!(fixture.subscription.id)
+    effect = exact_effect!(subscription.id, subscription.aggregate_version)
 
     assert subscription.status == :canceled
     assert effect.status in ["required", "pending", "failed_retryable"]
     assert effect.disposition == "non_effective"
     assert effect.source_version == subscription.aggregate_version
+    assert effect.source_version > fixture.candidate.source_version
     assert effect.entitlement_kind == nil
     assert effect.entitlement_scope_key == nil
     assert effect.valid_from_at == nil
@@ -281,10 +282,11 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     assert effect.source_order_line_item_id == subscription.source_order_line_item_id
     assert effect.contract_change_id == subscription.current_contract_change_id
     assert effect.plan_revision_id == subscription.current_plan_revision_id
+    assert exact_effect_count!(subscription.id, subscription.aggregate_version) == 1
     assert unresolved_effect_count!(fixture.subscription.id) == 1
   end
 
-  defp latest_effect!(subscription_id) do
+  defp exact_effect!(subscription_id, source_version) do
     %{rows: [row]} =
       Repo.query!(
         """
@@ -292,11 +294,9 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
                entitlement_kind::text, entitlement_scope_key, valid_from_at, valid_until_at,
                source_order_line_item_id::text, contract_change_id::text, plan_revision_id::text
         FROM access_effects
-        WHERE subscription_id = $1
-        ORDER BY source_version DESC
-        LIMIT 1
+        WHERE subscription_id = $1 AND source_version = $2
         """,
-        [Ecto.UUID.dump!(subscription_id)]
+        [Ecto.UUID.dump!(subscription_id), source_version]
       )
 
     [
@@ -324,6 +324,16 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
       contract_change_id: contract_change_id,
       plan_revision_id: plan_revision_id
     }
+  end
+
+  defp exact_effect_count!(subscription_id, source_version) do
+    %{rows: [[count]]} =
+      Repo.query!(
+        "SELECT count(*) FROM access_effects WHERE subscription_id = $1 AND source_version = $2",
+        [Ecto.UUID.dump!(subscription_id), source_version]
+      )
+
+    count
   end
 
   defp unresolved_effect_count!(subscription_id) do
