@@ -103,6 +103,65 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
     assert access_effects!(canceled.id) == effects
   end
 
+  test "schedule and rescind intent replays preserve the current access target" do
+    fixture = create_cancel_fixture!("schedule_neutrality", :active, :remove_immediately)
+    grant = issue_source_grant!(fixture)
+
+    assert access_effects!(fixture.source.id) == []
+
+    assert {:ok, scheduled} =
+             Facade.cancel_subscription_for_user(
+               fixture.customer,
+               fixture.subscription_id,
+               :period_end
+             )
+
+    assert scheduled.status == :active
+    assert scheduled.current_plan_revision_id == fixture.revision.id
+    assert scheduled.current_period_start_at == fixture.source.current_period_start_at
+    assert scheduled.current_period_end_at == fixture.source.current_period_end_at
+    assert scheduled.cancel_at_period_end
+    assert access_effects!(scheduled.id) == []
+    assert_active_grant_unchanged!(grant)
+
+    assert {:ok, scheduled_replay} =
+             Facade.cancel_subscription_for_user(
+               fixture.customer,
+               fixture.subscription_id,
+               :period_end
+             )
+
+    assert scheduled_replay.status == :active
+    assert scheduled_replay.current_plan_revision_id == fixture.revision.id
+    assert scheduled_replay.cancel_at_period_end
+    assert access_effects!(scheduled_replay.id) == []
+    assert_active_grant_unchanged!(grant)
+
+    assert {:ok, rescinded} =
+             Facade.cancel_subscription_for_user(
+               fixture.customer,
+               fixture.subscription_id,
+               :rescind_period_end
+             )
+
+    assert rescinded.status == :active
+    assert rescinded.current_plan_revision_id == fixture.revision.id
+    refute rescinded.cancel_at_period_end
+    assert access_effects!(rescinded.id) == []
+    assert_active_grant_unchanged!(grant)
+
+    assert {:error, _reason} =
+             Facade.cancel_subscription_for_user(
+               fixture.customer,
+               fixture.subscription_id,
+               :rescind_period_end
+             )
+
+    assert fetch_subscription!(rescinded.id).status == :active
+    assert access_effects!(rescinded.id) == []
+    assert_active_grant_unchanged!(grant)
+  end
+
   test "funded non-membership suppresses email after mutable Plan changes to membership" do
     fixture =
       create_cancel_fixture!("immutable_email", :active, :remove_immediately,
@@ -160,6 +219,88 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
     assert effect.status == :applied
     assert is_nil(effect.projection_delivered_at)
     assert access_ended_count(canceled.id) == 1
+  end
+
+  test "scheduled boundary permits membership email when F2 projection is pending" do
+    fixture = create_cancel_fixture!("boundary_projection_pending", :active, :remove_immediately)
+    _grant = issue_source_grant!(fixture)
+    assert {:ok, scheduled} = schedule_at_period_end(fixture)
+    constraint = add_projection_pending_constraint!()
+
+    on_exit(fn ->
+      Repo.query!("ALTER TABLE access_effects DROP CONSTRAINT IF EXISTS #{constraint}")
+    end)
+
+    assert {:ok, %{due_count: 1, canceled_count: 1, failed_count: 0}} =
+             Facade.run_due_scheduled_cancellations_for_system(
+               now: DateTime.add(scheduled.current_period_end_at, 1, :second)
+             )
+
+    canceled = fetch_subscription!(scheduled.id)
+    assert canceled.canceled_reason == "canceled_period_end"
+
+    assert [
+             %AccessEffect{
+               status: :applied,
+               disposition: :non_effective,
+               projection_delivered_at: nil
+             }
+           ] =
+             access_effects!(canceled.id)
+
+    assert access_ended_count(canceled.id) == 1
+  end
+
+  test "scheduled boundary suppresses email unless exact F2 applies" do
+    for outcome <- [:noop, :superseded, :error] do
+      fixture =
+        create_cancel_fixture!("boundary_email_#{outcome}", :active, :remove_immediately)
+
+      _grant = issue_source_grant!(fixture)
+      assert {:ok, scheduled} = schedule_at_period_end(fixture)
+      install_f2_outcome!(fixture, outcome)
+
+      assert {:ok, %{due_count: 1, canceled_count: 1}} =
+               Facade.run_due_scheduled_cancellations_for_system(
+                 now: DateTime.add(scheduled.current_period_end_at, 1, :second)
+               )
+
+      canceled = fetch_subscription!(scheduled.id)
+      assert canceled.status == :canceled
+      assert canceled.canceled_reason == "canceled_period_end"
+      assert access_ended_count(canceled.id) == 0
+    end
+  end
+
+  test "scheduled boundary email uses funded revision membership, not mutable Plan" do
+    fixture =
+      create_cancel_fixture!("boundary_immutable_email", :active, :remove_immediately,
+        entitlement_kind: nil,
+        entitlement_scope_key: nil
+      )
+
+    assert fixture.revision.entitlement_kind == nil
+
+    update_plan!(fixture.plan, %{
+      entitlement_kind: :membership_access,
+      entitlement_scope_key: "membership:mutable_boundary"
+    })
+
+    assert {:ok, scheduled} = schedule_at_period_end(fixture)
+
+    assert {:ok, %{due_count: 1, canceled_count: 1, failed_count: 0}} =
+             Facade.run_due_scheduled_cancellations_for_system(
+               now: DateTime.add(scheduled.current_period_end_at, 1, :second)
+             )
+
+    canceled = fetch_subscription!(scheduled.id)
+    assert canceled.status == :canceled
+    assert canceled.current_plan_revision_id == fixture.revision.id
+
+    assert [%AccessEffect{status: :applied, disposition: :non_effective}] =
+             access_effects!(canceled.id)
+
+    assert access_ended_count(canceled.id) == 0
   end
 
   test "historical effects cannot replace the exact cancel-now effect used by F2" do
@@ -410,6 +551,25 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
 
   defp cancel(fixture, :admin),
     do: Facade.cancel_subscription_for_admin(fixture.actor, fixture.subscription_id, :now)
+
+  defp schedule_at_period_end(fixture),
+    do:
+      Facade.cancel_subscription_for_user(
+        fixture.customer,
+        fixture.subscription_id,
+        :period_end
+      )
+
+  defp assert_active_grant_unchanged!(grant) do
+    current = fetch_grant!(grant.id)
+
+    assert current.status == :active
+    assert current.revoked_reason == nil
+    assert current.kind == grant.kind
+    assert current.scope_key == grant.scope_key
+    assert current.valid_from_at == grant.valid_from_at
+    assert current.valid_to_at == grant.valid_to_at
+  end
 
   defp issue_source_grant!(fixture, overrides \\ []) do
     EntitlementGrant
