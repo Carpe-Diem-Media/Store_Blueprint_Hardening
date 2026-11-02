@@ -9,9 +9,12 @@ defmodule Store.Accounts.User.Senders.SendPasswordResetEmail do
 
   @impl AshAuthentication.Sender
   def send(user, token, _opts) do
-    Emails.deliver_reset_password_instructions(
-      user,
-      url(~p"/password-reset/#{token}")
-    )
+    case Emails.deliver_reset_password_instructions(
+           user,
+           url(~p"/password-reset/#{token}")
+         ) do
+      {:ok, _email} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 end

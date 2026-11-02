@@ -4,8 +4,6 @@ defmodule StoreWeb.Router do
   use StoreWeb, :router
   use AshAuthentication.Phoenix.Router
 
-  import AshAuthentication.Plug.Helpers
-
   # CSP is applied by StoreWeb.Plugs.PutSecurityHeaders (runtime-configurable).
   # sobelow_skip ["Config.CSP"]
   pipeline :browser do
