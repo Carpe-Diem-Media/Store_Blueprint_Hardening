@@ -5,12 +5,16 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
   import Ash.Expr
   require Ash.Query
 
+  alias Store.Comms.EmailOutbox
   alias Store.Entitlements.EntitlementGrant
   alias Store.Repo
-  alias Store.Subscriptions.{AccessEffect, Facade, RenewalAttempt, Subscription}
+  alias Store.Subscriptions.AccessEffect
+  alias Store.Subscriptions.Facade
+  alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
+  alias Store.Subscriptions.RenewalAttempt
+  alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
   alias Store.TestFixtures
-  alias Store.Comms.EmailOutbox
 
   test "remove-immediately cancels active with exact F2 convergence",
     do: assert_remove_immediately!(:active)
@@ -102,20 +106,34 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
   test "funded non-membership suppresses email after mutable Plan changes to membership" do
     fixture =
       create_cancel_fixture!("immutable_email", :active, :remove_immediately,
-        entitlement_kind: :digital_library,
-        entitlement_scope_key: "library:funded"
+        entitlement_kind: nil,
+        entitlement_scope_key: nil
       )
+
+    grant =
+      issue_source_grant!(fixture,
+        kind: :digital_library,
+        scope_key: "library:funded"
+      )
+
+    assert grant.status == :active
+    assert fixture.revision.entitlement_kind == nil
+    assert fixture.revision.entitlement_scope_key == nil
 
     update_plan!(fixture.plan, %{
       entitlement_kind: :membership_access,
       entitlement_scope_key: "membership:mutable"
     })
 
-    assert fixture.revision.entitlement_kind == :digital_library
     assert {:ok, canceled} = cancel(fixture, :user)
     assert [effect] = access_effects!(canceled.id)
     assert effect.disposition == :non_effective
+    assert effect.status == :applied
     assert effect.plan_revision_id == fixture.revision.id
+
+    assert %EntitlementGrant{status: :revoked, revoked_reason: "canceled_now"} =
+             fetch_grant!(grant.id)
+
     assert access_ended_count(canceled.id) == 0
   end
 
@@ -393,14 +411,14 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
   defp cancel(fixture, :admin),
     do: Facade.cancel_subscription_for_admin(fixture.actor, fixture.subscription_id, :now)
 
-  defp issue_source_grant!(fixture) do
+  defp issue_source_grant!(fixture, overrides \\ []) do
     EntitlementGrant
     |> Ash.Changeset.for_create(
       :issue,
       %{
         user_id: fixture.source.user_id,
-        kind: fixture.revision.entitlement_kind,
-        scope_key: fixture.revision.entitlement_scope_key,
+        kind: Keyword.get(overrides, :kind, fixture.revision.entitlement_kind),
+        scope_key: Keyword.get(overrides, :scope_key, fixture.revision.entitlement_scope_key),
         source_kind: :subscription,
         source_id: fixture.source.id,
         status: :active,
@@ -475,7 +493,7 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
       plan_revision_id: fixture.revision.id
     }
 
-    {:ok, input} = Store.Subscriptions.Inputs.EstablishAccessEffectInput.new(attrs)
+    {:ok, input} = EstablishAccessEffectInput.new(attrs)
     {:ok, effect} = Facade.establish_access_effect_for_system(input)
     effect
   end

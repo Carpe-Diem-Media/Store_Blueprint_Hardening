@@ -4083,13 +4083,12 @@ defmodule Store.Subscriptions.Facade do
 
   defp finalize_immediate_cancellation(
          %Subscription{} = canceled,
-         %{
-           access_effect: %{id: effect_id, disposition: :non_effective},
-           membership_access_ended_email?: true
-         }
+         %{access_effect: %{id: effect_id, disposition: :non_effective}} = cancellation_access
        ) do
-    case execute_suspension_access_effect_for_system(effect_id) do
-      {:ok, outcome} when outcome in [:applied, :applied_projection_pending] ->
+    f2_result = execute_suspension_access_effect_for_system(effect_id)
+
+    case {Map.get(cancellation_access, :membership_access_ended_email?), f2_result} do
+      {true, {:ok, outcome}} when outcome in [:applied, :applied_projection_pending] ->
         _ =
           Comms.enqueue_membership_access_ended_for_system(
             canceled.id,
@@ -4100,13 +4099,6 @@ defmodule Store.Subscriptions.Facade do
       _ ->
         :ok
     end
-  end
-
-  defp finalize_immediate_cancellation(
-         %Subscription{},
-         %{access_effect: %{disposition: :non_effective}}
-       ) do
-    :ok
   end
 
   defp finalize_immediate_cancellation(%Subscription{}, _cancellation_access), do: :ok
@@ -7358,17 +7350,6 @@ defmodule Store.Subscriptions.Facade do
       provider_client_secret: Map.get(charge_response, :provider_client_secret)
     )
   end
-
-  defp maybe_enqueue_membership_access_ended_email(
-         %Subscription{} = subscription,
-         %SubscriptionPlan{entitlement_kind: :membership_access},
-         reason
-       )
-       when is_binary(reason) do
-    Comms.enqueue_membership_access_ended_for_system(subscription.id, reason)
-  end
-
-  defp maybe_enqueue_membership_access_ended_email(_subscription, _plan, _reason), do: :ok
 
   defp enqueue_scheduled_cancellation_email(%Subscription{} = subscription) do
     Comms.enqueue_membership_access_ended_for_system(

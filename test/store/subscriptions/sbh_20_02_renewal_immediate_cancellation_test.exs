@@ -1,7 +1,9 @@
 defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
   use Store.DataCase, async: false
 
-  @normal_cancel_now_query_bound 20
+  # JC247-C includes exact post-commit F2 convergence; the old bound measured
+  # a buggy non-membership path that skipped that required work.
+  @normal_cancel_now_query_bound 40
 
   import Ash.Expr
   require Ash.Query
@@ -215,6 +217,16 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
   test "normal cancel-now keeps the one-pass query path" do
     fixture = create_committed_fixture!("normal_cancel_now")
 
+    assert fixture.revision.access_on_cancel == :keep_until_period_end
+    assert fixture.subscription.current_plan_revision_id == fixture.revision.id
+    assert fixture.revision.entitlement_kind == nil
+    assert fixture.revision.entitlement_scope_key == nil
+
+    assert DateTime.compare(
+             fixture.subscription.current_period_end_at,
+             DateTime.utc_now()
+           ) == :lt
+
     {result, stats} =
       RepoStats.capture(fn ->
         Sandbox.unboxed_run(Repo, fn ->
@@ -227,6 +239,13 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
       end)
 
     assert {:ok, %Subscription{status: :canceled, cancel_at_period_end: false}} = result
+
+    assert [effect] = access_effect_rows!(fixture.subscription_id)
+    assert effect.disposition == "non_effective"
+    assert effect.status == "applied"
+    assert effect.plan_revision_id == fixture.revision.id
+    assert access_ended_email_count(fixture.subscription_id) == 0
+
     assert stats.query_count <= @normal_cancel_now_query_bound
 
     IO.puts(
@@ -628,7 +647,9 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
           order_id: order.id,
           plan_id: plan.id,
           product_id: product.id,
+          revision: revision,
           revision_id: revision.id,
+          subscription: queued_subscription,
           subscription_id: subscription.id,
           target_attachment_id: target_attachment.id,
           target_plan_id: target_plan.id,
@@ -976,6 +997,21 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
         plan_revision_id: plan_revision_id
       }
     end)
+  end
+
+  defp access_ended_email_count(subscription_id) do
+    %{rows: [[count]]} =
+      Repo.query!(
+        """
+        SELECT count(*)::bigint
+        FROM email_outboxes
+        WHERE subscription_id = $1
+          AND template_kind::text = 'access_ended'
+        """,
+        [Ecto.UUID.dump!(subscription_id)]
+      )
+
+    count
   end
 
   defp access_effect_count!(subscription_id) do
