@@ -192,7 +192,8 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
         plan =
           SubscriptionsFixtures.create_subscription_plan!(%{
             entitlement_kind: :membership_access,
-            entitlement_scope_key: "f05-contention-#{label}-#{unique}"
+            entitlement_scope_key: "f05-contention-#{label}-#{unique}",
+            access_on_cancel: :remove_immediately
           })
 
         variant_plan = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
@@ -201,6 +202,9 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
           SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
             create_payment_intent?: false
           })
+
+        assert fixture.revision.access_on_cancel == :remove_immediately
+        assert fixture.subscription.current_plan_revision_id == fixture.revision.id
 
         stale_input =
           input!(%{

@@ -249,8 +249,8 @@ defmodule Store.Comms do
   def enqueue_membership_access_ended_for_system(subscription_id, reason, opts \\ [])
       when is_binary(subscription_id) and is_binary(reason) do
     with {:ok, subscription} <- fetch_subscription(subscription_id),
-         {:ok, plan} <- fetch_subscription_plan(subscription.subscription_plan_id),
-         :ok <- ensure_membership_plan(plan),
+         {:ok, plan} <- fetch_access_ended_plan(subscription, opts),
+         :ok <- ensure_access_ended_membership(plan, opts),
          {:ok, to_email} <- resolve_subscription_recipient_email(subscription, opts),
          {:ok, provider} <- resolve_provider(opts),
          period_end_key <- access_ended_period_end_key(subscription.current_period_end_at),
@@ -261,13 +261,13 @@ defmodule Store.Comms do
              subscription_id: subscription.id,
              template_kind: :access_ended,
              to_email: to_email,
-             subject: "Membership access ended for #{plan.name || plan.key}",
+             subject: access_ended_subject(plan, opts),
              idempotency_key:
                "membership_access_ended:sub:#{subscription.id}:reason:#{reason}:period_end:#{period_end_key}",
              provider: provider,
              template_assigns: %{
                "subscription_id" => subscription.id,
-               "subscription_plan_id" => plan.id,
+               "subscription_plan_id" => subscription.subscription_plan_id,
                "reason" => reason,
                "current_period_end_at" => subscription.current_period_end_at,
                "support_email" => support_email()
@@ -281,6 +281,29 @@ defmodule Store.Comms do
       other -> other
     end
   end
+
+  defp fetch_access_ended_plan(subscription, opts) do
+    if membership_access_proven?(opts) do
+      {:ok, nil}
+    else
+      fetch_subscription_plan(subscription.subscription_plan_id)
+    end
+  end
+
+  defp ensure_access_ended_membership(plan, opts) when is_list(opts) do
+    if membership_access_proven?(opts), do: :ok, else: ensure_membership_plan(plan)
+  end
+
+  defp access_ended_subject(plan, opts) do
+    if membership_access_proven?(opts) do
+      "Membership access ended"
+    else
+      "Membership access ended for #{plan.name || plan.key}"
+    end
+  end
+
+  defp membership_access_proven?(opts) when is_list(opts),
+    do: Keyword.get(opts, :membership_access_proven?) == true
 
   @spec enqueue_due_membership_renewal_reminders_for_system(keyword()) ::
           {:ok, %{enqueued_count: non_neg_integer()}} | {:error, term()}

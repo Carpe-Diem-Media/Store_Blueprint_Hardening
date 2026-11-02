@@ -721,17 +721,21 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
     plan =
       SubscriptionsFixtures.create_subscription_plan!(%{
         entitlement_kind: :membership_access,
-        entitlement_scope_key: "membership:jc265-recovery-cancel-race"
+        entitlement_scope_key: "membership:jc265-recovery-cancel-race",
+        access_on_cancel: :remove_immediately
       })
 
     SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
-    %{subscription: subscription} =
+    %{subscription: subscription, revision: revision} =
       SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
         provider_billing_ref: "pm_jc265_recovery_cancel_race",
         started_at: DateTime.add(now, -40 * 86_400, :second)
       })
+
+    assert revision.access_on_cancel == :remove_immediately
+    assert subscription.current_plan_revision_id == revision.id
 
     assert {:ok, _grant} =
              EntitlementsFacade.issue_subscription_entitlement_for_system(subscription, plan)
@@ -836,6 +840,7 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
              SubscriptionsFacade.cancel_subscription_for_user(customer, subscription.id, :now)
 
     assert canceled.status == :canceled
+    assert canceled.current_plan_revision_id == revision.id
     assert [%EntitlementGrant{status: :revoked}] = grants_for(subscription.id)
     assert count_refunds() == 0
     assert count_payment_applications(attempt.order_id) == 1
@@ -890,17 +895,21 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
     plan =
       SubscriptionsFixtures.create_subscription_plan!(%{
         entitlement_kind: :membership_access,
-        entitlement_scope_key: "membership:jc265-recovery-wins-cancel"
+        entitlement_scope_key: "membership:jc265-recovery-wins-cancel",
+        access_on_cancel: :remove_immediately
       })
 
     SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
-    %{subscription: subscription} =
+    %{subscription: subscription, revision: revision} =
       SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
         provider_billing_ref: "pm_jc265_recovery_wins_cancel",
         started_at: DateTime.add(now, -40 * 86_400, :second)
       })
+
+    assert revision.access_on_cancel == :remove_immediately
+    assert subscription.current_plan_revision_id == revision.id
 
     assert {:ok, _grant} =
              EntitlementsFacade.issue_subscription_entitlement_for_system(subscription, plan)
@@ -955,6 +964,7 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
              SubscriptionsFacade.cancel_subscription_for_user(customer, subscription.id, :now)
 
     assert canceled.status == :canceled
+    assert canceled.current_plan_revision_id == revision.id
     assert [%EntitlementGrant{status: :revoked}] = grants_for(subscription.id)
     assert fetch_attempt!(subscription.id).status == :succeeded
     assert fetch_order!(attempt.order_id).state == :paid

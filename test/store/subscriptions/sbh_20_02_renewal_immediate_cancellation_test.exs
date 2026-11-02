@@ -1,7 +1,9 @@
 defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
   use Store.DataCase, async: false
 
-  @normal_cancel_now_query_bound 20
+  # JC247-C includes exact post-commit F2 convergence; the old bound measured
+  # a buggy non-membership path that skipped that required work.
+  @normal_cancel_now_query_bound 40
 
   import Ash.Expr
   require Ash.Query
@@ -215,6 +217,16 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
   test "normal cancel-now keeps the one-pass query path" do
     fixture = create_committed_fixture!("normal_cancel_now")
 
+    assert fixture.revision.access_on_cancel == :keep_until_period_end
+    assert fixture.subscription.current_plan_revision_id == fixture.revision.id
+    assert fixture.revision.entitlement_kind == nil
+    assert fixture.revision.entitlement_scope_key == nil
+
+    assert DateTime.compare(
+             fixture.subscription.current_period_end_at,
+             DateTime.utc_now()
+           ) == :lt
+
     {result, stats} =
       RepoStats.capture(fn ->
         Sandbox.unboxed_run(Repo, fn ->
@@ -227,6 +239,13 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
       end)
 
     assert {:ok, %Subscription{status: :canceled, cancel_at_period_end: false}} = result
+
+    assert [effect] = access_effect_rows!(fixture.subscription_id)
+    assert effect.disposition == "non_effective"
+    assert effect.status == "applied"
+    assert effect.plan_revision_id == fixture.revision.id
+    assert access_ended_email_count(fixture.subscription_id) == 0
+
     assert stats.query_count <= @normal_cancel_now_query_bound
 
     IO.puts(
@@ -237,6 +256,9 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
 
   test "cancel-now establishes current NON_EFFECTIVE target before transaction commit" do
     fixture = create_sandboxed_subscription_fixture!("cancel_effect_atomic")
+
+    assert fixture.revision.access_on_cancel == :remove_immediately
+    assert fixture.subscription.current_plan_revision_id == fixture.revision.id
 
     assert {:ok, canceled} =
              Repo.transaction(fn ->
@@ -272,6 +294,9 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
 
   test "cancel-now rolls back when NON_EFFECTIVE AccessEffect establishment fails" do
     fixture = create_sandboxed_subscription_fixture!("cancel_effect_rollback")
+
+    assert fixture.revision.access_on_cancel == :remove_immediately
+    assert fixture.subscription.current_plan_revision_id == fixture.revision.id
 
     {trigger_name, function_name} = fail_cancel_access_effect_insert!()
     before = fetch_subscription!(fixture.subscription_id)
@@ -622,7 +647,9 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
           order_id: order.id,
           plan_id: plan.id,
           product_id: product.id,
+          revision: revision,
           revision_id: revision.id,
+          subscription: queued_subscription,
           subscription_id: subscription.id,
           target_attachment_id: target_attachment.id,
           target_plan_id: target_plan.id,
@@ -638,15 +665,25 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
     unique = "#{suffix}_#{Ecto.UUID.generate()}"
     customer = SubscriptionsFixtures.create_customer!("jc245_#{unique}")
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
-    plan = SubscriptionsFixtures.create_subscription_plan!()
+
+    plan =
+      SubscriptionsFixtures.create_subscription_plan!(%{
+        access_on_cancel: :remove_immediately
+      })
+
     SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
 
-    %{subscription: subscription} =
+    %{subscription: subscription, revision: revision} =
       SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
         provider_billing_ref: "pm_jc245_#{unique}"
       })
 
-    %{customer: customer, subscription_id: subscription.id}
+    %{
+      customer: customer,
+      revision: revision,
+      subscription: subscription,
+      subscription_id: subscription.id
+    }
   end
 
   defp cleanup_committed_fixture!(fixture) do
@@ -960,6 +997,21 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
         plan_revision_id: plan_revision_id
       }
     end)
+  end
+
+  defp access_ended_email_count(subscription_id) do
+    %{rows: [[count]]} =
+      Repo.query!(
+        """
+        SELECT count(*)::bigint
+        FROM email_outboxes
+        WHERE subscription_id = $1
+          AND template_kind::text = 'access_ended'
+        """,
+        [Ecto.UUID.dump!(subscription_id)]
+      )
+
+    count
   end
 
   defp access_effect_count!(subscription_id) do
