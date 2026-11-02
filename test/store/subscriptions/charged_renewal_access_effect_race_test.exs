@@ -102,21 +102,25 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
                Task.await(cancel_task, @transaction_timeout)
 
       assert canceled.id == fixture.subscription.id
+      assert canceled.canceled_reason == "user_request"
       assert fetch_attempt!(fixture.attempt.id).status == :processing
 
       [renewal_effect, cancellation_effect] = access_effects_for!(fixture.subscription.id)
       assert renewal_effect.disposition == :effective
       assert renewal_effect.status in [:required, :superseded]
-      assert cancellation_effect.disposition == :non_effective
-      assert cancellation_effect.status == :required
+      assert cancellation_effect.disposition == :effective
+      assert cancellation_effect.status == :applied
       assert cancellation_effect.source_version > renewal_effect.source_version
-      assert active_grants_for!(fixture.subscription.id) == []
+
+      {_current_effect, cancellation_grant} =
+        assert_current_funded_cancellation!(fixture, canceled, cancellation_effect)
 
       send(renewal_task.pid, {run_ref, :resume_paid_renewal_access_sync})
       assert {:ok, :reconciled} = Task.await(renewal_task, @transaction_timeout)
 
       subscription = fetch_subscription!(fixture.subscription.id)
       assert subscription.status == :canceled
+      assert subscription.canceled_reason == "user_request"
       assert subscription.current_period_start_at == fixture.attempt.period_start_at
       assert subscription.current_period_end_at == fixture.attempt.period_end_at
       assert subscription.current_plan_revision_id == fixture.attempt.plan_revision_id
@@ -125,9 +129,14 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
 
       [renewal_effect, cancellation_effect] = access_effects_for!(fixture.subscription.id)
       assert renewal_effect.status == :superseded
-      assert cancellation_effect.disposition == :non_effective
-      assert latest_effect!(fixture.subscription.id).id == cancellation_effect.id
-      assert active_grants_for!(fixture.subscription.id) == []
+      assert cancellation_effect.disposition == :effective
+      assert cancellation_effect.status == :applied
+
+      {current_effect, final_grant} =
+        assert_current_funded_cancellation!(fixture, subscription, cancellation_effect)
+
+      assert current_effect.id == cancellation_effect.id
+      assert funded_grant_identity(final_grant) == funded_grant_identity(cancellation_grant)
       assert count_payment_applications(fixture.attempt.order_id) == 1
 
       IO.puts(
@@ -136,7 +145,8 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
       )
 
       IO.puts(
-        "IMMEDIATE_CANCEL_COMPAT_REVOKE_CHANGED=NO JC247_POLICY_PATH_USED=NO SCHEDULED_REMOVE_POLICY_ASSUMED=NO"
+        "JC247_POLICY_PATH_USED=YES FUNDED_ACCESS_ON_CANCEL=keep_until_period_end " <>
+          "CANCELLATION_DISPOSITION=#{cancellation_effect.disposition}"
       )
     after
       if Process.alive?(renewal_task.pid) do
@@ -223,25 +233,29 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
       assert {:ok, :released} = Task.await(grant_barrier, @transaction_timeout)
       assert {:ok, :reconciled} = Task.await(renewal_task, @transaction_timeout)
 
-      assert {:ok, %Subscription{status: :canceled}} =
+      assert {:ok, %Subscription{status: :canceled} = canceled} =
                Task.await(cancel_task, @transaction_timeout)
 
       [renewal_effect, cancellation_effect] = access_effects_for!(fixture.subscription.id)
       assert renewal_effect.status == :applied
-      assert cancellation_effect.disposition == :non_effective
+      assert cancellation_effect.disposition == :effective
+      assert cancellation_effect.status == :applied
       assert cancellation_effect.source_version > renewal_effect.source_version
-      assert latest_effect!(fixture.subscription.id).id == cancellation_effect.id
-
-      assert [%EntitlementGrant{status: :revoked} = grant] = grants_for!(fixture.subscription.id)
-      assert grant.valid_from_at == fixture.attempt.period_start_at
-      assert grant.valid_to_at == fixture.attempt.period_end_at
 
       subscription = fetch_subscription!(fixture.subscription.id)
       assert subscription.status == :canceled
+      assert canceled.canceled_reason == "user_request"
       assert subscription.current_period_start_at == fixture.attempt.period_start_at
       assert subscription.current_period_end_at == fixture.attempt.period_end_at
+
+      {current_effect, grant} =
+        assert_current_funded_cancellation!(fixture, subscription, cancellation_effect)
+
+      assert current_effect.id == cancellation_effect.id
+      assert grant.status == :active
       assert fetch_attempt!(fixture.attempt.id).status == :succeeded
       assert fetch_order!(fixture.attempt.order_id).state == :paid
+      assert count_payment_applications(fixture.attempt.order_id) == 1
 
       IO.puts(
         "JC300_RACE_A_BEFORE_B barrier_backend=#{barrier_backend} renewal_backend=#{renewal_backend} " <>
@@ -267,7 +281,8 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
         amount_minor: 1_100,
         currency: "USD",
         entitlement_kind: :membership_access,
-        entitlement_scope_key: "membership:#{token}"
+        entitlement_scope_key: "membership:#{token}",
+        access_on_cancel: :keep_until_period_end
       })
 
     variant_plan = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
@@ -484,8 +499,6 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
     |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 
-  defp latest_effect!(subscription_id), do: List.last(access_effects_for!(subscription_id))
-
   defp grants_for!(subscription_id) do
     EntitlementGrant
     |> Ash.Query.filter(expr(source_kind == :subscription and source_id == ^subscription_id))
@@ -495,6 +508,44 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
 
   defp active_grants_for!(subscription_id) do
     Enum.filter(grants_for!(subscription_id), &(&1.status == :active))
+  end
+
+  defp assert_current_funded_cancellation!(fixture, subscription, cancellation_effect) do
+    assert subscription.status == :canceled
+    assert subscription.canceled_reason == "user_request"
+    assert subscription.current_plan_revision_id == fixture.revision.id
+    assert fixture.attempt.plan_revision_id == fixture.revision.id
+    assert subscription.current_period_start_at == fixture.attempt.period_start_at
+    assert subscription.current_period_end_at == fixture.attempt.period_end_at
+
+    assert cancellation_effect.disposition == :effective
+    assert cancellation_effect.status == :applied
+    assert cancellation_effect.source_version == subscription.aggregate_version
+    assert cancellation_effect.plan_revision_id == subscription.current_plan_revision_id
+    assert cancellation_effect.entitlement_kind == fixture.revision.entitlement_kind
+
+    assert cancellation_effect.entitlement_scope_key ==
+             fixture.revision.entitlement_scope_key
+
+    assert cancellation_effect.valid_from_at == subscription.current_period_start_at
+    assert cancellation_effect.valid_until_at == subscription.current_period_end_at
+
+    assert {:ok, current_effect} = Facade.get_current_access_effect_for_system(subscription)
+    assert current_effect.id == cancellation_effect.id
+
+    assert [%EntitlementGrant{status: :active} = grant] =
+             active_grants_for!(subscription.id)
+
+    assert grant.kind == fixture.revision.entitlement_kind
+    assert grant.scope_key == fixture.revision.entitlement_scope_key
+    assert grant.valid_from_at == subscription.current_period_start_at
+    assert grant.valid_to_at == subscription.current_period_end_at
+
+    {current_effect, grant}
+  end
+
+  defp funded_grant_identity(grant) do
+    {grant.id, grant.status, grant.kind, grant.scope_key, grant.valid_from_at, grant.valid_to_at}
   end
 
   defp mark_collection_successful!(collection) do
