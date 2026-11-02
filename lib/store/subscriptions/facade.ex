@@ -7748,7 +7748,7 @@ defmodule Store.Subscriptions.Facade do
            update_reconciled_subscription(subscription, attempt, revision, target),
          {:ok, change_notifications} <- apply_reconciliation_contract_change(contract_change),
          {:ok, outcome, terminal_subscription, terminal_notifications, boundary_access} <-
-           terminalize_late_reconciled_cancellation(subscription, updated, attempt),
+           terminalize_late_reconciled_cancellation(subscription, updated, attempt, revision),
          {:ok, effect} <-
            maybe_establish_charged_renewal_access_effect(
              outcome,
@@ -7983,7 +7983,8 @@ defmodule Store.Subscriptions.Facade do
   defp terminalize_late_reconciled_cancellation(
          %Subscription{} = previous,
          %Subscription{} = updated,
-         %RenewalAttempt{} = attempt
+         %RenewalAttempt{} = attempt,
+         %PlanRevision{} = revision
        ) do
     awaiting_same_attempt? =
       previous.cancel_at_period_end and
@@ -7993,14 +7994,14 @@ defmodule Store.Subscriptions.Facade do
         updated.cancel_at_period_end_at == attempt.period_end_at
 
     if awaiting_same_attempt?,
-      do: terminalize_late_paid_cancellation(updated, attempt),
+      do: terminalize_late_paid_cancellation(updated, attempt, revision),
       else: {:ok, :applied, updated, [], nil}
   end
 
-  defp terminalize_late_paid_cancellation(updated, attempt) do
+  defp terminalize_late_paid_cancellation(updated, attempt, revision) do
     case database_boundary_reached?(attempt.period_end_at) do
       {:ok, true} ->
-        terminalize_reconciled_cancellation_at_boundary(updated, attempt)
+        terminalize_reconciled_cancellation_at_boundary(updated, attempt, revision)
 
       {:ok, false} ->
         {:ok, :applied, updated, [], nil}
@@ -8010,14 +8011,27 @@ defmodule Store.Subscriptions.Facade do
     end
   end
 
-  defp terminalize_reconciled_cancellation_at_boundary(updated, attempt) do
-    case terminalize_scheduled_cancellation_in_transaction(
-           updated.id,
-           attempt.period_end_at,
-           nil
-         ) do
-      {:canceled, canceled, notifications, boundary_access} ->
-        {:ok, :scheduled_cancellation_established, canceled, notifications, boundary_access}
+  defp terminalize_reconciled_cancellation_at_boundary(
+         updated,
+         attempt,
+         %PlanRevision{} = revision
+       ) do
+    with true <- revision.id == attempt.plan_revision_id,
+         {:canceled, canceled, notifications, boundary_access} <-
+           terminalize_scheduled_cancellation_in_transaction(
+             updated.id,
+             attempt.period_end_at,
+             nil,
+             revision
+           ) do
+      {:ok, :scheduled_cancellation_established, canceled, notifications, boundary_access}
+    else
+      false ->
+        {:error,
+         Error.new(
+           "VALIDATION_ERROR",
+           "late paid boundary PlanRevision does not match the RenewalAttempt"
+         )}
 
       :noop ->
         {:error,
@@ -8468,6 +8482,20 @@ defmodule Store.Subscriptions.Facade do
          subscription_id,
          expected_boundary_at,
          now_override
+       ),
+       do:
+         terminalize_scheduled_cancellation_in_transaction(
+           subscription_id,
+           expected_boundary_at,
+           now_override,
+           nil
+         )
+
+  defp terminalize_scheduled_cancellation_in_transaction(
+         subscription_id,
+         expected_boundary_at,
+         now_override,
+         preloaded_revision
        ) do
     case fetch_subscription_for_renewal_locked(subscription_id) do
       {:ok,
@@ -8480,7 +8508,8 @@ defmodule Store.Subscriptions.Facade do
           subscription,
           boundary_at,
           expected_boundary_at,
-          now_override
+          now_override,
+          preloaded_revision
         )
 
       {:ok, %Subscription{}} ->
@@ -8495,14 +8524,15 @@ defmodule Store.Subscriptions.Facade do
          subscription,
          boundary_at,
          expected_boundary_at,
-         now_override
+         now_override,
+         preloaded_revision
        ) do
     with true <- is_nil(expected_boundary_at) or expected_boundary_at == boundary_at,
          {:ok, now} <- terminalization_now(now_override) do
       if DateTime.compare(now, boundary_at) == :lt do
         :noop
       else
-        commit_scheduled_boundary_cancellation(subscription)
+        commit_scheduled_boundary_cancellation(subscription, preloaded_revision)
       end
     else
       false -> :noop
@@ -8516,7 +8546,7 @@ defmodule Store.Subscriptions.Facade do
   defp terminalization_now(_now),
     do: {:error, Error.new("VALIDATION_ERROR", "terminalization time must be a DateTime")}
 
-  defp commit_scheduled_boundary_cancellation(subscription) do
+  defp commit_scheduled_boundary_cancellation(subscription, preloaded_revision) do
     with {:ok, canceled, notifications} <-
            subscription
            |> Ash.Changeset.for_update(
@@ -8531,7 +8561,8 @@ defmodule Store.Subscriptions.Facade do
              return_notifications?: true
            )
            |> scheduled_cancellation_update_result(),
-         {:ok, funded_revision} <- fetch_plan_revision(canceled.current_plan_revision_id),
+         {:ok, funded_revision} <-
+           scheduled_boundary_funded_revision(canceled, preloaded_revision),
          {:ok, input} <-
            EstablishAccessEffectInput.new(%{
              subscription_id: canceled.id,
@@ -8555,6 +8586,27 @@ defmodule Store.Subscriptions.Facade do
       {:error, reason} -> Repo.rollback(Normalize.normalize(reason))
     end
   end
+
+  defp scheduled_boundary_funded_revision(
+         %Subscription{} = canceled,
+         %PlanRevision{id: revision_id} = revision
+       ) do
+    if revision_id == canceled.current_plan_revision_id do
+      {:ok, revision}
+    else
+      {:error,
+       Error.new(
+         "VALIDATION_ERROR",
+         "supplied boundary PlanRevision does not match the canceled Subscription"
+       )}
+    end
+  end
+
+  defp scheduled_boundary_funded_revision(%Subscription{} = canceled, nil),
+    do: fetch_plan_revision(canceled.current_plan_revision_id)
+
+  defp scheduled_boundary_funded_revision(_canceled, _revision),
+    do: {:error, Error.new("VALIDATION_ERROR", "boundary PlanRevision is invalid")}
 
   defp scheduled_cancellation_update_result({:ok, subscription, notifications}),
     do: {:ok, subscription, notifications}
