@@ -2583,7 +2583,7 @@ defmodule Store.Subscriptions.Facade do
   defp count_due_scheduled_cancellation({:ok, :noop}, counts), do: counts
 
   defp count_due_scheduled_cancellation(
-         {:ok, {:canceled, canceled, notifications}},
+         {:ok, {:canceled, canceled, notifications, boundary_access}},
          counts
        ) do
     :ok =
@@ -2594,11 +2594,28 @@ defmodule Store.Subscriptions.Facade do
         }
       )
 
-    case enqueue_scheduled_cancellation_email(canceled) do
-      {:ok, _outbox_or_skipped} ->
-        %{counts | canceled: counts.canceled + 1}
+    case execute_suspension_access_effect_for_system(boundary_access.access_effect.id) do
+      {:ok, outcome} when outcome in [:applied, :applied_projection_pending] ->
+        email_result =
+          if boundary_access.membership_access_ended_email? do
+            Comms.enqueue_membership_access_ended_for_system(
+              canceled.id,
+              "canceled_period_end",
+              membership_access_proven?: true
+            )
+          else
+            {:ok, :skipped}
+          end
 
-      {:error, _reason} ->
+        case email_result do
+          {:ok, _outbox_or_skipped} ->
+            %{counts | canceled: counts.canceled + 1}
+
+          {:error, _reason} ->
+            %{counts | canceled: counts.canceled + 1, failed: counts.failed + 1}
+        end
+
+      _ ->
         %{counts | canceled: counts.canceled + 1, failed: counts.failed + 1}
     end
   end
@@ -2607,7 +2624,11 @@ defmodule Store.Subscriptions.Facade do
     do: %{counts | failed: counts.failed + 1}
 
   defp count_replayed_notification(subscription, {replayed, failed}) do
-    case enqueue_scheduled_cancellation_email(subscription) do
+    case Comms.enqueue_membership_access_ended_for_system(
+           subscription.id,
+           "canceled_period_end",
+           membership_access_proven?: true
+         ) do
       {:ok, _outbox_or_skipped} -> {replayed + 1, failed}
       {:error, _reason} -> {replayed, failed + 1}
     end
@@ -3003,15 +3024,36 @@ defmodule Store.Subscriptions.Facade do
        do: {:ok, :noop}
 
   defp finish_paid_renewal_reconciliation(
-         %{
-           outcome: :scheduled_cancellation,
-           subscription: updated_subscription,
-           notifications: notifications
-         },
+         %{outcome: :scheduled_cancellation_applied_replay},
+         %RenewalAttempt{status: :succeeded},
+         _order_id,
+         _payment_intent_id
+       ),
+       do: {:ok, :noop}
+
+  defp finish_paid_renewal_reconciliation(
+         %{outcome: :scheduled_cancellation_applied_replay},
          attempt,
          order_id,
          payment_intent_id
        ) do
+    with {:ok, _attempt} <- mark_attempt_succeeded(attempt, order_id, payment_intent_id) do
+      {:ok, :reconciled}
+    end
+  end
+
+  defp finish_paid_renewal_reconciliation(
+         %{
+           outcome: outcome,
+           subscription: updated_subscription,
+           notifications: notifications,
+           boundary_access: boundary_access
+         },
+         attempt,
+         order_id,
+         payment_intent_id
+       )
+       when outcome in [:scheduled_cancellation_established, :scheduled_cancellation_recovery] do
     with :ok <-
            AshNotifications.notify_post_commit(notifications,
              context: %{
@@ -3019,8 +3061,9 @@ defmodule Store.Subscriptions.Facade do
                subscription_id: attempt.subscription_id
              }
            ),
-         {:ok, _attempt} <- mark_attempt_succeeded(attempt, order_id, payment_intent_id),
-         {:ok, _outbox_or_skipped} <- enqueue_scheduled_cancellation_email(updated_subscription) do
+         {:ok, _attempt} <- mark_attempt_succeeded(attempt, order_id, payment_intent_id) do
+      dispatch_late_paid_boundary_access_effect(boundary_access, updated_subscription)
+
       {:ok, if(attempt.status == :succeeded, do: :noop, else: :reconciled)}
     end
   end
@@ -3059,6 +3102,29 @@ defmodule Store.Subscriptions.Facade do
          do: :noop,
          else: :reconciled
        )}
+    end
+  end
+
+  defp dispatch_late_paid_boundary_access_effect(
+         %{
+           access_effect: %{id: effect_id, disposition: :non_effective},
+           membership_access_ended_email?: membership?
+         },
+         %Subscription{} = subscription
+       ) do
+    case execute_suspension_access_effect_for_system(effect_id) do
+      {:ok, outcome} when outcome in [:applied, :applied_projection_pending] and membership? ->
+        _ =
+          Comms.enqueue_membership_access_ended_for_system(
+            subscription.id,
+            "canceled_period_end",
+            membership_access_proven?: true
+          )
+
+        :ok
+
+      _ ->
+        :ok
     end
   end
 
@@ -7529,27 +7595,45 @@ defmodule Store.Subscriptions.Facade do
 
   defp apply_locked_reconciliation_without_historical_effect(
          %Subscription{status: :canceled} = subscription,
-         _contract_change,
+         contract_change,
          %RenewalAttempt{} = attempt,
-         _revision,
+         revision,
          target
        ) do
-    if subscription.canceled_reason == "canceled_period_end" and
-         subscription.canceled_at == attempt.period_end_at and
-         subscription.current_period_end_at == attempt.period_end_at do
-      %{
-        outcome: :scheduled_cancellation,
-        subscription: subscription,
-        target: target,
-        notifications: []
-      }
-    else
-      %{
-        outcome: :canceled,
-        subscription: subscription,
-        target: target,
-        notifications: []
-      }
+    cond do
+      subscription.canceled_reason != "canceled_period_end" ->
+        %{outcome: :canceled, subscription: subscription, target: target, notifications: []}
+
+      not exact_late_paid_boundary_source?(subscription, contract_change, attempt, revision) ->
+        Repo.rollback(
+          Error.new(
+            "VALIDATION_ERROR",
+            "canceled-period-end reconciliation lacks exact current boundary source evidence"
+          )
+        )
+
+      true ->
+        case exact_late_paid_boundary_effect(subscription, attempt, revision) do
+          {:ok, :already_applied} ->
+            %{
+              outcome: :scheduled_cancellation_applied_replay,
+              subscription: subscription,
+              target: target,
+              notifications: []
+            }
+
+          {:ok, {:recoverable, effect}} ->
+            %{
+              outcome: :scheduled_cancellation_recovery,
+              subscription: subscription,
+              target: target,
+              notifications: [],
+              boundary_access: late_paid_boundary_access(effect, revision)
+            }
+
+          {:error, reason} ->
+            Repo.rollback(reason)
+        end
     end
   end
 
@@ -7577,13 +7661,92 @@ defmodule Store.Subscriptions.Facade do
     end
   end
 
+  defp exact_late_paid_boundary_source?(subscription, contract_change, attempt, revision) do
+    contract_change_id = if match?(%ContractChange{}, contract_change), do: contract_change.id
+
+    subscription.status == :canceled and
+      subscription.canceled_at == attempt.period_end_at and
+      subscription.ended_at == attempt.period_end_at and
+      subscription.current_period_end_at == attempt.period_end_at and
+      not subscription.cancel_at_period_end and
+      is_nil(subscription.cancel_at_period_end_at) and
+      is_nil(subscription.cancel_after_renewal_attempt_id) and
+      is_nil(subscription.current_dunning_renewal_attempt_id) and
+      attempt.subscription_id == subscription.id and
+      attempt.plan_revision_id == revision.id and
+      subscription.current_plan_revision_id == revision.id and
+      subscription.subscription_plan_id == revision.subscription_plan_id and
+      attempt.contract_change_id == contract_change_id and
+      subscription.current_contract_change_id == contract_change_id
+  end
+
+  defp exact_late_paid_boundary_effect(subscription, attempt, revision) do
+    with {:ok, %AccessEffect{} = effect} <-
+           get_access_effect_for_source_version(subscription.id, subscription.aggregate_version),
+         true <- exact_late_paid_boundary_effect?(effect, subscription, attempt, revision) do
+      case effect.status do
+        :applied ->
+          {:ok, :already_applied}
+
+        status when status in [:required, :pending, :failed_retryable] ->
+          {:ok, {:recoverable, effect}}
+
+        _status ->
+          {:error,
+           Error.new(
+             "VALIDATION_ERROR",
+             "current canceled-period-end AccessEffect is not in an accepted lifecycle state"
+           )}
+      end
+    else
+      {:ok, nil} ->
+        {:error,
+         Error.new(
+           "VALIDATION_ERROR",
+           "canceled-period-end reconciliation has no exact current boundary AccessEffect"
+         )}
+
+      false ->
+        {:error,
+         Error.new(
+           "VALIDATION_ERROR",
+           "canceled-period-end reconciliation has mismatched boundary AccessEffect evidence"
+         )}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp exact_late_paid_boundary_effect?(effect, subscription, attempt, revision) do
+    effect.subscription_id == subscription.id and
+      effect.source_version == subscription.aggregate_version and
+      effect.disposition == :non_effective and
+      is_nil(effect.entitlement_kind) and
+      is_nil(effect.entitlement_scope_key) and
+      is_nil(effect.valid_from_at) and
+      is_nil(effect.valid_until_at) and
+      effect.source_order_line_item_id == subscription.source_order_line_item_id and
+      effect.contract_change_id == subscription.current_contract_change_id and
+      effect.plan_revision_id == revision.id and
+      revision.id == attempt.plan_revision_id and
+      AccessEffect.persisted_fingerprint_status(effect) in [:v2_match, :v1_legacy_match]
+  end
+
+  defp late_paid_boundary_access(%AccessEffect{} = effect, revision) do
+    %{
+      access_effect: %{id: effect.id, disposition: effect.disposition},
+      membership_access_ended_email?: revision.entitlement_kind == :membership_access
+    }
+  end
+
   defp apply_first_reconciliation(subscription, contract_change, attempt, revision, target) do
     with :ok <- ensure_reconciliation_period_boundary(subscription, attempt),
          :ok <- ensure_reconciliation_no_future_target(subscription, contract_change, attempt),
          {:ok, updated, subscription_notifications} <-
            update_reconciled_subscription(subscription, attempt, revision, target),
          {:ok, change_notifications} <- apply_reconciliation_contract_change(contract_change),
-         {:ok, outcome, terminal_subscription, terminal_notifications} <-
+         {:ok, outcome, terminal_subscription, terminal_notifications, boundary_access} <-
            terminalize_late_reconciled_cancellation(subscription, updated, attempt),
          {:ok, effect} <-
            maybe_establish_charged_renewal_access_effect(
@@ -7600,6 +7763,7 @@ defmodule Store.Subscriptions.Facade do
         target: target,
         renewal_access_effect_id: effect_id,
         grant_writer_lane: grant_writer_lane,
+        boundary_access: boundary_access,
         notifications:
           subscription_notifications ++ change_notifications ++ terminal_notifications
       }
@@ -7829,7 +7993,7 @@ defmodule Store.Subscriptions.Facade do
 
     if awaiting_same_attempt?,
       do: terminalize_late_paid_cancellation(updated, attempt),
-      else: {:ok, :applied, updated, []}
+      else: {:ok, :applied, updated, [], nil}
   end
 
   defp terminalize_late_paid_cancellation(updated, attempt) do
@@ -7838,7 +8002,7 @@ defmodule Store.Subscriptions.Facade do
         terminalize_reconciled_cancellation_at_boundary(updated, attempt)
 
       {:ok, false} ->
-        {:ok, :applied, updated, []}
+        {:ok, :applied, updated, [], nil}
 
       {:error, reason} ->
         {:error, reason}
@@ -7851,8 +8015,8 @@ defmodule Store.Subscriptions.Facade do
            attempt.period_end_at,
            nil
          ) do
-      {:canceled, canceled, notifications} ->
-        {:ok, :scheduled_cancellation, canceled, notifications}
+      {:canceled, canceled, notifications, boundary_access} ->
+        {:ok, :scheduled_cancellation_established, canceled, notifications, boundary_access}
 
       :noop ->
         {:error,
@@ -8291,8 +8455,8 @@ defmodule Store.Subscriptions.Facade do
       {:ok, :noop} ->
         {:ok, :noop}
 
-      {:ok, {:canceled, subscription, notifications}} ->
-        {:ok, {:canceled, subscription, notifications}}
+      {:ok, {:canceled, subscription, notifications, boundary_access}} ->
+        {:ok, {:canceled, subscription, notifications, boundary_access}}
 
       {:error, reason} ->
         {:error, Normalize.normalize(reason)}
@@ -8366,6 +8530,7 @@ defmodule Store.Subscriptions.Facade do
              return_notifications?: true
            )
            |> scheduled_cancellation_update_result(),
+         {:ok, funded_revision} <- fetch_plan_revision(canceled.current_plan_revision_id),
          {:ok, input} <-
            EstablishAccessEffectInput.new(%{
              subscription_id: canceled.id,
@@ -8379,8 +8544,12 @@ defmodule Store.Subscriptions.Facade do
              contract_change_id: canceled.current_contract_change_id,
              plan_revision_id: canceled.current_plan_revision_id
            }),
-         {:ok, _effect} <- establish_access_effect_for_system(input) do
-      {:canceled, canceled, notifications}
+         {:ok, effect} <- establish_access_effect_for_system(input) do
+      {:canceled, canceled, notifications,
+       %{
+         access_effect: %{id: effect.id, disposition: effect.disposition},
+         membership_access_ended_email?: funded_revision.entitlement_kind == :membership_access
+       }}
     else
       {:error, reason} -> Repo.rollback(Normalize.normalize(reason))
     end
@@ -8403,12 +8572,26 @@ defmodule Store.Subscriptions.Facade do
            """
            SELECT s.id::text, s.ended_at, s.current_period_end_at
            FROM subscriptions s
-           JOIN subscription_plans sp ON sp.id = s.subscription_plan_id
+           JOIN plan_revisions pr ON pr.id = s.current_plan_revision_id
+           JOIN access_effects ae
+             ON ae.subscription_id = s.id
+            AND ae.source_version = s.aggregate_version
+            AND ae.source_order_line_item_id = s.source_order_line_item_id
+            AND ae.contract_change_id IS NOT DISTINCT FROM s.current_contract_change_id
+            AND ae.plan_revision_id = s.current_plan_revision_id
            WHERE s.status = 'canceled'
              AND s.canceled_reason = 'canceled_period_end'
              AND s.ended_at IS NOT NULL
              AND s.current_period_end_at IS NOT NULL
-             AND sp.entitlement_kind = 'membership_access'
+             AND s.canceled_at = s.current_period_end_at
+             AND s.ended_at = s.current_period_end_at
+             AND pr.entitlement_kind = 'membership_access'
+             AND ae.disposition = 'non_effective'
+             AND ae.entitlement_kind IS NULL
+             AND ae.entitlement_scope_key IS NULL
+             AND ae.valid_from_at IS NULL
+             AND ae.valid_until_at IS NULL
+             AND ae.status = 'applied'
              AND (
                $1::timestamptz IS NULL OR
                s.ended_at > $1::timestamptz OR
