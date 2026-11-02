@@ -43,6 +43,8 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     producer_first = create_committed_source!("producer_first")
 
     try do
+      assert producer_first.revision.access_on_cancel == :remove_immediately
+      assert producer_first.subscription.current_plan_revision_id == producer_first.revision.id
       run_race!(producer_first, :producer_first, context.direct_repo_owner)
       assert_final_non_effective_target!(producer_first)
     after
@@ -52,6 +54,11 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     reconciler_first = create_committed_source!("reconciler_first")
 
     try do
+      assert reconciler_first.revision.access_on_cancel == :remove_immediately
+
+      assert reconciler_first.subscription.current_plan_revision_id ==
+               reconciler_first.revision.id
+
       run_race!(reconciler_first, :reconciler_first, context.direct_repo_owner)
       assert_final_non_effective_target!(reconciler_first)
 
@@ -192,7 +199,8 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
         plan =
           SubscriptionsFixtures.create_subscription_plan!(%{
             entitlement_kind: :membership_access,
-            entitlement_scope_key: "f05-contention-#{label}-#{unique}"
+            entitlement_scope_key: "f05-contention-#{label}-#{unique}",
+            access_on_cancel: :remove_immediately
           })
 
         variant_plan = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)

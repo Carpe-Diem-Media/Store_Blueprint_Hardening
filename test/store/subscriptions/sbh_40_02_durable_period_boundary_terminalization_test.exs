@@ -6,6 +6,7 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
 
   alias Ash.Resource.Info
   alias Oban.Job
+  alias Store.Entitlements.EntitlementGrant
   alias Store.Payments.PaymentIntent
   alias Store.Payments.Types.ProviderObservation
   alias Store.Repo
@@ -675,19 +676,19 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     effect = fetch_current_access_effect!(subscription.id)
     assert effect.disposition == :non_effective
     assert effect.source_version == canceled.aggregate_version
+    assert effect.status == :applied
     assert count_scheduled_cancellation_outboxes(subscription.id) == 1
-
-    assert {:ok, :applied} = Facade.execute_suspension_access_effect_for_system(effect.id)
-    assert fetch_current_access_effect!(subscription.id).status == :applied
   end
 
-  test "financial payment application stays awaiting until late exact commercial reconciliation" do
+  test "late paid boundary recovery uses the exact existing effect and rejects stale replay evidence" do
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
     {customer, subscription} =
       create_subscription("jc242_payment_before_commercial_application", %{
         started_at: DateTime.add(now, -80 * 86_400, :second)
       })
+
+    grant = create_source_grant!(subscription)
 
     enable_stripe!()
     post_count = :atomics.new(1, [])
@@ -748,6 +749,19 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     assert access_effects(subscription.id) == []
     assert count_scheduled_cancellation_outboxes(subscription.id) == 0
 
+    f2_constraint = "jc247_c_late_paid_f2_#{System.unique_integer([:positive])}"
+
+    Repo.query!("""
+    ALTER TABLE entitlement_grants
+    ADD CONSTRAINT #{f2_constraint}
+    CHECK (source_id <> '#{subscription.id}'::uuid OR status <> 'revoked')
+    NOT VALID
+    """)
+
+    on_exit(fn ->
+      Repo.query!("ALTER TABLE entitlement_grants DROP CONSTRAINT IF EXISTS #{f2_constraint}")
+    end)
+
     assert {:ok, :reconciled} =
              Facade.reconcile_paid_subscription_renewal_for_system(attempt.order_id,
                renewal_attempt_id: attempt.id,
@@ -762,11 +776,15 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     assert canceled.ended_at == attempt.period_end_at
     assert fetch_attempt!(attempt.id).status == :succeeded
 
-    effect = fetch_current_access_effect!(subscription.id)
+    [effect] = access_effects(subscription.id)
     assert effect.disposition == :non_effective
     assert effect.source_version == canceled.aggregate_version
+    assert effect.status == :failed_retryable
     assert length(access_effects(subscription.id)) == 1
-    assert count_scheduled_cancellation_outboxes(subscription.id) == 1
+    assert count_scheduled_cancellation_outboxes(subscription.id) == 0
+    assert fetch_source_grant!(grant.id).status == :active
+
+    Repo.query!("ALTER TABLE entitlement_grants DROP CONSTRAINT #{f2_constraint}")
 
     assert {:ok, :noop} =
              Facade.reconcile_paid_subscription_renewal_for_system(attempt.order_id,
@@ -778,7 +796,37 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     replayed = fetch_subscription!(subscription.id)
     assert replayed.aggregate_version == canceled.aggregate_version
     assert replayed.current_period_end_at == attempt.period_end_at
-    assert fetch_current_access_effect!(subscription.id).id == effect.id
+
+    assert [%AccessEffect{id: effect_id, status: :applied, disposition: :non_effective}] =
+             access_effects(subscription.id)
+
+    assert effect_id == effect.id
+    assert count_scheduled_cancellation_outboxes(subscription.id) == 1
+    assert fetch_source_grant!(grant.id).status == :revoked
+
+    assert {:ok, :noop} =
+             Facade.reconcile_paid_subscription_renewal_for_system(attempt.order_id,
+               renewal_attempt_id: attempt.id,
+               collection_attempt_id: collection.id,
+               payment_intent_id: payment_intent.id
+             )
+
+    assert fetch_subscription!(subscription.id).aggregate_version == canceled.aggregate_version
+    assert [%AccessEffect{id: ^effect_id, status: :applied}] = access_effects(subscription.id)
+    assert count_scheduled_cancellation_outboxes(subscription.id) == 1
+
+    Repo.query!(
+      "UPDATE subscriptions SET aggregate_version = aggregate_version + 1 WHERE id = $1",
+      [Ecto.UUID.dump!(subscription.id)]
+    )
+
+    assert {:error, _reason} =
+             Facade.reconcile_paid_subscription_renewal_for_system(attempt.order_id,
+               renewal_attempt_id: attempt.id,
+               collection_attempt_id: collection.id,
+               payment_intent_id: payment_intent.id
+             )
+
     assert length(access_effects(subscription.id)) == 1
     assert count_scheduled_cancellation_outboxes(subscription.id) == 1
 
@@ -1028,6 +1076,31 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
       authorize?: false,
       context: %{system?: true}
     )
+  end
+
+  defp create_source_grant!(%Subscription{} = subscription) do
+    EntitlementGrant
+    |> Ash.Changeset.for_create(
+      :issue,
+      %{
+        user_id: subscription.user_id,
+        kind: :membership_access,
+        scope_key: subscription.membership_key,
+        source_kind: :subscription,
+        source_id: subscription.id,
+        status: :active,
+        valid_from_at: subscription.current_period_start_at,
+        valid_to_at: subscription.current_period_end_at
+      },
+      context: %{system?: true}
+    )
+    |> Ash.create!(domain: Store.Entitlements, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_source_grant!(id) do
+    EntitlementGrant
+    |> Ash.Query.filter(expr(id == ^id))
+    |> Ash.read_one!(domain: Store.Entitlements, authorize?: false, context: %{system?: true})
   end
 
   defp authoritative_success_observation(%PaymentIntent{} = payment_intent) do

@@ -1,7 +1,8 @@
 defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
   use Store.DataCase, async: false
 
-  @normal_cancel_now_query_bound 20
+  # Stable path: 36 queries (caller + source 18, required F2 18); bound is 40.
+  @normal_cancel_now_query_bound 40
 
   import Ash.Expr
   require Ash.Query
@@ -212,8 +213,14 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
     assert duplicate.aggregate_version == canceled.aggregate_version
   end
 
-  test "normal cancel-now keeps the one-pass query path" do
+  test "normal cancel-now keeps the bounded source-plus-F2 query path" do
     fixture = create_committed_fixture!("normal_cancel_now")
+
+    assert fixture.revision.access_on_cancel == :keep_until_period_end
+    assert fixture.subscription.current_plan_revision_id == fixture.revision.id
+    assert fixture.revision.entitlement_kind == nil
+    assert fixture.revision.entitlement_scope_key == nil
+    assert DateTime.compare(fixture.subscription.current_period_end_at, fixture.now) == :lt
 
     {result, stats} =
       RepoStats.capture(fn ->
@@ -226,7 +233,35 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
         end)
       end)
 
-    assert {:ok, %Subscription{status: :canceled, cancel_at_period_end: false}} = result
+    assert {:ok, %Subscription{status: :canceled, cancel_at_period_end: false} = canceled} =
+             result
+
+    assert canceled.current_plan_revision_id == fixture.revision.id
+    assert [effect] = access_effect_rows!(fixture.subscription_id)
+    assert effect.status == "applied"
+    assert effect.disposition == "non_effective"
+    assert effect.source_version == canceled.aggregate_version
+    assert effect.plan_revision_id == fixture.revision.id
+    assert effect.source_order_line_item_id == fixture.line_item_id
+    assert effect.entitlement_kind == nil
+    assert effect.entitlement_scope_key == nil
+    assert effect.valid_from_at == nil
+    assert effect.valid_until_at == nil
+
+    assert %{rows: [[0]]} =
+             Repo.query!(
+               """
+               SELECT count(*)
+               FROM email_outboxes
+               WHERE subscription_id = $1
+                 AND idempotency_key LIKE $2
+               """,
+               [
+                 Ecto.UUID.dump!(fixture.subscription_id),
+                 "membership_access_ended:sub:%:reason:canceled_now:period_end:%"
+               ]
+             )
+
     assert stats.query_count <= @normal_cancel_now_query_bound
 
     IO.puts(
@@ -628,7 +663,9 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
           order_id: order.id,
           plan_id: plan.id,
           product_id: product.id,
+          revision: revision,
           revision_id: revision.id,
+          subscription: queued_subscription,
           subscription_id: subscription.id,
           target_attachment_id: target_attachment.id,
           target_plan_id: target_plan.id,
