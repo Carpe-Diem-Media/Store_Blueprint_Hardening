@@ -9,6 +9,13 @@ defmodule Store.Accounts.Token do
     authorizers: [Ash.Policy.Authorizer],
     domain: Store.Accounts
 
+  actions do
+    read :read do
+      primary?(true)
+      public?(false)
+    end
+  end
+
   postgres do
     table("tokens")
     repo(Store.Repo)
