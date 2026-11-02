@@ -655,12 +655,17 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     assert collection.financial_outcome == :verified_success
     assert collection.payment_attempt_id == payment_attempt.id
 
-    assert {:ok, :reconciled} =
-             Facade.reconcile_paid_subscription_renewal_for_system(attempt.order_id,
-               renewal_attempt_id: attempt.id,
-               collection_attempt_id: collection.id,
-               payment_intent_id: payment_intent.id
-             )
+    {reconciliation, exact_revision_fetches} =
+      capture_exact_plan_revision_primary_key_fetches(fn ->
+        Facade.reconcile_paid_subscription_renewal_for_system(attempt.order_id,
+          renewal_attempt_id: attempt.id,
+          collection_attempt_id: collection.id,
+          payment_intent_id: payment_intent.id
+        )
+      end)
+
+    assert {:ok, :reconciled} = reconciliation
+    assert exact_revision_fetches == 1
 
     canceled = fetch_subscription!(subscription.id)
     assert canceled.status == :canceled
@@ -1154,4 +1159,41 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
       ]
     )
   end
+
+  defp capture_exact_plan_revision_primary_key_fetches(fun) when is_function(fun, 0) do
+    count_key = {__MODULE__, :exact_plan_revision_primary_key_fetch_count, make_ref()}
+    handler_id = "jc247_exact_plan_revision_fetch_#{System.unique_integer([:positive])}"
+    Process.put(count_key, 0)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :repo, :query],
+        fn _event, _measurements, metadata, key ->
+          if exact_plan_revision_primary_key_fetch?(Map.get(metadata, :query, "")) do
+            Process.put(key, Process.get(key, 0) + 1)
+          end
+        end,
+        count_key
+      )
+
+    try do
+      result = fun.()
+      {result, Process.get(count_key, 0)}
+    after
+      :telemetry.detach(handler_id)
+      Process.delete(count_key)
+    end
+  end
+
+  defp exact_plan_revision_primary_key_fetch?(query) when is_binary(query) do
+    normalized_query = query |> String.downcase() |> String.replace(~r/\s+/, " ")
+
+    Regex.match?(
+      ~r/from\s+"plan_revisions"\s+as\s+p\d+\s+where\s+\(p\d+\."id"::uuid\s*=\s*\$1::uuid\)/,
+      normalized_query
+    )
+  end
+
+  defp exact_plan_revision_primary_key_fetch?(_query), do: false
 end
