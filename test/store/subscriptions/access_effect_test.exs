@@ -91,6 +91,7 @@ defmodule Store.Subscriptions.AccessEffectTest do
 
   test "NON_EFFECTIVE recovery selector remains backed by its existing partial index" do
     Repo.query!("SET LOCAL enable_seqscan = off")
+    Repo.query!("SET LOCAL enable_bitmapscan = off")
 
     through_updated_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
     after_updated_at = DateTime.add(through_updated_at, -1, :second)

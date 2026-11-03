@@ -6,6 +6,7 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
 
   alias Ash.Resource.Info
   alias Oban.Job
+  alias Store.Entitlements.EntitlementGrant
   alias Store.Payments.PaymentIntent
   alias Store.Payments.Types.ProviderObservation
   alias Store.Repo
@@ -13,6 +14,7 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
   alias Store.Subscriptions.{
     AccessEffect,
     Facade,
+    PlanRevision,
     RenewalAttempt,
     RenewalCollectionAttempt,
     RenewalCollectionAttempts,
@@ -622,6 +624,8 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
         started_at: DateTime.add(now, -80 * 86_400, :second)
       })
 
+    _grant = issue_subscription_grant!(subscription)
+
     enable_stripe!()
 
     StripeAPIStub.stub_payment_intent(fn conn, params ->
@@ -675,10 +679,11 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     effect = fetch_current_access_effect!(subscription.id)
     assert effect.disposition == :non_effective
     assert effect.source_version == canceled.aggregate_version
+    assert effect.status == :applied
     assert count_scheduled_cancellation_outboxes(subscription.id) == 1
 
-    assert {:ok, :applied} = Facade.execute_suspension_access_effect_for_system(effect.id)
-    assert fetch_current_access_effect!(subscription.id).status == :applied
+    assert %EntitlementGrant{status: :revoked, revoked_reason: "canceled_period_end"} =
+             fetch_subscription_grant!(subscription.id)
   end
 
   test "financial payment application stays awaiting until late exact commercial reconciliation" do
@@ -764,6 +769,7 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
 
     effect = fetch_current_access_effect!(subscription.id)
     assert effect.disposition == :non_effective
+    assert effect.status == :applied
     assert effect.source_version == canceled.aggregate_version
     assert length(access_effects(subscription.id)) == 1
     assert count_scheduled_cancellation_outboxes(subscription.id) == 1
@@ -849,6 +855,141 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     assert count_scheduled_cancellation_outboxes(subscription.id) == 1
   end
 
+  test "direct due sweep creates the same policy-free boundary target for both policies" do
+    for access_on_cancel <- [:remove_immediately, :keep_until_period_end] do
+      {customer, subscription} =
+        create_subscription(
+          "jc247_due_policy_#{access_on_cancel}",
+          %{access_on_cancel: access_on_cancel}
+        )
+
+      boundary_at = subscription.current_period_end_at
+      grant = issue_subscription_grant!(subscription)
+
+      assert {:ok, scheduled} =
+               Facade.cancel_subscription_for_user(customer, subscription.id, :period_end)
+
+      assert scheduled.status == :active
+      assert scheduled.current_plan_revision_id == subscription.current_plan_revision_id
+      assert access_effects(subscription.id) == []
+
+      assert {:ok, result} =
+               Facade.run_due_scheduled_cancellations_for_system(
+                 now: DateTime.add(boundary_at, 1, :second)
+               )
+
+      assert Enum.sort(Map.keys(result)) ==
+               Enum.sort([:due_count, :canceled_count, :failed_count, :cursor, :now])
+
+      assert result.due_count == 1
+      assert result.canceled_count == 1
+      assert result.failed_count == 0
+
+      canceled = fetch_subscription!(subscription.id)
+      assert canceled.status == :canceled
+      assert canceled.canceled_reason == "canceled_period_end"
+      assert canceled.canceled_at == boundary_at
+      assert canceled.ended_at == boundary_at
+      assert canceled.current_plan_revision_id == subscription.current_plan_revision_id
+      assert is_nil(canceled.current_dunning_renewal_attempt_id)
+
+      assert [effect] = access_effects(subscription.id)
+      assert effect.status == :applied
+      assert effect.disposition == :non_effective
+      assert is_nil(effect.entitlement_kind)
+      assert is_nil(effect.entitlement_scope_key)
+      assert is_nil(effect.valid_from_at)
+      assert is_nil(effect.valid_until_at)
+      assert effect.plan_revision_id == subscription.current_plan_revision_id
+      assert effect.source_order_line_item_id == canceled.source_order_line_item_id
+      assert effect.contract_change_id == canceled.current_contract_change_id
+      assert effect.source_version == canceled.aggregate_version
+
+      assert %EntitlementGrant{status: :revoked, revoked_reason: "canceled_period_end"} =
+               fetch_entitlement_grant!(grant.id)
+
+      assert count_scheduled_cancellation_outboxes(subscription.id) == 1
+
+      assert {:ok, replay_result} =
+               Facade.run_due_scheduled_cancellations_for_system(
+                 now: DateTime.add(boundary_at, 1, :second)
+               )
+
+      assert replay_result.due_count == 0
+      assert replay_result.canceled_count == 0
+      assert access_effects(subscription.id) == [effect]
+      assert count_scheduled_cancellation_outboxes(subscription.id) == 1
+    end
+  end
+
+  test "notification replay requires the exact current boundary effect to be applied" do
+    {customer, subscription} = create_subscription("jc247_notification_exact_effect")
+    boundary_at = subscription.current_period_end_at
+
+    assert {:ok, _scheduled} =
+             Facade.cancel_subscription_for_user(customer, subscription.id, :period_end)
+
+    assert {:ok, %{due_count: 1, canceled_count: 1}} =
+             Facade.run_due_scheduled_cancellations_for_system(
+               now: DateTime.add(boundary_at, 1, :second)
+             )
+
+    canceled = fetch_subscription!(subscription.id)
+    assert [current_effect] = access_effects(subscription.id)
+    assert current_effect.source_version == canceled.aggregate_version
+    assert current_effect.status == :applied
+
+    assert {:ok, _} =
+             Repo.query(
+               "DELETE FROM email_outboxes WHERE subscription_id = $1 AND idempotency_key LIKE $2",
+               [
+                 Ecto.UUID.dump!(subscription.id),
+                 "membership_access_ended:sub:%:reason:canceled_period_end:period_end:%"
+               ]
+             )
+
+    historical_version = current_effect.source_version - 1
+    assert historical_version > 0
+
+    Repo.query!(
+      "UPDATE access_effects SET status = 'required' WHERE id = $1",
+      [Ecto.UUID.dump!(current_effect.id)]
+    )
+
+    historical_id = Ecto.UUID.generate()
+
+    Repo.query!(
+      """
+      INSERT INTO access_effects (
+        id, subscription_id, source_version, status, disposition,
+        entitlement_kind, entitlement_scope_key, valid_from_at, valid_until_at,
+        source_order_line_item_id, contract_change_id, plan_revision_id,
+        target_fingerprint, inserted_at, updated_at
+      ) VALUES (
+        $1, $2, $3, 'applied', 'non_effective',
+        NULL, NULL, NULL, NULL,
+        $4, $5, $6, $7, clock_timestamp(), clock_timestamp()
+      )
+      """,
+      [
+        Ecto.UUID.dump!(historical_id),
+        Ecto.UUID.dump!(subscription.id),
+        historical_version,
+        Ecto.UUID.dump!(current_effect.source_order_line_item_id),
+        current_effect.contract_change_id && Ecto.UUID.dump!(current_effect.contract_change_id),
+        Ecto.UUID.dump!(current_effect.plan_revision_id),
+        current_effect.target_fingerprint
+      ]
+    )
+
+    assert {:ok, %{replay_count: 0, failed_count: 0, cursor: nil}} =
+             Facade.replay_scheduled_cancellation_notifications_for_system()
+
+    assert current_effect.id == fetch_current_access_effect!(subscription.id).id
+    assert fetch_current_access_effect!(subscription.id).status == :required
+    assert count_scheduled_cancellation_outboxes(subscription.id) == 0
+  end
+
   test "rescission clears a funded target before the due worker selects it" do
     {customer, subscription} = create_subscription("jc242_rescind")
 
@@ -928,6 +1069,7 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
 
     plan =
       SubscriptionsFixtures.create_subscription_plan!(%{
+        access_on_cancel: Map.get(overrides, :access_on_cancel, :remove_immediately),
         entitlement_kind: :membership_access,
         entitlement_scope_key: "membership:#{prefix}"
       })
@@ -939,7 +1081,10 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
         customer.id,
         variant,
         plan,
-        Map.merge(%{provider_billing_ref: "pm_#{prefix}"}, overrides)
+        Map.merge(
+          %{provider_billing_ref: "pm_#{prefix}"},
+          Map.drop(Map.new(overrides), [:access_on_cancel])
+        )
       )
 
     {customer, subscription}
@@ -990,6 +1135,50 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
       Facade.get_current_access_effect_for_system(fetch_subscription!(subscription_id))
 
     effect
+  end
+
+  defp issue_subscription_grant!(%Subscription{} = subscription) do
+    revision =
+      Ash.get!(PlanRevision, subscription.current_plan_revision_id,
+        domain: Store.Subscriptions,
+        authorize?: false,
+        context: %{system?: true}
+      )
+
+    EntitlementGrant
+    |> Ash.Changeset.for_create(
+      :issue,
+      %{
+        user_id: subscription.user_id,
+        kind: revision.entitlement_kind,
+        scope_key: revision.entitlement_scope_key,
+        source_kind: :subscription,
+        source_id: subscription.id,
+        status: :active,
+        valid_from_at: subscription.current_period_start_at,
+        valid_to_at: subscription.current_period_end_at
+      },
+      context: %{system?: true}
+    )
+    |> Ash.create!(domain: Store.Entitlements, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_entitlement_grant!(grant_id) do
+    Ash.get!(EntitlementGrant, grant_id,
+      domain: Store.Entitlements,
+      authorize?: false,
+      context: %{system?: true}
+    )
+  end
+
+  defp fetch_subscription_grant!(subscription_id) do
+    EntitlementGrant
+    |> Ash.Query.filter(expr(source_kind == :subscription and source_id == ^subscription_id))
+    |> Ash.read_one!(
+      domain: Store.Entitlements,
+      authorize?: false,
+      context: %{system?: true}
+    )
   end
 
   defp access_effects(subscription_id) do
@@ -1080,5 +1269,188 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
         request_options: StripeAPIStub.req_options()
       ]
     )
+  end
+end
+
+defmodule Store.Subscriptions.Sbh4002ScheduledBoundaryPostCommitTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :real_connections
+
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Store.Entitlements.EntitlementGrant
+  alias Store.Repo
+  alias Store.Subscriptions.{AccessEffect, Facade}
+  alias Store.SubscriptionsFixtures
+
+  import Ash.Expr
+  require Ash.Query
+
+  setup_all do
+    :ok = Sandbox.mode(Store.Repo, :auto)
+    :ok = Sandbox.mode(Store.DirectRepo, :auto)
+
+    on_exit(fn ->
+      :ok = Sandbox.mode(Store.Repo, :manual)
+      :ok = Sandbox.mode(Store.DirectRepo, :manual)
+    end)
+
+    :ok
+  end
+
+  test "both policy values commit the exact effect before post-commit F2 runs" do
+    for access_on_cancel <- [:remove_immediately, :keep_until_period_end] do
+      prefix = "jc247_real_boundary_#{access_on_cancel}_#{Ecto.UUID.generate()}"
+      customer = SubscriptionsFixtures.create_customer!(prefix)
+      %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
+
+      plan =
+        SubscriptionsFixtures.create_subscription_plan!(%{
+          access_on_cancel: access_on_cancel,
+          entitlement_kind: :membership_access,
+          entitlement_scope_key: "membership:#{prefix}"
+        })
+
+      SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
+
+      %{subscription: subscription, revision: revision} =
+        SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
+          provider_billing_ref: "pm_#{prefix}"
+        })
+
+      grant = issue_grant!(subscription, revision)
+      boundary_at = subscription.current_period_end_at
+
+      assert {:ok, scheduled} =
+               Facade.cancel_subscription_for_user(customer, subscription.id, :period_end)
+
+      assert scheduled.status == :active
+      assert access_effects(subscription.id) == []
+
+      :ok = install_commit_fence!(subscription.id, grant.id)
+
+      assert {:ok, result} =
+               Facade.run_due_scheduled_cancellations_for_system(
+                 now: DateTime.add(boundary_at, 1, :second)
+               )
+
+      assert Enum.sort(Map.keys(result)) ==
+               Enum.sort([:due_count, :canceled_count, :failed_count, :cursor, :now])
+
+      canceled = fetch_subscription!(subscription.id)
+      assert canceled.status == :canceled
+      assert canceled.canceled_reason == "canceled_period_end"
+      assert canceled.canceled_at == boundary_at
+      assert canceled.current_plan_revision_id == revision.id
+
+      assert [effect] = access_effects(subscription.id)
+      assert effect.status == :applied
+      assert effect.disposition == :non_effective
+      assert is_nil(effect.entitlement_kind)
+      assert is_nil(effect.entitlement_scope_key)
+      assert is_nil(effect.valid_from_at)
+      assert is_nil(effect.valid_until_at)
+      assert effect.plan_revision_id == revision.id
+
+      assert %EntitlementGrant{status: :revoked, revoked_reason: "canceled_period_end"} =
+               fetch_grant!(grant.id)
+
+      assert scheduled_email_count(subscription.id) == 1
+    end
+  end
+
+  defp install_commit_fence!(subscription_id, grant_id) do
+    function = "jc247_commit_fence_#{System.unique_integer([:positive])}"
+    trigger = "#{function}_trigger"
+
+    Repo.query!("""
+    CREATE FUNCTION #{function}() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.subscription_id = '#{subscription_id}'::uuid AND (
+        NOT EXISTS (
+          SELECT 1 FROM access_effects
+          WHERE id = NEW.id
+            AND status = 'required'
+            AND disposition = 'non_effective'
+        ) OR NOT EXISTS (
+          SELECT 1 FROM entitlement_grants
+          WHERE id = '#{grant_id}'::uuid
+            AND status = 'active'
+            AND revoked_reason IS NULL
+        )
+      ) THEN
+        RAISE EXCEPTION 'scheduled-boundary F2 ran before its source transaction committed';
+      END IF;
+      RETURN NEW;
+    END;
+    $$
+    """)
+
+    Repo.query!("""
+    CREATE CONSTRAINT TRIGGER #{trigger}
+    AFTER INSERT ON access_effects
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION #{function}()
+    """)
+
+    on_exit(fn ->
+      Repo.query!("DROP TRIGGER IF EXISTS #{trigger} ON access_effects")
+      Repo.query!("DROP FUNCTION IF EXISTS #{function}()")
+    end)
+
+    :ok
+  end
+
+  defp issue_grant!(subscription, revision) do
+    EntitlementGrant
+    |> Ash.Changeset.for_create(
+      :issue,
+      %{
+        user_id: subscription.user_id,
+        kind: revision.entitlement_kind,
+        scope_key: revision.entitlement_scope_key,
+        source_kind: :subscription,
+        source_id: subscription.id,
+        status: :active,
+        valid_from_at: subscription.current_period_start_at,
+        valid_to_at: subscription.current_period_end_at
+      },
+      context: %{system?: true}
+    )
+    |> Ash.create!(domain: Store.Entitlements, authorize?: false, context: %{system?: true})
+  end
+
+  defp access_effects(subscription_id) do
+    AccessEffect
+    |> Ash.Query.filter(expr(subscription_id == ^subscription_id))
+    |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_subscription!(subscription_id) do
+    Store.Subscriptions.Subscription
+    |> Ash.Query.filter(expr(id == ^subscription_id))
+    |> Ash.read_one!(
+      domain: Store.Subscriptions,
+      authorize?: false,
+      context: %{system?: true}
+    )
+  end
+
+  defp fetch_grant!(grant_id) do
+    Ash.get!(EntitlementGrant, grant_id,
+      domain: Store.Entitlements,
+      authorize?: false,
+      context: %{system?: true}
+    )
+  end
+
+  defp scheduled_email_count(subscription_id) do
+    {:ok, %{rows: [[count]]}} =
+      Repo.query(
+        "SELECT count(*) FROM email_outboxes WHERE subscription_id = $1 AND template_kind = 'access_ended'",
+        [Ecto.UUID.dump!(subscription_id)]
+      )
+
+    count
   end
 end
