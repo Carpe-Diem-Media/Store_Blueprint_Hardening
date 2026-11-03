@@ -5,7 +5,9 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
   @tag timeout: 60_000
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Store.Entitlements.EntitlementGrant
   alias Store.Repo
+  alias Store.Subscriptions.AccessEffect
   alias Store.Subscriptions.Facade
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
   alias Store.SubscriptionsFixtures
@@ -39,12 +41,12 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     {:ok, direct_repo_owner: direct_repo_owner}
   end
 
-  test "producer and reconciliation serialize in both lock-arrival orders", context do
+  test "cancellation producer and F0.5 serialize in both lock-arrival orders", context do
     producer_first = create_committed_source!("producer_first")
 
     try do
       run_race!(producer_first, :producer_first, context.direct_repo_owner)
-      assert_final_non_effective_target!(producer_first)
+      assert_final_effective_target!(producer_first)
     after
       cleanup_owned_source!(producer_first)
     end
@@ -53,7 +55,8 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
 
     try do
       run_race!(reconciler_first, :reconciler_first, context.direct_repo_owner)
-      assert_final_non_effective_target!(reconciler_first)
+      assert_pre_cancellation_effect_derived_from_source!(reconciler_first)
+      assert_final_effective_target!(reconciler_first)
 
       IO.puts(
         "F0_5_CONTENTION pool_size=#{context.effective_repo_pool_size} both_orders=serialized"
@@ -193,7 +196,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
           SubscriptionsFixtures.create_subscription_plan!(%{
             entitlement_kind: :membership_access,
             entitlement_scope_key: "f05-contention-#{label}-#{unique}",
-            access_on_cancel: :remove_immediately
+            access_on_cancel: :keep_until_period_end
           })
 
         variant_plan = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
@@ -203,18 +206,18 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
             create_payment_intent?: false
           })
 
-        assert fixture.revision.access_on_cancel == :remove_immediately
+        assert fixture.revision.access_on_cancel == :keep_until_period_end
         assert fixture.subscription.current_plan_revision_id == fixture.revision.id
 
         stale_input =
           input!(%{
             subscription_id: fixture.subscription.id,
             source_version: fixture.subscription.aggregate_version,
-            disposition: :effective,
-            entitlement_kind: fixture.revision.entitlement_kind,
-            entitlement_scope_key: fixture.revision.entitlement_scope_key,
-            valid_from_at: ~U[2020-01-01 00:00:00.000000Z],
-            valid_until_at: fixture.subscription.current_period_end_at,
+            disposition: :non_effective,
+            entitlement_kind: nil,
+            entitlement_scope_key: nil,
+            valid_from_at: nil,
+            valid_until_at: nil,
             source_order_line_item_id: fixture.line_item.id,
             contract_change_id: fixture.subscription.current_contract_change_id,
             plan_revision_id: fixture.revision.id
@@ -237,6 +240,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
           plan: plan,
           variant_plan: variant_plan,
           candidate: candidate,
+          pre_cancellation_source_version: fixture.subscription.aggregate_version + 1,
           through_inserted_at: inserted_at,
           after_inserted_at: inserted_at
         })
@@ -259,78 +263,97 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     end
   end
 
-  defp assert_final_non_effective_target!(fixture) do
+  defp assert_final_effective_target!(fixture) do
     subscription = fetch_subscription!(fixture.subscription.id)
-    effect = latest_effect!(fixture.subscription.id)
+    assert {:ok, effect} = Facade.get_current_access_effect_for_system(subscription)
 
     assert subscription.status == :canceled
-    assert effect.status in ["required", "pending", "failed_retryable"]
-    assert effect.disposition == "non_effective"
+    assert subscription.canceled_reason == "user_request"
+    assert %DateTime{} = subscription.canceled_at
+    assert effect.status in [:required, :pending, :failed_retryable, :applied]
+    assert effect.disposition == :effective
     assert effect.source_version == subscription.aggregate_version
-    assert effect.entitlement_kind == nil
-    assert effect.entitlement_scope_key == nil
-    assert effect.valid_from_at == nil
-    assert effect.valid_until_at == nil
+    assert effect.entitlement_kind == fixture.revision.entitlement_kind
+    assert effect.entitlement_scope_key == fixture.revision.entitlement_scope_key
+    assert effect.valid_from_at == subscription.current_period_start_at
+    assert effect.valid_until_at == subscription.current_period_end_at
     assert effect.source_order_line_item_id == subscription.source_order_line_item_id
     assert effect.contract_change_id == subscription.current_contract_change_id
     assert effect.plan_revision_id == subscription.current_plan_revision_id
-    assert unresolved_effect_count!(fixture.subscription.id) == 1
+    assert effect.plan_revision_id == fixture.revision.id
+    assert current_effect_count!(subscription.id, subscription.aggregate_version) == 1
+
+    assert {:ok, outcome} = Facade.execute_effective_access_effect_for_system(effect.id)
+    assert outcome in [:applied, :applied_projection_pending, :noop]
+
+    assert {:ok, current_effect} = Facade.get_current_access_effect_for_system(subscription)
+    assert current_effect.id == effect.id
+    assert current_effect.disposition == :effective
+    assert current_effect.source_version == subscription.aggregate_version
+
+    assert [grant] = active_grants_for!(subscription.id)
+    assert grant.source_kind == :subscription
+    assert grant.source_id == subscription.id
+    assert grant.kind == current_effect.entitlement_kind
+    assert grant.scope_key == current_effect.entitlement_scope_key
+    assert grant.valid_from_at == current_effect.valid_from_at
+    assert grant.valid_to_at == current_effect.valid_until_at
   end
 
-  defp latest_effect!(subscription_id) do
-    %{rows: [row]} =
-      Repo.query!(
-        """
-        SELECT status::text, disposition::text, source_version,
-               entitlement_kind::text, entitlement_scope_key, valid_from_at, valid_until_at,
-               source_order_line_item_id::text, contract_change_id::text, plan_revision_id::text
-        FROM access_effects
-        WHERE subscription_id = $1
-        ORDER BY source_version DESC
-        LIMIT 1
-        """,
-        [Ecto.UUID.dump!(subscription_id)]
+  defp assert_pre_cancellation_effect_derived_from_source!(fixture) do
+    effect =
+      fetch_effect_for_source_version!(
+        fixture.subscription.id,
+        fixture.pre_cancellation_source_version
       )
 
-    [
-      status,
-      disposition,
-      source_version,
-      entitlement_kind,
-      entitlement_scope_key,
-      valid_from_at,
-      valid_until_at,
-      source_order_line_item_id,
-      contract_change_id,
-      plan_revision_id
-    ] = row
+    assert effect.disposition == :effective
+    assert effect.source_version == fixture.pre_cancellation_source_version
+    assert effect.entitlement_kind == fixture.revision.entitlement_kind
+    assert effect.entitlement_scope_key == fixture.revision.entitlement_scope_key
+    assert effect.valid_from_at == fixture.subscription.current_period_start_at
+    assert effect.valid_until_at == fixture.subscription.current_period_end_at
+    assert effect.source_order_line_item_id == fixture.subscription.source_order_line_item_id
+    assert effect.contract_change_id == fixture.subscription.current_contract_change_id
+    assert effect.plan_revision_id == fixture.revision.id
+    assert current_effect_count!(fixture.subscription.id, effect.source_version) == 1
 
-    %{
-      status: status,
-      disposition: disposition,
-      source_version: source_version,
-      entitlement_kind: entitlement_kind,
-      entitlement_scope_key: entitlement_scope_key,
-      valid_from_at: valid_from_at,
-      valid_until_at: valid_until_at,
-      source_order_line_item_id: source_order_line_item_id,
-      contract_change_id: contract_change_id,
-      plan_revision_id: plan_revision_id
-    }
+    assert fixture.candidate.disposition == :non_effective
+    assert fetch_access_effect!(fixture.candidate.id).status == :superseded
   end
 
-  defp unresolved_effect_count!(subscription_id) do
+  defp current_effect_count!(subscription_id, source_version) do
     %{rows: [[count]]} =
       Repo.query!(
         """
-        SELECT count(*) FROM access_effects
-        WHERE subscription_id = $1
-          AND status IN ('required', 'pending', 'failed_retryable')
+        SELECT count(*) FROM access_effects WHERE subscription_id = $1 AND source_version = $2
         """,
-        [Ecto.UUID.dump!(subscription_id)]
+        [Ecto.UUID.dump!(subscription_id), source_version]
       )
 
     count
+  end
+
+  defp fetch_access_effect!(effect_id) do
+    AccessEffect
+    |> Ash.Query.filter(expr(id == ^effect_id))
+    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_effect_for_source_version!(subscription_id, source_version) do
+    AccessEffect
+    |> Ash.Query.filter(
+      expr(subscription_id == ^subscription_id and source_version == ^source_version)
+    )
+    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp active_grants_for!(subscription_id) do
+    EntitlementGrant
+    |> Ash.Query.filter(
+      expr(source_kind == :subscription and source_id == ^subscription_id and status == :active)
+    )
+    |> Ash.read!(domain: Store.Entitlements, authorize?: false, context: %{system?: true})
   end
 
   defp fetch_subscription!(subscription_id) do
@@ -364,7 +387,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
         )
 
       true ->
-        Process.sleep(25)
+        :erlang.yield()
         poll_blocking_pids!(blocked_pid, expected_blocker_pid, deadline, blockers)
     end
   end
