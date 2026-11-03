@@ -7542,6 +7542,25 @@ defmodule Store.Subscriptions.Facade do
   end
 
   defp apply_locked_reconciliation(
+         %Subscription{status: :canceled} = subscription,
+         contract_change,
+         %RenewalAttempt{status: :succeeded} = attempt,
+         revision,
+         target
+       ) do
+    # A later terminal cancellation remains authoritative after a successful
+    # renewal. Reuse the existing canceled outcome without re-identifying or
+    # re-executing the historical renewal AccessEffect.
+    apply_locked_reconciliation_without_historical_effect(
+      subscription,
+      contract_change,
+      attempt,
+      revision,
+      target
+    )
+  end
+
+  defp apply_locked_reconciliation(
          %Subscription{} = subscription,
          contract_change,
          %RenewalAttempt{} = attempt,

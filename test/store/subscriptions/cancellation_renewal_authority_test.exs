@@ -1037,7 +1037,157 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
     assert :atomics.get(provider_post_count, 1) == 1
   end
 
-  test "cancel-now keep policy preserves recovery access against stale suspension revoke" do
+  test "succeeded renewal replay preserves later keep-until-period-end cancellation" do
+    customer = SubscriptionsFixtures.create_customer!("jc247c_terminal_keep_cancel")
+    %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
+
+    plan =
+      SubscriptionsFixtures.create_subscription_plan!(%{
+        entitlement_kind: :membership_access,
+        entitlement_scope_key: "membership:jc247c-terminal-keep-cancel",
+        access_on_cancel: :keep_until_period_end
+      })
+
+    SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{subscription: subscription, revision: revision} =
+      SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
+        provider_billing_ref: "pm_jc247c_terminal_keep_cancel",
+        started_at: DateTime.add(now, -40 * 86_400, :second)
+      })
+
+    assert revision.access_on_cancel == :keep_until_period_end
+    assert subscription.current_plan_revision_id == revision.id
+
+    assert {:ok, _grant} =
+             EntitlementsFacade.issue_subscription_entitlement_for_system(subscription, plan)
+
+    enable_stripe!()
+    provider_post_count = :atomics.new(1, [])
+
+    StripeAPIStub.stub_payment_intent(fn conn, params ->
+      :atomics.add(provider_post_count, 1, 1)
+
+      StripeAPIStub.json_response(
+        conn,
+        StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
+      )
+    end)
+
+    assert {:ok, :processed} =
+             SubscriptionsFacade.process_due_subscription_renewal_for_system(subscription.id,
+               now: now
+             )
+
+    attempt = fetch_attempt!(subscription.id)
+    assert suspend_subscription!(fetch_subscription!(subscription.id)).status == :suspended
+    suspended_source = fetch_subscription!(subscription.id)
+
+    assert {:ok, suspension_effect_input} =
+             EstablishAccessEffectInput.new(%{
+               subscription_id: suspended_source.id,
+               source_version: suspended_source.aggregate_version,
+               disposition: :non_effective,
+               entitlement_kind: nil,
+               entitlement_scope_key: nil,
+               valid_from_at: nil,
+               valid_until_at: nil,
+               source_order_line_item_id: suspended_source.source_order_line_item_id,
+               contract_change_id: suspended_source.current_contract_change_id,
+               plan_revision_id: revision.id
+             })
+
+    assert {:ok, suspension_effect} =
+             SubscriptionsFacade.establish_access_effect_for_system(suspension_effect_input)
+
+    assert assert_current_effect!(suspended_source, revision, :non_effective).id ==
+             suspension_effect.id
+
+    assert {:ok, _revoked} =
+             EntitlementsFacade.revoke_subscription_entitlements_for_system(
+               subscription.id,
+               "grace_expired"
+             )
+
+    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
+
+    assert {:ok, %{outcome: :authoritative_success}} =
+             Store.Payments.record_and_apply_payment_observation_for_system(
+               payment_intent,
+               authoritative_success_observation(payment_intent)
+             )
+
+    assert count_payment_applications(attempt.order_id) == 1
+    assert {:ok, :reconciled} = reconcile_paid_renewal!(attempt)
+
+    recovered_source = fetch_subscription!(subscription.id)
+    assert recovered_source.status == :active
+    assert fetch_attempt!(subscription.id).status == :succeeded
+    recovery_effect = assert_current_effect!(recovered_source, revision, :effective)
+    assert recovery_effect.valid_from_at == attempt.period_start_at
+    assert recovery_effect.valid_until_at == attempt.period_end_at
+    assert_active_grant_matches_effect!(recovered_source, recovery_effect)
+
+    assert {:ok, canceled} =
+             SubscriptionsFacade.cancel_subscription_for_user(customer, subscription.id, :now)
+
+    assert canceled.status == :canceled
+    assert canceled.current_plan_revision_id == revision.id
+
+    canceled_source = fetch_subscription!(subscription.id)
+    cancellation_effect = assert_current_effect!(canceled_source, revision, :effective)
+    assert cancellation_effect.valid_from_at == attempt.period_start_at
+    assert cancellation_effect.valid_until_at == attempt.period_end_at
+    assert_active_grant_matches_effect!(canceled_source, cancellation_effect)
+    assert fetch_access_effect!(suspension_effect.id).status == :superseded
+
+    assert {:ok, :noop} =
+             SubscriptionsFacade.execute_suspension_access_effect_for_system(suspension_effect.id)
+
+    assert fetch_access_effect!(suspension_effect.id).status == :superseded
+
+    before_replay_attempt = fetch_attempt!(subscription.id)
+    before_replay_order = fetch_order!(attempt.order_id)
+    before_replay_subscription = fetch_subscription!(subscription.id)
+    before_replay_effect = current_access_effect!(before_replay_subscription)
+    before_replay_effects = access_effects_for_subscription!(subscription.id)
+    before_replay_grants = grants_for(subscription.id, :active)
+    before_replay_applications = count_payment_applications(attempt.order_id)
+    before_replay_refunds = refunds_for(attempt.order_id, attempt.payment_intent_id)
+
+    historical_matches =
+      historical_charged_renewal_effects_for_test!(
+        before_replay_subscription,
+        before_replay_attempt,
+        recovery_effect
+      )
+
+    assert before_replay_attempt.status == :succeeded
+    assert before_replay_order.state == :paid
+    assert before_replay_subscription.status == :canceled
+    assert before_replay_subscription.canceled_reason == "user_request"
+    assert before_replay_effect.id == cancellation_effect.id
+    assert Enum.map(historical_matches, & &1.id) == [cancellation_effect.id, recovery_effect.id]
+    assert before_replay_applications == 1
+    assert before_replay_refunds == []
+    assert_active_grant_matches_effect!(before_replay_subscription, before_replay_effect)
+
+    assert {:ok, :noop} = reconcile_paid_renewal!(before_replay_attempt)
+
+    assert fetch_attempt!(subscription.id) == before_replay_attempt
+    assert fetch_order!(attempt.order_id) == before_replay_order
+    assert fetch_subscription!(subscription.id) == before_replay_subscription
+    assert current_access_effect!(before_replay_subscription) == before_replay_effect
+    assert access_effects_for_subscription!(subscription.id) == before_replay_effects
+    assert grants_for(subscription.id, :active) == before_replay_grants
+    assert count_payment_applications(attempt.order_id) == before_replay_applications
+    assert refunds_for(attempt.order_id, attempt.payment_intent_id) == before_replay_refunds
+    assert count_refunds() == 0
+    assert :atomics.get(provider_post_count, 1) == 1
+  end
+
+  test "pre-success keep cancellation replay fails closed on ambiguous history" do
     customer = SubscriptionsFixtures.create_customer!("jc265_recovery_keep_cancel")
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
 
@@ -1120,14 +1270,46 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
 
     assert count_payment_applications(attempt.order_id) == 1
 
-    assert {:ok, :reconciled} = reconcile_paid_renewal!(attempt)
+    owner = self()
+    telemetry_handler_id = "jc247c_keep_replay-#{System.unique_integer([:positive])}"
+    sync_counter = :atomics.new(1, [])
+
+    :ok =
+      :telemetry.attach(
+        telemetry_handler_id,
+        [:store, :subscriptions, :paid_renewal_access_sync],
+        fn _event, _measurements, _metadata, config ->
+          if :atomics.add_get(config.sync_counter, 1, 1) == 1 do
+            send(config.owner, {:jc247c_paid_renewal_access_sync, self()})
+
+            receive do
+              :resume_paid_renewal_access_sync -> :ok
+            end
+          else
+            :ok
+          end
+        end,
+        %{owner: owner, sync_counter: sync_counter}
+      )
+
+    on_exit(fn -> :telemetry.detach(telemetry_handler_id) end)
+
+    reconciliation_task =
+      Task.async(fn ->
+        receive do
+          :start_paid_renewal_reconciliation -> reconcile_paid_renewal!(attempt)
+        end
+      end)
+
+    send(reconciliation_task.pid, :start_paid_renewal_reconciliation)
+    assert_receive {:jc247c_paid_renewal_access_sync, recovery_worker}, 1_000
 
     recovered_source = fetch_subscription!(subscription.id)
     assert recovered_source.status == :active
     recovery_effect = assert_current_effect!(recovered_source, revision, :effective)
     assert recovery_effect.valid_from_at == attempt.period_start_at
     assert recovery_effect.valid_until_at == attempt.period_end_at
-    assert_active_grant_matches_effect!(recovered_source, recovery_effect)
+    assert fetch_attempt!(subscription.id).status == :processing
 
     assert {:ok, canceled} =
              SubscriptionsFacade.cancel_subscription_for_user(customer, subscription.id, :now)
@@ -1140,6 +1322,53 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
     assert cancellation_effect.valid_from_at == attempt.period_start_at
     assert cancellation_effect.valid_until_at == attempt.period_end_at
     assert_active_grant_matches_effect!(canceled_source, cancellation_effect)
+
+    pre_success_attempt = fetch_attempt!(subscription.id)
+    pre_success_order = fetch_order!(attempt.order_id)
+    pre_success_subscription = fetch_subscription!(subscription.id)
+    pre_success_effect = current_access_effect!(pre_success_subscription)
+    pre_success_effects = access_effects_for_subscription!(subscription.id)
+    pre_success_grants = grants_for(subscription.id, :active)
+    pre_success_applications = count_payment_applications(attempt.order_id)
+    pre_success_refunds = refunds_for(attempt.order_id, attempt.payment_intent_id)
+
+    pre_success_matches =
+      historical_charged_renewal_effects_for_test!(
+        pre_success_subscription,
+        pre_success_attempt,
+        recovery_effect
+      )
+
+    assert pre_success_attempt.status == :processing
+    assert pre_success_order.state == :paid
+    assert pre_success_subscription.status == :canceled
+    assert pre_success_subscription.canceled_reason == "user_request"
+    assert pre_success_effect.id == cancellation_effect.id
+    assert Enum.map(pre_success_matches, & &1.id) == [cancellation_effect.id, recovery_effect.id]
+    assert pre_success_applications == 1
+    assert pre_success_refunds == []
+
+    try do
+      assert {:error,
+              %Error{
+                code: "VALIDATION_ERROR",
+                message:
+                  "charged renewal has ambiguous historical EFFECTIVE AccessEffect evidence"
+              }} = reconcile_paid_renewal!(attempt)
+
+      assert fetch_attempt!(subscription.id) == pre_success_attempt
+      assert fetch_order!(attempt.order_id) == pre_success_order
+      assert fetch_subscription!(subscription.id) == pre_success_subscription
+      assert current_access_effect!(pre_success_subscription) == pre_success_effect
+      assert access_effects_for_subscription!(subscription.id) == pre_success_effects
+      assert grants_for(subscription.id, :active) == pre_success_grants
+      assert count_payment_applications(attempt.order_id) == pre_success_applications
+      assert refunds_for(attempt.order_id, attempt.payment_intent_id) == pre_success_refunds
+    after
+      send(recovery_worker, :resume_paid_renewal_access_sync)
+    end
+
+    assert {:ok, :reconciled} = Task.await(reconciliation_task, 5_000)
 
     assert fetch_access_effect!(suspension_effect.id).status == :superseded
 
@@ -3276,6 +3505,32 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
     AccessEffect
     |> Ash.Query.filter(expr(id == ^effect_id))
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp historical_charged_renewal_effects_for_test!(subscription, attempt, target_effect) do
+    AccessEffect
+    |> Ash.Query.filter(
+      expr(
+        subscription_id == ^subscription.id and
+          disposition == :effective and
+          plan_revision_id == ^attempt.plan_revision_id and
+          source_order_line_item_id == ^subscription.source_order_line_item_id and
+          valid_until_at == ^attempt.period_end_at and
+          entitlement_kind == ^target_effect.entitlement_kind and
+          entitlement_scope_key == ^target_effect.entitlement_scope_key and
+          valid_from_at == ^attempt.period_start_at
+      )
+    )
+    |> Ash.Query.sort(source_version: :desc)
+    |> Ash.Query.limit(2)
+    |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp access_effects_for_subscription!(subscription_id) do
+    AccessEffect
+    |> Ash.Query.filter(expr(subscription_id == ^subscription_id))
+    |> Ash.Query.sort(source_version: :desc)
+    |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 
   defp assert_current_effect!(%Subscription{} = subscription, revision, disposition) do
