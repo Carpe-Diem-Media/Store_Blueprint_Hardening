@@ -34,25 +34,14 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
   test "keep-until-period-end pair target converges through the funded end for suspended",
     do: assert_keep_pair!(:suspended)
 
-  test "keep-until-period-end preserves the accepted nil/nil target" do
-    fixture =
-      create_cancel_fixture!("keep_empty", :active, :keep_until_period_end,
-        entitlement_kind: nil,
-        entitlement_scope_key: nil
-      )
+  test "keep-until-period-end preserves the accepted nil/nil target for active",
+    do: assert_keep_nil_nil!(:active)
 
-    assert {:ok, canceled} = cancel(fixture, :user)
-    assert [effect] = access_effects!(canceled.id)
-    assert effect.status == :applied
-    assert effect.disposition == :effective
-    assert effect.entitlement_kind == nil
-    assert effect.entitlement_scope_key == nil
-    assert effect.valid_from_at == nil
-    assert effect.valid_until_at == fixture.source.current_period_end_at
-    assert effect.plan_revision_id == fixture.revision.id
-    assert [] == Enum.filter(grants_for_source!(canceled.id), &(&1.status == :active))
-    assert access_ended_count(canceled.id) == 0
-  end
+  test "keep-until-period-end preserves the accepted nil/nil target for past_due",
+    do: assert_keep_nil_nil!(:past_due)
+
+  test "keep-until-period-end preserves the accepted nil/nil target for suspended",
+    do: assert_keep_nil_nil!(:suspended)
 
   test "keep policy outside the funded interval uses exact F2 convergence" do
     fixture =
@@ -389,6 +378,66 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
     if attempt, do: assert(fetch_attempt!(attempt.id).id == attempt.id)
   end
 
+  defp assert_keep_nil_nil!(source_state) do
+    fixture =
+      create_cancel_fixture!("keep_empty_#{source_state}", source_state, :keep_until_period_end,
+        entitlement_kind: nil,
+        entitlement_scope_key: nil
+      )
+
+    period_start = fixture.source.current_period_start_at
+    period_end = fixture.source.current_period_end_at
+    attempt = seed_dunning_attempt!(fixture)
+    source_before_cancel = fetch_subscription!(fixture.source.id)
+
+    assert DateTime.compare(period_start, period_end) == :lt
+    assert fixture.revision.entitlement_kind == nil
+    assert fixture.revision.entitlement_scope_key == nil
+
+    if attempt do
+      assert source_before_cancel.current_dunning_renewal_attempt_id == attempt.id
+      assert fetch_attempt!(attempt.id).status == :failed
+    else
+      assert is_nil(source_before_cancel.current_dunning_renewal_attempt_id)
+    end
+
+    assert {:ok, canceled} = cancel(fixture, :user)
+    assert canceled.status == :canceled
+    assert canceled.canceled_reason == "user_request"
+    assert %DateTime{} = canceled.canceled_at
+    assert DateTime.compare(canceled.canceled_at, period_start) in [:eq, :gt]
+    assert DateTime.compare(canceled.canceled_at, period_end) == :lt
+    assert canceled.current_plan_revision_id == fixture.revision.id
+    assert canceled.current_period_start_at == period_start
+    assert canceled.current_period_end_at == period_end
+    assert is_nil(canceled.current_dunning_renewal_attempt_id)
+
+    assert [effect] = access_effects!(canceled.id)
+    assert effect.status == :applied
+    assert effect.disposition == :effective
+    assert effect.plan_revision_id == fixture.revision.id
+    assert effect.entitlement_kind == nil
+    assert effect.entitlement_scope_key == nil
+    assert effect.valid_from_at == nil
+    assert effect.valid_until_at == period_end
+
+    assert [] ==
+             Enum.filter(grants_for_source!(canceled.id), fn grant ->
+               grant.source_kind == :subscription and grant.status == :active
+             end)
+
+    assert access_ended_count(canceled.id) == 0
+
+    if attempt do
+      assert fetch_attempt!(attempt.id).id == attempt.id
+      assert fetch_attempt!(attempt.id).status == :failed
+    end
+
+    assert {:ok, replayed} = cancel(fixture, :user)
+    assert replayed.aggregate_version == canceled.aggregate_version
+    assert access_effects!(canceled.id) == [effect]
+  end
+
   defp assert_f2_email_suppressed!(outcome) do
     fixture = create_cancel_fixture!("email_#{outcome}", :active, :remove_immediately)
     _grant = issue_source_grant!(fixture)
@@ -541,7 +590,11 @@ defmodule Store.Subscriptions.Jc247CAcceptanceMatrixTest do
       "grace_period_days" => revision.grace_period_days,
       "max_retry_attempts" => revision.max_retry_attempts,
       "retry_schedule_hours" => revision.retry_schedule_hours,
-      "entitlement_kind" => Atom.to_string(revision.entitlement_kind),
+      "entitlement_kind" =>
+        if(is_nil(revision.entitlement_kind),
+          do: nil,
+          else: Atom.to_string(revision.entitlement_kind)
+        ),
       "entitlement_scope_key" => revision.entitlement_scope_key
     }
   end
