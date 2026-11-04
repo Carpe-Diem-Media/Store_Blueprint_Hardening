@@ -57,7 +57,7 @@ defmodule Store.MixProject do
       {:ash_postgres, "~> 2.15.2"},
       # These transitive security floors are explicit so parent ranges cannot
       # re-resolve the graph to an advisory-affected release.
-      {:ash_sql, ">= 0.7.1 and < 1.0.0-0"},
+      {:ash_sql, ">= 0.8.6 and < 1.0.0-0"},
       {:ash_phoenix, ">= 2.3.25 and < 3.0.0-0"},
       {:ash_json_api, "~> 1.5"},
       {:ash_state_machine, "~> 0.2.12"},
