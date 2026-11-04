@@ -108,7 +108,7 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
       assert renewal_effect.disposition == :effective
       assert renewal_effect.status in [:required, :superseded]
       assert cancellation_effect.disposition == :non_effective
-      assert cancellation_effect.status == :required
+      assert cancellation_effect.status == :applied
       assert cancellation_effect.source_version > renewal_effect.source_version
       assert active_grants_for!(fixture.subscription.id) == []
 
@@ -133,10 +133,6 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
       IO.puts(
         "JC300_RACE_NEWER_B_BEFORE_A renewal_backend=#{renewal_backend} " <>
           "cancel_backend=#{cancel_backend} A=#{renewal_effect.status} B=#{cancellation_effect.disposition}"
-      )
-
-      IO.puts(
-        "IMMEDIATE_CANCEL_COMPAT_REVOKE_CHANGED=NO JC247_POLICY_PATH_USED=NO SCHEDULED_REMOVE_POLICY_ASSUMED=NO"
       )
     after
       if Process.alive?(renewal_task.pid) do
@@ -266,6 +262,7 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
         interval_count: 1,
         amount_minor: 1_100,
         currency: "USD",
+        access_on_cancel: :remove_immediately,
         entitlement_kind: :membership_access,
         entitlement_scope_key: "membership:#{token}"
       })
@@ -295,6 +292,8 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
         variant_plan: variant_plan,
         now: now
       })
+
+    assert fixture.revision.access_on_cancel == :remove_immediately
 
     if Keyword.get(opts, :issue_initial_grant?, false) do
       assert {:ok, _grant} =
