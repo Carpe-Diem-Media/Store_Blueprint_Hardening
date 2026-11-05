@@ -36,6 +36,58 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert grant.revoked_reason == nil
   end
 
+  @tag :jc360_task07
+  test "a committed REQUIRED initial source effect recovers by exact ID without duplicate rows" do
+    fixture = create_committed_effective_effect_fixture!("jc360_initial_required_recovery")
+
+    assert fetch_effect!(fixture.effect.id).status == :required
+
+    before =
+      Sandbox.unboxed_run(Repo, fn -> source_identity_snapshot!(fixture.subscription.id) end)
+
+    assert before.subscriptions == [fixture.subscription.id]
+    assert before.items == [fixture.item.id]
+    assert before.effects == [fixture.effect.id]
+    assert before.grants == []
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+             end)
+
+    applied = fetch_effect!(fixture.effect.id)
+    assert applied.status == :applied
+    assert_effective_grant!(%{fixture | effect: applied})
+
+    grants_after_apply =
+      Sandbox.unboxed_run(Repo, fn -> grants_for_source!(fixture.subscription.id) end)
+
+    assert length(grants_after_apply) == 1
+
+    after_apply =
+      Sandbox.unboxed_run(Repo, fn -> source_identity_snapshot!(fixture.subscription.id) end)
+
+    assert Map.take(after_apply, [:subscriptions, :items, :effects]) ==
+             Map.take(before, [:subscriptions, :items, :effects])
+
+    assert after_apply.grants == Enum.map(grants_after_apply, & &1.id)
+
+    assert {:ok, :noop} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+             end)
+
+    assert fetch_effect!(fixture.effect.id).status == :applied
+
+    assert Sandbox.unboxed_run(Repo, fn ->
+             grants_for_source!(fixture.subscription.id)
+           end) == grants_after_apply
+
+    assert Sandbox.unboxed_run(Repo, fn ->
+             source_identity_snapshot!(fixture.subscription.id)
+           end) == after_apply
+  end
+
   test "EFFECTIVE nil/nil execution converges to an empty exact-source set" do
     fixture = create_committed_effective_effect_fixture!("jc245_effective_empty", target: :empty)
 
@@ -551,6 +603,39 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     |> Ash.read!(domain: Store.Entitlements, authorize?: false, context: %{system?: true})
   end
 
+  defp source_identity_snapshot!(subscription_id) do
+    dumped_id = Ecto.UUID.dump!(subscription_id)
+
+    %{
+      subscriptions: persisted_ids!("SELECT id FROM subscriptions WHERE id = $1", [dumped_id]),
+      items:
+        persisted_ids!(
+          "SELECT id FROM subscription_items WHERE subscription_id = $1 ORDER BY id",
+          [dumped_id]
+        ),
+      effects:
+        persisted_ids!(
+          "SELECT id FROM access_effects WHERE subscription_id = $1 ORDER BY id",
+          [dumped_id]
+        ),
+      grants:
+        persisted_ids!(
+          """
+          SELECT id
+          FROM entitlement_grants
+          WHERE source_kind = 'subscription' AND source_id = $1
+          ORDER BY id
+          """,
+          [dumped_id]
+        )
+    }
+  end
+
+  defp persisted_ids!(sql, params) do
+    Repo.query!(sql, params).rows
+    |> Enum.map(fn [id] -> Ecto.UUID.load!(id) end)
+  end
+
   defp assert_effective_grant!(fixture) do
     assert [%EntitlementGrant{} = grant] = grants_for_source!(fixture.subscription.id)
     assert grant.status == :active
@@ -572,28 +657,76 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
       plan_id = Ecto.UUID.dump!(fixture.plan.id)
       user_id = Ecto.UUID.dump!(fixture.subscription.user_id)
 
-      Repo.query!("DELETE FROM entitlement_grants WHERE source_id = $1", [subscription_id])
-      Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [subscription_id])
+      assert {:ok, :cleaned} =
+               Repo.transaction(fn ->
+                 Repo.query!("SET CONSTRAINTS products_default_variant_id_fkey DEFERRED")
 
-      Repo.query!(
-        "UPDATE subscriptions SET current_dunning_renewal_attempt_id = NULL WHERE id = $1",
-        [subscription_id]
-      )
+                 Repo.query!(
+                   "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+                   [subscription_id]
+                 )
 
-      Repo.query!("DELETE FROM renewal_attempts WHERE subscription_id = $1", [subscription_id])
-      Repo.query!("DELETE FROM subscription_items WHERE subscription_id = $1", [subscription_id])
-      Repo.query!("DELETE FROM subscriptions WHERE id = $1", [subscription_id])
-      Repo.query!("DELETE FROM order_line_items WHERE id = $1", [line_item_id])
-      Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
-      Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
-      Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
-      Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
-      Repo.query!("DELETE FROM variant_subscription_plans WHERE variant_id = $1", [variant_id])
-      Repo.query!("DELETE FROM plan_revisions WHERE subscription_plan_id = $1", [plan_id])
-      Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [plan_id])
-      Repo.query!("SET CONSTRAINTS products_default_variant_id_fkey DEFERRED")
-      Repo.query!("DELETE FROM products WHERE id = $1", [product_id])
-      Repo.query!("DELETE FROM users WHERE id = $1", [user_id])
+                 Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [
+                   subscription_id
+                 ])
+
+                 Repo.query!(
+                   "UPDATE subscriptions SET current_dunning_renewal_attempt_id = NULL WHERE id = $1",
+                   [subscription_id]
+                 )
+
+                 Repo.query!("DELETE FROM renewal_attempts WHERE subscription_id = $1", [
+                   subscription_id
+                 ])
+
+                 Repo.query!("DELETE FROM subscription_items WHERE subscription_id = $1", [
+                   subscription_id
+                 ])
+
+                 Repo.query!("DELETE FROM subscriptions WHERE id = $1", [subscription_id])
+                 Repo.query!("DELETE FROM order_line_items WHERE id = $1", [line_item_id])
+                 Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
+
+                 Repo.query!(
+                   "DELETE FROM variant_subscription_plans WHERE variant_id = $1",
+                   [variant_id]
+                 )
+
+                 Repo.query!("DELETE FROM plan_revisions WHERE subscription_plan_id = $1", [
+                   plan_id
+                 ])
+
+                 Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [plan_id])
+                 Repo.query!("DELETE FROM products WHERE id = $1", [product_id])
+                 Repo.query!("DELETE FROM users WHERE id = $1", [user_id])
+
+                 cleanup_checks = [
+                   {"subscriptions", "SELECT count(*) FROM subscriptions WHERE id = $1",
+                    subscription_id},
+                   {"subscription_items",
+                    "SELECT count(*) FROM subscription_items WHERE subscription_id = $1",
+                    subscription_id},
+                   {"access_effects",
+                    "SELECT count(*) FROM access_effects WHERE subscription_id = $1",
+                    subscription_id},
+                   {"entitlement_grants",
+                    "SELECT count(*) FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+                    subscription_id},
+                   {"order_line_items", "SELECT count(*) FROM order_line_items WHERE id = $1",
+                    line_item_id},
+                   {"orders", "SELECT count(*) FROM orders WHERE id = $1", order_id}
+                 ]
+
+                 Enum.each(cleanup_checks, fn {table, query, id} ->
+                   assert %{rows: [[0]]} = Repo.query!(query, [id]),
+                          "committed fixture cleanup left rows in #{table}"
+                 end)
+
+                 :cleaned
+               end)
     end)
   end
 end

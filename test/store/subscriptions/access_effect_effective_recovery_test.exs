@@ -8,6 +8,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
   alias Store.Subscriptions.AccessEffect
   alias Store.Subscriptions.Facade
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
+  alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
   alias Store.TestSupport.StripeAPIStub
 
@@ -17,22 +18,25 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     StripeAPIStub.setup_default(context)
   end
 
+  @tag :jc360_task07
   test "EFFECTIVE recovery includes only required, pending, and retryable EFFECTIVE rows" do
     required = create_effect!(:effective)
     pending = create_effect!(:effective) |> transition_to!(:pending)
     failed = create_effect!(:effective) |> transition_to!(:failed_retryable)
     applied = create_effect!(:effective) |> transition_to!(:applied)
-    superseded = create_effect!(:effective)
+
+    superseded_fixture = create_subscription_fixture!()
+    superseded = create_effect!(superseded_fixture, :effective)
+    superseding = supersede_with_newer_effect!(superseded_fixture)
     non_effective = create_effect!(:non_effective)
 
     set_updated_at!(
-      [required, pending, failed, applied, superseded, non_effective],
+      [required, pending, failed, applied, superseded, superseding, non_effective],
       ~U[2026-10-20 11:00:00.000000Z]
     )
 
-    Repo.query!("UPDATE access_effects SET status = 'superseded' WHERE id = $1", [
-      Ecto.UUID.dump!(superseded.id)
-    ])
+    assert fetch_effect!(superseded.id).status == :superseded
+    assert fetch_effect!(superseding.id).status == :applied
 
     ids =
       read_effects!(
@@ -48,6 +52,18 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     refute non_effective.id in ids
   end
 
+  @tag :jc360_task07
+  test "EFFECTIVE recovery read uses its default page limit of 100" do
+    query =
+      AccessEffect
+      |> Ash.Query.for_read(:read_recoverable_effective_for_system, %{
+        through_updated_at: @through_updated_at
+      })
+
+    assert query.arguments.limit == 100
+  end
+
+  @tag :jc360_task07
   test "the through timestamp includes equality and excludes newer updates" do
     eligible = create_effect!(:effective)
     later = create_effect!(:effective)
@@ -68,6 +84,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert selected.id == eligible.id
   end
 
+  @tag :jc360_task07
   test "the updated_at and id cursor paginates tied timestamps without gaps or duplicates" do
     effects = Enum.map(1..4, fn _ -> create_effect!(:effective) end)
     tied_at = ~U[2026-10-20 10:30:00.123456Z]
@@ -104,6 +121,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert_binary_uuid_order!(first_page ++ second_page)
   end
 
+  @tag :jc360_task07
   test "the selector accepts limits 1 and 500 and rejects limits outside that range" do
     first = create_effect!(:effective)
     second = create_effect!(:effective)
@@ -164,6 +182,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
              "disposition='effective'andstatusin'required','pending','failed_retryable'"
   end
 
+  @tag :jc360_task07
   test "EFFECTIVE recovery returns its own count and keyset cursor" do
     effect = create_effect!(:effective)
     set_updated_at!([effect], ~U[2026-10-20 11:00:00.000000Z])
@@ -189,6 +208,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert fetch_effect!(effect.id).status == :applied
   end
 
+  @tag :jc360_task07
   test "EFFECTIVE recovery rejects either half of its timestamp and id cursor" do
     assert {:error, _error} =
              Facade.run_subscription_access_effect_recovery_for_system(
@@ -251,6 +271,10 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
 
   defp create_effect!(disposition) do
     fixture = create_subscription_fixture!()
+    create_effect!(fixture, disposition)
+  end
+
+  defp create_effect!(fixture, disposition) do
     subscription = fixture.subscription
     revision = fixture.revision
 
@@ -270,6 +294,22 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert {:ok, input} = EstablishAccessEffectInput.new(attrs)
     assert {:ok, effect} = Facade.establish_access_effect_for_system(input)
     effect
+  end
+
+  defp supersede_with_newer_effect!(fixture) do
+    assert %{num_rows: 1} =
+             Repo.query!(
+               "UPDATE subscriptions SET aggregate_version = aggregate_version + 1 WHERE id = $1",
+               [Ecto.UUID.dump!(fixture.subscription.id)]
+             )
+
+    subscription =
+      Subscription
+      |> Ash.Query.filter(expr(id == ^fixture.subscription.id))
+      |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+
+    newer = create_effect!(%{fixture | subscription: subscription}, :effective)
+    transition_to!(newer, :applied)
   end
 
   defp create_subscription_fixture! do
