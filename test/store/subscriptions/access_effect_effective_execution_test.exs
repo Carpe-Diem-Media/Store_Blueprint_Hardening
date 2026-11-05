@@ -183,6 +183,70 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   end
 
   @tag :jc360_task08
+  test "F1 rejects source-line and plan-revision provenance mismatches" do
+    fixture = create_committed_effective_effect_fixture!("jc360_wrong_provenance")
+    foreign_fixture = create_committed_effective_effect_fixture!("jc360_foreign_provenance")
+
+    mismatched_provenance = [
+      {foreign_fixture.revision.id, fixture.effect.source_order_line_item_id},
+      {fixture.effect.plan_revision_id, foreign_fixture.line_item.id}
+    ]
+
+    try do
+      Enum.each(mismatched_provenance, fn {plan_revision_id, line_item_id} ->
+        {result, invalid_effect, effect_after_execution, grants} =
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.query!(
+              """
+              UPDATE access_effects
+              SET plan_revision_id = $2,
+                  source_order_line_item_id = $3,
+                  target_fingerprint = $4
+              WHERE id = $1
+              """,
+              [
+                Ecto.UUID.dump!(fixture.effect.id),
+                Ecto.UUID.dump!(plan_revision_id),
+                Ecto.UUID.dump!(line_item_id),
+                fixture.effect.target_fingerprint
+              ]
+            )
+
+            invalid_effect = fetch_effect!(fixture.effect.id)
+            result = Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+            {result, invalid_effect, fetch_effect!(fixture.effect.id),
+             grants_for_source!(fixture.subscription.id)}
+          end)
+
+        assert {:error, %Error{code: "INTERNAL_ERROR"}} = result
+        assert AccessEffect.persisted_fingerprint_status(invalid_effect) == :mismatch
+        assert invalid_effect.status == :required
+        assert effect_after_execution == invalid_effect
+        assert grants == []
+      end)
+    after
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!(
+          """
+          UPDATE access_effects
+          SET plan_revision_id = $2,
+              source_order_line_item_id = $3,
+              target_fingerprint = $4
+          WHERE id = $1
+          """,
+          [
+            Ecto.UUID.dump!(fixture.effect.id),
+            Ecto.UUID.dump!(fixture.effect.plan_revision_id),
+            Ecto.UUID.dump!(fixture.effect.source_order_line_item_id),
+            fixture.effect.target_fingerprint
+          ]
+        )
+      end)
+    end
+  end
+
+  @tag :jc360_task08
   test "F1 rejects an invalid interval with a valid fingerprint without writes" do
     fixture = create_committed_effective_effect_fixture!("jc360_invalid_interval")
 
@@ -601,15 +665,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert {:ok, true} =
              Cachex.put(Cache, Cache.cache_key(fixture.subscription.user_id), cache_value)
 
-    {repair_result, repair_queries} =
-      capture_repo_queries(fn ->
-        Sandbox.unboxed_run(Repo, fn ->
-          Facade.repair_suspension_access_effect_projection_for_system(fixture.effect.id)
-        end)
-      end)
-
-    assert :ok = repair_result
-    refute Enum.any?(repair_queries, &entitlement_grant_dml_query?/1)
+    repair_projection_with_sql_evidence!(fixture.effect.id, :delivery_update)
 
     repaired = fetch_effect!(fixture.effect.id)
     assert repaired.status == :applied
@@ -619,6 +675,29 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert {:ok, nil} = Cachex.get(Cache, Cache.cache_key(fixture.subscription.user_id))
     assert_receive {:entitlements_invalidated, user_id, "effective_access_effect_applied", _at}
     assert user_id == fixture.subscription.user_id
+
+    repeated_cache_value = {:projection_repair_replay, fixture.subscription.user_id}
+
+    assert {:ok, true} =
+             Cachex.put(
+               Cache,
+               Cache.cache_key(fixture.subscription.user_id),
+               repeated_cache_value
+             )
+
+    repair_projection_with_sql_evidence!(fixture.effect.id, :already_delivered)
+
+    repeated_repair = fetch_effect!(fixture.effect.id)
+    assert repeated_repair.status == :applied
+    assert %DateTime{} = repeated_repair.projection_delivered_at
+    assert repeated_repair.projection_user_ids == [fixture.subscription.user_id]
+    assert grants_for_source!(fixture.subscription.id) == before_repair
+    assert {:ok, nil} = Cachex.get(Cache, Cache.cache_key(fixture.subscription.user_id))
+
+    assert_receive {:entitlements_invalidated, repeated_user_id,
+                    "effective_access_effect_applied", _at}
+
+    assert repeated_user_id == fixture.subscription.user_id
   end
 
   defp create_committed_effective_effect_fixture!(prefix, opts \\ []) do
@@ -781,6 +860,42 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
       ~r/^\s*(insert\s+into|update|delete\s+from)\s+"?entitlement_grants"?/i,
       query
     )
+  end
+
+  defp access_effect_projection_delivery_update?(query) do
+    Regex.match?(~r/^\s*update\s+"?access_effects"?/i, query) and
+      String.contains?(String.downcase(query), "projection_delivered_at")
+  end
+
+  defp access_effect_projection_lock_query?(query) do
+    normalized = String.downcase(query)
+
+    Regex.match?(~r/^\s*select\b/s, normalized) and
+      String.contains?(normalized, "from \"access_effects\"") and
+      String.contains?(normalized, "for update")
+  end
+
+  defp repair_projection_with_sql_evidence!(effect_id, expected_query) do
+    {result, queries} =
+      capture_repo_queries(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Facade.repair_suspension_access_effect_projection_for_system(effect_id)
+        end)
+      end)
+
+    assert :ok = result
+
+    case expected_query do
+      :delivery_update ->
+        assert Enum.any?(queries, &access_effect_projection_delivery_update?/1),
+               "projection delivery update was not captured: #{inspect(queries)}"
+
+      :already_delivered ->
+        assert Enum.any?(queries, &access_effect_projection_lock_query?/1),
+               "projection repair lock query was not captured: #{inspect(queries)}"
+    end
+
+    refute Enum.any?(queries, &entitlement_grant_dml_query?/1)
   end
 
   defp create_grant!(fixture, scope_key, valid_from_at) do
