@@ -708,6 +708,77 @@ defmodule Store.Subscriptions.FacadeTest do
     assert succeeded_payment_intents_for_order(fixture.order.id) == [payment_intent_before]
   end
 
+  @tag :jc360_task06
+  test "paid-order replay does not reconstruct an effect for a historical source after plan mutation" do
+    customer = SubscriptionsFixtures.create_customer!("jc360_historical_no_effect")
+    %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
+
+    plan =
+      SubscriptionsFixtures.create_subscription_plan!(%{
+        entitlement_kind: :membership_access,
+        entitlement_scope_key: "jc360_historical:#{Ecto.UUID.generate()}"
+      })
+
+    _variant_plan = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
+
+    historical =
+      SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan)
+
+    assert historical.revision.entitlement_kind == :membership_access
+    assert historical.subscription.current_plan_revision_id == historical.revision.id
+    assert historical.order.state == :paid
+    assert historical.line_item.subscription_plan_revision_id_snapshot == historical.revision.id
+
+    order_before = fetch_order!(historical.order.id)
+    [payment_intent_before] = succeeded_payment_intents_for_order(historical.order.id)
+    assert [subscription_before] = subscriptions_for_order(historical.order.id)
+    assert subscription_before.id == historical.subscription.id
+    assert subscription_before.source_order_line_item_id == historical.line_item.id
+    assert [item_before] = subscription_items_for_source_line(historical.line_item.id)
+    assert access_effects_for_source_line(historical.line_item.id) == []
+    assert entitlements_for_subscription(historical.subscription.id) == []
+
+    changed_scope = "jc360_historical:changed:#{Ecto.UUID.generate()}"
+
+    changed_plan =
+      plan
+      |> Ash.Changeset.for_update(
+        :update,
+        %{entitlement_kind: :digital_library, entitlement_scope_key: changed_scope},
+        context: %{system?: true}
+      )
+      |> Ash.update!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+
+    assert changed_plan.entitlement_kind == :digital_library
+    assert changed_plan.entitlement_scope_key == changed_scope
+    assert historical.revision.entitlement_kind == :membership_access
+    assert historical.revision.entitlement_scope_key != changed_scope
+
+    assert {:ok, replay} =
+             SubscriptionsFacade.create_subscriptions_from_paid_order_for_system(
+               historical.order.id
+             )
+
+    assert replay.order_id == historical.order.id
+    assert replay.subscription_line_count == 1
+    assert replay.created_count == 0
+    assert replay.skipped_count == 1
+    assert replay.entitlement_issued_count == 0
+
+    assert [%Subscription{} = subscription_after] = subscriptions_for_order(historical.order.id)
+    assert subscription_after.id == subscription_before.id
+    assert subscription_after.source_order_line_item_id == historical.line_item.id
+
+    assert [%SubscriptionItem{id: item_id}] =
+             subscription_items_for_source_line(historical.line_item.id)
+
+    assert item_id == item_before.id
+    assert access_effects_for_source_line(historical.line_item.id) == []
+    assert entitlements_for_subscription(historical.subscription.id) == []
+    assert fetch_order!(historical.order.id) == order_before
+    assert succeeded_payment_intents_for_order(historical.order.id) == [payment_intent_before]
+  end
+
   test "run_due_renewals_for_system creates a virtual renewal attempt and waits for paid reconciliation" do
     customer = SubscriptionsFixtures.create_customer!("phase26_sub_renew_success")
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
