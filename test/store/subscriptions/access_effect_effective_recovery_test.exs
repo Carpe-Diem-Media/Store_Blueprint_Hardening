@@ -4,6 +4,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
   import Ash.Expr
   require Ash.Query
 
+  alias Store.Entitlements.Cache
   alias Store.Repo
   alias Store.Subscriptions.AccessEffect
   alias Store.Subscriptions.Facade
@@ -225,21 +226,37 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
              )
   end
 
+  @tag :jc360_task08
   test "an exhausted EFFECTIVE stream does not suppress NON_EFFECTIVE or projection work" do
     effective = create_effect!(:effective)
     non_effective = create_effect!(:non_effective)
     projection = create_effect!(:effective)
+    projection_user_id = subscription_user_id!(projection.subscription_id)
 
     Repo.query!("UPDATE subscriptions SET status = 'suspended' WHERE id = $1", [
       Ecto.UUID.dump!(non_effective.subscription_id)
     ])
 
+    assert {:ok, pending_projection} = Facade.mark_access_effect_pending_for_system(projection)
+
+    assert {:ok, applied_projection} =
+             Facade.mark_access_effect_applied_for_system(pending_projection)
+
     Repo.query!(
-      "UPDATE access_effects SET status = 'applied', projection_user_ids = ARRAY[$2]::uuid[] WHERE id = $1",
-      [Ecto.UUID.dump!(projection.id), Ecto.UUID.dump!(projection.subscription_id)]
+      "UPDATE access_effects SET projection_user_ids = ARRAY[$2]::uuid[] WHERE id = $1",
+      [Ecto.UUID.dump!(projection.id), Ecto.UUID.dump!(projection_user_id)]
     )
 
-    set_updated_at!([effective, non_effective, projection], ~U[2026-10-20 11:00:00.000000Z])
+    Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(projection_user_id))
+    cache_value = {:jc360_projection_recovery, projection_user_id}
+    assert {:ok, true} = Cachex.put(Cache, Cache.cache_key(projection_user_id), cache_value)
+
+    projection_grants_before = grant_ids_for_source!(projection.subscription_id)
+
+    set_updated_at!(
+      [effective, non_effective, applied_projection],
+      ~U[2026-10-20 11:00:00.000000Z]
+    )
 
     assert {:ok, result} =
              Facade.run_subscription_access_effect_recovery_for_system(
@@ -266,7 +283,16 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert result.projection_cursor == %{timestamp: projection.inserted_at, id: projection.id}
     assert fetch_effect!(effective.id).status == :required
     assert fetch_effect!(non_effective.id).status == :applied
-    assert %DateTime{} = fetch_effect!(projection.id).projection_delivered_at
+
+    repaired_projection = fetch_effect!(projection.id)
+    assert repaired_projection.status == :applied
+    assert repaired_projection.projection_user_ids == [projection_user_id]
+    assert %DateTime{} = repaired_projection.projection_delivered_at
+    assert grant_ids_for_source!(projection.subscription_id) == projection_grants_before
+    assert {:ok, nil} = Cachex.get(Cache, Cache.cache_key(projection_user_id))
+
+    assert_receive {:entitlements_invalidated, user_id, "effective_access_effect_applied", _at}
+    assert user_id == projection_user_id
   end
 
   defp create_effect!(disposition) do
@@ -366,6 +392,25 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     AccessEffect
     |> Ash.Query.filter(expr(id == ^effect_id))
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp subscription_user_id!(subscription_id) do
+    assert {:ok, %{rows: [[user_id]]}} =
+             Repo.query("SELECT user_id FROM subscriptions WHERE id = $1", [
+               Ecto.UUID.dump!(subscription_id)
+             ])
+
+    Ecto.UUID.load!(user_id)
+  end
+
+  defp grant_ids_for_source!(subscription_id) do
+    assert {:ok, %{rows: rows}} =
+             Repo.query(
+               "SELECT id FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1 ORDER BY id",
+               [Ecto.UUID.dump!(subscription_id)]
+             )
+
+    Enum.map(rows, fn [id] -> Ecto.UUID.load!(id) end)
   end
 
   defp read_effects!(opts) do

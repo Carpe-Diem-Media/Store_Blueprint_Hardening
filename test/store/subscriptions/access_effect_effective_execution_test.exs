@@ -12,8 +12,10 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   alias Store.Subscriptions.{AccessEffect, Facade}
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
   alias Store.SubscriptionsFixtures
+  alias Store.Support.Errors.Error
   alias Store.Support.Telemetry.RepoStats
 
+  @tag :jc360_task08
   test "EFFECTIVE execution converges one exact-source grant interval" do
     fixture = create_committed_effective_effect_fixture!("jc245_effective_pair")
 
@@ -25,6 +27,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     effect = fetch_effect!(fixture.effect.id)
     assert effect.status == :applied
     assert %DateTime{} = effect.projection_delivered_at
+    assert AccessEffect.persisted_fingerprint_status(effect) == :v2_match
 
     assert [grant] = grants_for_source!(fixture.subscription.id)
     assert grant.status == :active
@@ -37,6 +40,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   end
 
   @tag :jc360_task07
+  @tag :jc360_task08
   test "a committed REQUIRED initial source effect recovers by exact ID without duplicate rows" do
     fixture = create_committed_effective_effect_fixture!("jc360_initial_required_recovery")
 
@@ -104,19 +108,184 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert [] == Enum.filter(grants_for_source!(fixture.subscription.id), &(&1.status == :active))
   end
 
+  @tag :jc360_task08
   test "the EFFECTIVE executor rejects NON_EFFECTIVE disposition before lifecycle mutation" do
     fixture =
       create_committed_effective_effect_fixture!("jc245_wrong_disposition",
         disposition: :non_effective
       )
 
-    assert {:error, _reason} =
+    assert {:error, %Error{code: "INVALID_STATE_TRANSITION"}} =
              Sandbox.unboxed_run(Repo, fn ->
                Facade.execute_effective_access_effect_for_system(fixture.effect.id)
              end)
 
     assert fetch_effect!(fixture.effect.id).status == :required
     assert grants_for_source!(fixture.subscription.id) == []
+  end
+
+  @tag :jc360_task08
+  test "F1 rejects a corrupt fingerprint without changing lifecycle or grants" do
+    fixture = create_committed_effective_effect_fixture!("jc360_bad_fingerprint")
+
+    corrupt_fingerprint =
+      Base.encode16(:crypto.hash(:sha256, "corrupt fingerprint"), case: :lower)
+
+    refute corrupt_fingerprint == fixture.effect.target_fingerprint
+
+    {result, invalid_effect, effect_after_execution, grants} =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!(
+          "UPDATE access_effects SET target_fingerprint = $2 WHERE id = $1",
+          [Ecto.UUID.dump!(fixture.effect.id), corrupt_fingerprint]
+        )
+
+        invalid_effect = fetch_effect!(fixture.effect.id)
+        result = Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+        {result, invalid_effect, fetch_effect!(fixture.effect.id),
+         grants_for_source!(fixture.subscription.id)}
+      end)
+
+    assert {:error, %Error{code: "INTERNAL_ERROR"}} = result
+    assert AccessEffect.persisted_fingerprint_status(invalid_effect) == :mismatch
+    assert invalid_effect.status == :required
+    assert effect_after_execution == invalid_effect
+    assert grants == []
+  end
+
+  @tag :jc360_task08
+  test "F1 rejects a future source version without changing lifecycle or grants" do
+    fixture = create_committed_effective_effect_fixture!("jc360_future_version")
+
+    {result, invalid_effect, effect_after_execution, grants} =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!(
+          "UPDATE access_effects SET source_version = $2 WHERE id = $1",
+          [
+            Ecto.UUID.dump!(fixture.effect.id),
+            fixture.subscription.aggregate_version + 1
+          ]
+        )
+
+        recompute_v2_fingerprint!(fixture.effect.id)
+        invalid_effect = fetch_effect!(fixture.effect.id)
+        result = Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+        {result, invalid_effect, fetch_effect!(fixture.effect.id),
+         grants_for_source!(fixture.subscription.id)}
+      end)
+
+    assert {:error, %Error{code: "INTERNAL_ERROR"}} = result
+    assert invalid_effect.status == :required
+    assert effect_after_execution == invalid_effect
+    assert grants == []
+  end
+
+  @tag :jc360_task08
+  test "F1 rejects an invalid interval with a valid fingerprint without writes" do
+    fixture = create_committed_effective_effect_fixture!("jc360_invalid_interval")
+
+    {result, invalid_effect, effect_after_execution, grants} =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!(
+          "UPDATE access_effects SET valid_until_at = valid_from_at WHERE id = $1",
+          [Ecto.UUID.dump!(fixture.effect.id)]
+        )
+
+        recompute_v2_fingerprint!(fixture.effect.id)
+        malformed = fetch_effect!(fixture.effect.id)
+        assert AccessEffect.persisted_fingerprint_status(malformed) == :v2_match
+
+        result = Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+        {result, malformed, fetch_effect!(fixture.effect.id),
+         grants_for_source!(fixture.subscription.id)}
+      end)
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} = result
+    assert invalid_effect.status == :required
+    assert effect_after_execution == invalid_effect
+    assert grants == []
+  end
+
+  @tag :jc360_task08
+  test "F1 accepts a compatible v1 fingerprint for an EFFECTIVE empty target" do
+    fixture = create_committed_effective_effect_fixture!("jc360_v1_empty", target: :empty)
+    legacy_fingerprint = AccessEffect.legacy_target_fingerprint_v1(fixture.effect)
+
+    refute legacy_fingerprint == fixture.effect.target_fingerprint
+
+    {result, effect, grants} =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!(
+          "UPDATE access_effects SET target_fingerprint = $2 WHERE id = $1",
+          [Ecto.UUID.dump!(fixture.effect.id), legacy_fingerprint]
+        )
+
+        result = Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+        {result, fetch_effect!(fixture.effect.id), grants_for_source!(fixture.subscription.id)}
+      end)
+
+    assert {:ok, :applied} = result
+    assert effect.status == :applied
+    assert effect.target_fingerprint == legacy_fingerprint
+    assert AccessEffect.persisted_fingerprint_status(effect) == :v1_legacy_match
+    assert grants == []
+  end
+
+  @tag :jc360_task08
+  test "a valid stale REQUIRED target is superseded without issuing a grant" do
+    fixture = create_committed_effective_effect_fixture!("jc360_valid_stale")
+
+    newer =
+      Sandbox.unboxed_run(Repo, fn -> create_newer_untransitioned_effect!(fixture) end)
+
+    assert fetch_effect!(fixture.effect.id).status == :required
+    assert fetch_effect!(newer.id).status == :required
+
+    assert {:ok, :superseded} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+             end)
+
+    assert fetch_effect!(fixture.effect.id).status == :superseded
+    assert fetch_effect!(newer.id).status == :required
+    assert grants_for_source!(fixture.subscription.id) == []
+  end
+
+  @tag :jc360_task08
+  test "an invalid stale target fails before lifecycle or grant mutation" do
+    fixture = create_committed_effective_effect_fixture!("jc360_invalid_stale")
+
+    newer =
+      Sandbox.unboxed_run(Repo, fn -> create_newer_untransitioned_effect!(fixture) end)
+
+    {result, invalid_candidate, candidate_after_execution, latest_before_execution,
+     latest_after_execution, grants} =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!(
+          "UPDATE access_effects SET valid_until_at = valid_from_at WHERE id = $1",
+          [Ecto.UUID.dump!(fixture.effect.id)]
+        )
+
+        recompute_v2_fingerprint!(fixture.effect.id)
+        malformed = fetch_effect!(fixture.effect.id)
+        assert AccessEffect.persisted_fingerprint_status(malformed) == :v2_match
+        latest_before_execution = fetch_effect!(newer.id)
+
+        result = Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+        {result, malformed, fetch_effect!(fixture.effect.id), latest_before_execution,
+         fetch_effect!(newer.id), grants_for_source!(fixture.subscription.id)}
+      end)
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} = result
+    assert invalid_candidate.status == :required
+    assert candidate_after_execution == invalid_candidate
+    assert latest_before_execution.status == :required
+    assert latest_after_execution == latest_before_execution
+    assert grants == []
   end
 
   test "the public EFFECTIVE executor rejects a caller-owned transaction before writes on commit" do
@@ -392,6 +561,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert_effective_grant!(fixture)
   end
 
+  @tag :jc360_task08
   test "post-commit projection failure returns a successful repairable outcome" do
     fixture = create_committed_effective_effect_fixture!("jc245_effective_projection")
     constraint = "jc245_projection_pending_#{System.unique_integer([:positive])}"
@@ -422,18 +592,33 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     applied = fetch_effect!(fixture.effect.id)
     assert applied.status == :applied
     assert applied.projection_delivered_at == nil
+    assert applied.projection_user_ids == [fixture.subscription.user_id]
     before_repair = grants_for_source!(fixture.subscription.id)
     assert_effective_grant!(fixture)
 
-    assert :ok =
-             Sandbox.unboxed_run(Repo, fn ->
-               Facade.repair_suspension_access_effect_projection_for_system(fixture.effect.id)
-             end)
+    cache_value = {:projection_repair_sentinel, fixture.subscription.user_id}
+
+    assert {:ok, true} =
+             Cachex.put(Cache, Cache.cache_key(fixture.subscription.user_id), cache_value)
+
+    {repair_result, repair_queries} =
+      capture_repo_queries(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Facade.repair_suspension_access_effect_projection_for_system(fixture.effect.id)
+        end)
+      end)
+
+    assert :ok = repair_result
+    refute Enum.any?(repair_queries, &entitlement_grant_dml_query?/1)
 
     repaired = fetch_effect!(fixture.effect.id)
     assert repaired.status == :applied
     assert %DateTime{} = repaired.projection_delivered_at
+    assert repaired.projection_user_ids == [fixture.subscription.user_id]
     assert grants_for_source!(fixture.subscription.id) == before_repair
+    assert {:ok, nil} = Cachex.get(Cache, Cache.cache_key(fixture.subscription.user_id))
+    assert_receive {:entitlements_invalidated, user_id, "effective_access_effect_applied", _at}
+    assert user_id == fixture.subscription.user_id
   end
 
   defp create_committed_effective_effect_fixture!(prefix, opts \\ []) do
@@ -517,6 +702,85 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
       valid_from_at: subscription.current_period_start_at,
       valid_until_at: subscription.current_period_end_at
     }
+  end
+
+  defp create_newer_untransitioned_effect!(fixture) do
+    source_version = fixture.subscription.aggregate_version + 1
+
+    assert %{num_rows: 1} =
+             Repo.query!(
+               "UPDATE subscriptions SET aggregate_version = $2 WHERE id = $1",
+               [Ecto.UUID.dump!(fixture.subscription.id), source_version]
+             )
+
+    attrs = %{
+      subscription_id: fixture.subscription.id,
+      source_version: source_version,
+      disposition: :effective,
+      entitlement_kind: fixture.revision.entitlement_kind,
+      entitlement_scope_key: "#{fixture.effect.entitlement_scope_key}:newer",
+      valid_from_at: fixture.subscription.current_period_start_at,
+      valid_until_at: fixture.subscription.current_period_end_at,
+      source_order_line_item_id: fixture.line_item.id,
+      contract_change_id: fixture.subscription.current_contract_change_id,
+      plan_revision_id: fixture.revision.id
+    }
+
+    assert {:ok, input} = EstablishAccessEffectInput.new(attrs)
+
+    AccessEffect
+    |> Ash.Changeset.for_create(:establish, Map.from_struct(input), context: %{system?: true})
+    |> Ash.create!(
+      domain: Store.Subscriptions,
+      authorize?: false,
+      context: %{system?: true}
+    )
+  end
+
+  defp recompute_v2_fingerprint!(effect_id) do
+    effect = fetch_effect!(effect_id)
+
+    Repo.query!(
+      "UPDATE access_effects SET target_fingerprint = $2 WHERE id = $1",
+      [Ecto.UUID.dump!(effect_id), AccessEffect.target_fingerprint(effect)]
+    )
+  end
+
+  defp capture_repo_queries(fun) do
+    handler_id = {__MODULE__, :jc360_task08_queries, make_ref()}
+    message_ref = make_ref()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :repo, :query],
+        fn _event, _measurements, metadata, {pid, ref} ->
+          send(pid, {ref, metadata.query})
+        end,
+        {self(), message_ref}
+      )
+
+    try do
+      result = fun.()
+      {result, receive_repo_queries(message_ref, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp receive_repo_queries(ref, queries) do
+    receive do
+      {^ref, query} -> receive_repo_queries(ref, [query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp entitlement_grant_dml_query?(query) do
+    Regex.match?(
+      ~r/^\s*(insert\s+into|update|delete\s+from)\s+"?entitlement_grants"?/i,
+      query
+    )
   end
 
   defp create_grant!(fixture, scope_key, valid_from_at) do
