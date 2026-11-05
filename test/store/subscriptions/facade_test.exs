@@ -410,8 +410,7 @@ defmodule Store.Subscriptions.FacadeTest do
     assert effect.valid_from_at == nil
     assert effect.valid_until_at == subscription.current_period_end_at
 
-    assert Enum.filter(entitlements_for_subscription(subscription.id), &(&1.status == :active)) ==
-             []
+    assert entitlements_for_subscription(subscription.id) == []
   end
 
   @tag :jc360_task02
@@ -545,6 +544,7 @@ defmodule Store.Subscriptions.FacadeTest do
     assert [subscription] = subscriptions_for_order(fixture.order.id)
     assert [effect] = access_effects_for_source_line(fixture.line_item.id)
     assert effect.status == :applied
+    assert effect.projection_user_ids == [subscription.user_id]
     assert effect.projection_delivered_at == nil
 
     assert [grant] = entitlements_for_subscription(subscription.id)
@@ -578,22 +578,35 @@ defmodule Store.Subscriptions.FacadeTest do
     assert fetch_access_effect_unboxed!(fixture.effect.id).status == :superseded
     assert newer_effect.status == :required
 
-    assert %{num_rows: 1} =
-             Sandbox.unboxed_run(Repo, fn ->
-               Repo.query!("UPDATE access_effects SET status = 'required' WHERE id = $1", [
-                 Ecto.UUID.dump!(fixture.effect.id)
-               ])
-             end)
+    effects_before_terminal_noop =
+      Sandbox.unboxed_run(Repo, fn -> access_effects_for_source_line(fixture.line_item.id) end)
 
-    assert {:ok, :superseded} =
+    effect_ids_before_terminal_noop =
+      MapSet.new(Enum.map(effects_before_terminal_noop, & &1.id))
+
+    assert effect_ids_before_terminal_noop == MapSet.new([fixture.effect.id, newer_effect.id])
+
+    grants_before_terminal_noop =
+      Sandbox.unboxed_run(Repo, fn -> entitlements_for_subscription(fixture.subscription.id) end)
+
+    assert grants_before_terminal_noop == []
+
+    assert {:ok, :noop} =
              Sandbox.unboxed_run(Repo, fn ->
                SubscriptionsFacade.execute_effective_access_effect_for_system(fixture.effect.id)
              end)
 
+    assert fetch_access_effect_unboxed!(fixture.effect.id).status == :superseded
+
+    effects_after_terminal_noop =
+      Sandbox.unboxed_run(Repo, fn -> access_effects_for_source_line(fixture.line_item.id) end)
+
+    assert MapSet.new(Enum.map(effects_after_terminal_noop, & &1.id)) ==
+             effect_ids_before_terminal_noop
+
     assert Sandbox.unboxed_run(Repo, fn ->
              entitlements_for_subscription(fixture.subscription.id)
-           end) ==
-             []
+           end) == grants_before_terminal_noop
 
     assert {:ok, result} =
              Sandbox.unboxed_run(Repo, fn ->
@@ -602,16 +615,21 @@ defmodule Store.Subscriptions.FacadeTest do
                )
              end)
 
+    assert result.order_id == fixture.order.id
+    assert result.subscription_line_count == 1
     assert result.created_count == 0
     assert result.skipped_count == 1
     assert result.entitlement_issued_count == 0
 
-    assert length(
-             Sandbox.unboxed_run(Repo, fn ->
-               access_effects_for_source_line(fixture.line_item.id)
-             end)
-           ) ==
-             2
+    effects_after_replay =
+      Sandbox.unboxed_run(Repo, fn -> access_effects_for_source_line(fixture.line_item.id) end)
+
+    assert MapSet.new(Enum.map(effects_after_replay, & &1.id)) ==
+             effect_ids_before_terminal_noop
+
+    assert Sandbox.unboxed_run(Repo, fn ->
+             entitlements_for_subscription(fixture.subscription.id)
+           end) == grants_before_terminal_noop
 
     assert fetch_access_effect_unboxed!(fixture.effect.id).status == :superseded
     assert fetch_access_effect_unboxed!(newer_effect.id).status == :required
