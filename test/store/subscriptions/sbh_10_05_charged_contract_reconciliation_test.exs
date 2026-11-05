@@ -9,7 +9,7 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
 
   alias Store.Entitlements.EntitlementGrant
   alias Store.Entitlements.Facade, as: EntitlementsFacade
-  alias Store.Orders.Order
+  alias Store.Orders.{Order, OrderLineItem}
   alias Store.Payments.Inputs.ValidateRenewalCollectionOutcomeInput
   alias Store.Payments.PaymentIntent
   alias Store.Payments.Types.ProviderObservation
@@ -22,7 +22,8 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
     RenewalAttempt,
     RenewalCollectionAttempt,
     RenewalCollectionAttempts,
-    Subscription
+    Subscription,
+    SubscriptionItem
   }
 
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
@@ -234,7 +235,7 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
     assert replayed_grant.valid_to_at == attempt.period_end_at
   end
 
-  test "initial paid activation keeps its legacy entitlement issue path",
+  test "initial paid activation applies its exact EFFECTIVE AccessEffect through F1",
        %{sandbox_owners: sandbox_owners} do
     customer = SubscriptionsFixtures.create_customer!("sbh_10_05_initial_activation")
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
@@ -247,7 +248,7 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
 
     SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
 
-    %{order: order} =
+    %{order: order, line_item: line_item, revision: purchased_revision} =
       SubscriptionsFixtures.create_paid_order_with_subscription_line!(
         customer.id,
         variant,
@@ -261,21 +262,100 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
       )
 
     assert {:ok, activation} = result
+    assert calls == []
+
+    assert Enum.sort(Map.keys(activation)) ==
+             Enum.sort([
+               :order_id,
+               :subscription_line_count,
+               :created_count,
+               :skipped_count,
+               :entitlement_issued_count
+             ])
+
+    assert is_binary(activation.order_id)
     assert activation.created_count == 1
+    assert activation.skipped_count == 0
+    assert activation.subscription_line_count == 1
     assert activation.entitlement_issued_count == 1
 
-    assert [issue_call] = calls
-    assert issue_call.module == EntitlementsFacade
-    assert issue_call.function == :issue_subscription_entitlement_for_system
-    assert [%Subscription{} = activated_subscription, activated_plan] = issue_call.args
-    assert activated_plan.id == activated_subscription.current_plan_revision_id
-    assert activated_plan.entitlement_kind == plan.entitlement_kind
-    assert activated_plan.entitlement_scope_key == plan.entitlement_scope_key
+    assert Enum.all?(
+             [
+               activation.subscription_line_count,
+               activation.created_count,
+               activation.skipped_count,
+               activation.entitlement_issued_count
+             ],
+             &is_integer/1
+           )
 
-    assert [%EntitlementGrant{kind: :membership_access, scope_key: "membership:initial"}] =
-             active_grants_for(activated_subscription.id)
+    assert activation.order_id == order.id
 
-    assert access_effect_records!(activated_subscription.id) == []
+    persisted_line_item = read_one!(OrderLineItem, line_item.id, Store.Orders)
+    persisted_revision = read_one!(PlanRevision, purchased_revision.id, Store.Subscriptions)
+
+    assert persisted_line_item.order_id == order.id
+    assert persisted_line_item.subscription_plan_revision_id_snapshot == persisted_revision.id
+    assert persisted_revision.subscription_plan_id == plan.id
+
+    assert [%Subscription{} = activated_subscription] =
+             Subscription
+             |> Ash.Query.filter(expr(source_order_id == ^order.id))
+             |> Ash.read!(
+               domain: Store.Subscriptions,
+               authorize?: false,
+               context: %{system?: true}
+             )
+
+    assert activated_subscription.source_order_id == order.id
+    assert activated_subscription.source_order_line_item_id == persisted_line_item.id
+    assert activated_subscription.subscription_plan_id == persisted_revision.subscription_plan_id
+    assert activated_subscription.current_plan_revision_id == persisted_revision.id
+    assert activated_subscription.aggregate_version > 0
+    assert %DateTime{} = activated_subscription.current_period_start_at
+    assert %DateTime{} = activated_subscription.current_period_end_at
+
+    assert DateTime.compare(
+             activated_subscription.current_period_start_at,
+             activated_subscription.current_period_end_at
+           ) == :lt
+
+    assert [%SubscriptionItem{} = item] =
+             SubscriptionItem
+             |> Ash.Query.filter(expr(source_order_line_item_id == ^persisted_line_item.id))
+             |> Ash.read!(
+               domain: Store.Subscriptions,
+               authorize?: false,
+               context: %{system?: true}
+             )
+
+    assert item.subscription_id == activated_subscription.id
+    assert item.source_order_line_item_id == persisted_line_item.id
+
+    assert [%AccessEffect{} = effect] = access_effect_records!(activated_subscription.id)
+    assert effect.subscription_id == activated_subscription.id
+    assert effect.source_order_line_item_id == persisted_line_item.id
+    assert effect.source_version == activated_subscription.aggregate_version
+    assert effect.disposition == :effective
+    assert effect.status == :applied
+    assert effect.plan_revision_id == persisted_revision.id
+    assert effect.contract_change_id == nil
+    assert effect.entitlement_kind == persisted_revision.entitlement_kind
+    assert effect.entitlement_scope_key == persisted_revision.entitlement_scope_key
+    assert effect.valid_from_at == activated_subscription.current_period_start_at
+    assert effect.valid_until_at == activated_subscription.current_period_end_at
+
+    assert [%EntitlementGrant{} = grant] = grants_for_source!(activated_subscription.id)
+    assert grant.user_id == activated_subscription.user_id
+    assert grant.source_kind == :subscription
+    assert grant.source_id == activated_subscription.id
+    assert grant.kind == effect.entitlement_kind
+    assert grant.scope_key == effect.entitlement_scope_key
+    assert grant.status == :active
+    assert grant.valid_from_at == effect.valid_from_at
+    assert grant.valid_to_at == effect.valid_until_at
+    assert grant.revoked_at == nil
+    assert grant.revoked_reason == nil
   end
 
   test "a charged nil/nil target keeps valid_from_at nil in its AccessEffect" do

@@ -319,39 +319,7 @@ defmodule Store.Workers.SubscriptionsEnsureForPaidOrderWorkerTest do
               )
 
             additional_sources =
-              if line_count > 1 do
-                Enum.map(2..line_count, fn line_no ->
-                  additional_plan =
-                    SubscriptionsFixtures.create_subscription_plan!(%{
-                      entitlement_kind: :membership_access,
-                      entitlement_scope_key: "#{prefix}:line#{line_no}:#{Ecto.UUID.generate()}"
-                    })
-
-                  variant_plan =
-                    SubscriptionsFixtures.attach_variant_plan!(variant.id, additional_plan.id)
-
-                  additional_revision =
-                    SubscriptionsFixtures.create_plan_revision!(additional_plan)
-
-                  additional_line =
-                    create_paid_order_line_for_revision!(
-                      order,
-                      variant,
-                      additional_plan,
-                      additional_revision,
-                      line_no
-                    )
-
-                  %{
-                    line_item: additional_line,
-                    plan: additional_plan,
-                    revision: additional_revision,
-                    variant_plan: variant_plan
-                  }
-                end)
-              else
-                []
-              end
+              create_additional_paid_order_sources!(line_count, prefix, order, variant)
 
             plans = [plan | Enum.map(additional_sources, & &1.plan)]
             revisions = [revision | Enum.map(additional_sources, & &1.revision)]
@@ -379,6 +347,37 @@ defmodule Store.Workers.SubscriptionsEnsureForPaidOrderWorkerTest do
 
     on_exit(fn -> cleanup_committed_paid_order_fixture!(fixture) end)
     fixture
+  end
+
+  defp create_additional_paid_order_sources!(line_count, prefix, order, variant) do
+    line_numbers = if line_count > 1, do: 2..line_count, else: []
+
+    Enum.map(line_numbers, fn line_no ->
+      additional_plan =
+        SubscriptionsFixtures.create_subscription_plan!(%{
+          entitlement_kind: :membership_access,
+          entitlement_scope_key: "#{prefix}:line#{line_no}:#{Ecto.UUID.generate()}"
+        })
+
+      variant_plan = SubscriptionsFixtures.attach_variant_plan!(variant.id, additional_plan.id)
+      additional_revision = SubscriptionsFixtures.create_plan_revision!(additional_plan)
+
+      additional_line =
+        create_paid_order_line_for_revision!(
+          order,
+          variant,
+          additional_plan,
+          additional_revision,
+          line_no
+        )
+
+      %{
+        line_item: additional_line,
+        plan: additional_plan,
+        revision: additional_revision,
+        variant_plan: variant_plan
+      }
+    end)
   end
 
   defp create_paid_order_line_for_revision!(order, variant, plan, revision, line_no) do
@@ -484,19 +483,9 @@ defmodule Store.Workers.SubscriptionsEnsureForPaidOrderWorkerTest do
                  Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
 
-                 Enum.each(variant_plan_ids, fn variant_plan_id ->
-                   Repo.query!("DELETE FROM variant_subscription_plans WHERE id = $1", [
-                     variant_plan_id
-                   ])
-                 end)
+                 delete_committed_paid_order_variant_plans!(variant_plan_ids)
 
-                 Enum.each(plan_ids, fn plan_id ->
-                   Repo.query!("DELETE FROM plan_revisions WHERE subscription_plan_id = $1", [
-                     plan_id
-                   ])
-
-                   Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [plan_id])
-                 end)
+                 delete_committed_paid_order_plans!(plan_ids)
 
                  Repo.query!("SET CONSTRAINTS products_default_variant_id_fkey DEFERRED")
                  Repo.query!("DELETE FROM products WHERE id = $1", [product_id])
@@ -514,6 +503,19 @@ defmodule Store.Workers.SubscriptionsEnsureForPaidOrderWorkerTest do
         user_id: user_id,
         subscription_ids: subscription_ids
       })
+    end)
+  end
+
+  defp delete_committed_paid_order_plans!(plan_ids) do
+    Enum.each(plan_ids, fn plan_id ->
+      Repo.query!("DELETE FROM plan_revisions WHERE subscription_plan_id = $1", [plan_id])
+      Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [plan_id])
+    end)
+  end
+
+  defp delete_committed_paid_order_variant_plans!(variant_plan_ids) do
+    Enum.each(variant_plan_ids, fn variant_plan_id ->
+      Repo.query!("DELETE FROM variant_subscription_plans WHERE id = $1", [variant_plan_id])
     end)
   end
 

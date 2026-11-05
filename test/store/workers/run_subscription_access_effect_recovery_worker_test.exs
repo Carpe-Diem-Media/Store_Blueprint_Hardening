@@ -357,90 +357,89 @@ defmodule Store.Workers.RunSubscriptionAccessEffectRecoveryWorkerTest do
   end
 
   defp cleanup_on_exit(fixture) do
-    on_exit(fn ->
-      Sandbox.unboxed_run(Repo, fn ->
-        subscription_id = Ecto.UUID.dump!(fixture.subscription.id)
-        line_item_id = Ecto.UUID.dump!(fixture.line_item.id)
-        order_id = Ecto.UUID.dump!(fixture.order.id)
-        variant_id = Ecto.UUID.dump!(fixture.variant.id)
-        product_id = Ecto.UUID.dump!(fixture.product.id)
-        plan_id = Ecto.UUID.dump!(fixture.plan.id)
-        user_id = Ecto.UUID.dump!(fixture.subscription.user_id)
-
-        assert {:ok, :cleaned} =
-                 Repo.transaction(fn ->
-                   Repo.query!("SET CONSTRAINTS products_default_variant_id_fkey DEFERRED")
-
-                   Repo.query!(
-                     "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
-                     [subscription_id]
-                   )
-
-                   Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [
-                     subscription_id
-                   ])
-
-                   Repo.query!(
-                     "UPDATE subscriptions SET current_dunning_renewal_attempt_id = NULL WHERE id = $1",
-                     [subscription_id]
-                   )
-
-                   Repo.query!("DELETE FROM renewal_attempts WHERE subscription_id = $1", [
-                     subscription_id
-                   ])
-
-                   Repo.query!("DELETE FROM subscription_items WHERE subscription_id = $1", [
-                     subscription_id
-                   ])
-
-                   Repo.query!("DELETE FROM subscriptions WHERE id = $1", [subscription_id])
-                   Repo.query!("DELETE FROM order_line_items WHERE id = $1", [line_item_id])
-                   Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
-                   Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
-                   Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
-                   Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
-
-                   Repo.query!(
-                     "DELETE FROM variant_subscription_plans WHERE variant_id = $1",
-                     [variant_id]
-                   )
-
-                   Repo.query!("DELETE FROM plan_revisions WHERE subscription_plan_id = $1", [
-                     plan_id
-                   ])
-
-                   Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [plan_id])
-                   Repo.query!("DELETE FROM products WHERE id = $1", [product_id])
-                   Repo.query!("DELETE FROM users WHERE id = $1", [user_id])
-
-                   cleanup_checks = [
-                     {"subscriptions", "SELECT count(*) FROM subscriptions WHERE id = $1",
-                      subscription_id},
-                     {"subscription_items",
-                      "SELECT count(*) FROM subscription_items WHERE subscription_id = $1",
-                      subscription_id},
-                     {"access_effects",
-                      "SELECT count(*) FROM access_effects WHERE subscription_id = $1",
-                      subscription_id},
-                     {"entitlement_grants",
-                      "SELECT count(*) FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
-                      subscription_id},
-                     {"order_line_items", "SELECT count(*) FROM order_line_items WHERE id = $1",
-                      line_item_id},
-                     {"orders", "SELECT count(*) FROM orders WHERE id = $1", order_id}
-                   ]
-
-                   Enum.each(cleanup_checks, fn {table, query, id} ->
-                     assert %{rows: [[0]]} = Repo.query!(query, [id]),
-                            "committed fixture cleanup left rows in #{table}"
-                   end)
-
-                   :cleaned
-                 end)
-      end)
-    end)
+    on_exit(fn -> cleanup_committed_recovery_fixture!(fixture) end)
 
     fixture
+  end
+
+  defp cleanup_committed_recovery_fixture!(fixture) do
+    Sandbox.unboxed_run(Repo, fn ->
+      subscription_id = Ecto.UUID.dump!(fixture.subscription.id)
+      line_item_id = Ecto.UUID.dump!(fixture.line_item.id)
+      order_id = Ecto.UUID.dump!(fixture.order.id)
+      variant_id = Ecto.UUID.dump!(fixture.variant.id)
+      product_id = Ecto.UUID.dump!(fixture.product.id)
+      plan_id = Ecto.UUID.dump!(fixture.plan.id)
+      user_id = Ecto.UUID.dump!(fixture.subscription.user_id)
+
+      assert {:ok, :cleaned} =
+               Repo.transaction(fn ->
+                 Repo.query!("SET CONSTRAINTS products_default_variant_id_fkey DEFERRED")
+
+                 Repo.query!(
+                   "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+                   [subscription_id]
+                 )
+
+                 Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [
+                   subscription_id
+                 ])
+
+                 Repo.query!(
+                   "UPDATE subscriptions SET current_dunning_renewal_attempt_id = NULL WHERE id = $1",
+                   [subscription_id]
+                 )
+
+                 Repo.query!("DELETE FROM renewal_attempts WHERE subscription_id = $1", [
+                   subscription_id
+                 ])
+
+                 Repo.query!("DELETE FROM subscription_items WHERE subscription_id = $1", [
+                   subscription_id
+                 ])
+
+                 Repo.query!("DELETE FROM subscriptions WHERE id = $1", [subscription_id])
+                 Repo.query!("DELETE FROM order_line_items WHERE id = $1", [line_item_id])
+                 Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
+
+                 Repo.query!(
+                   "DELETE FROM variant_subscription_plans WHERE variant_id = $1",
+                   [variant_id]
+                 )
+
+                 Repo.query!("DELETE FROM plan_revisions WHERE subscription_plan_id = $1", [
+                   plan_id
+                 ])
+
+                 Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [plan_id])
+                 Repo.query!("DELETE FROM products WHERE id = $1", [product_id])
+                 Repo.query!("DELETE FROM users WHERE id = $1", [user_id])
+
+                 cleanup_checks = [
+                   {"subscriptions", "SELECT count(*) FROM subscriptions WHERE id = $1",
+                    subscription_id},
+                   {"subscription_items",
+                    "SELECT count(*) FROM subscription_items WHERE subscription_id = $1",
+                    subscription_id},
+                   {"access_effects",
+                    "SELECT count(*) FROM access_effects WHERE subscription_id = $1",
+                    subscription_id},
+                   {"entitlement_grants",
+                    "SELECT count(*) FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+                    subscription_id},
+                   {"order_line_items", "SELECT count(*) FROM order_line_items WHERE id = $1",
+                    line_item_id},
+                   {"orders", "SELECT count(*) FROM orders WHERE id = $1", order_id}
+                 ]
+
+                 assert_committed_fixture_rows_removed!(cleanup_checks)
+
+                 :cleaned
+               end)
+    end)
   end
 
   defp clear_worker_jobs! do
@@ -448,5 +447,12 @@ defmodule Store.Workers.RunSubscriptionAccessEffectRecoveryWorkerTest do
       "DELETE FROM oban_jobs WHERE worker = $1",
       [inspect(RunSubscriptionAccessEffectRecoveryWorker)]
     )
+  end
+
+  defp assert_committed_fixture_rows_removed!(cleanup_checks) do
+    Enum.each(cleanup_checks, fn {table, query, id} ->
+      assert %{rows: [[0]]} = Repo.query!(query, [id]),
+             "committed fixture cleanup left rows in #{table}"
+    end)
   end
 end

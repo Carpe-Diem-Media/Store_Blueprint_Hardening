@@ -720,13 +720,17 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
                    {"orders", "SELECT count(*) FROM orders WHERE id = $1", order_id}
                  ]
 
-                 Enum.each(cleanup_checks, fn {table, query, id} ->
-                   assert %{rows: [[0]]} = Repo.query!(query, [id]),
-                          "committed fixture cleanup left rows in #{table}"
-                 end)
+                 assert_fixture_rows_removed!(cleanup_checks)
 
                  :cleaned
                end)
+    end)
+  end
+
+  defp assert_fixture_rows_removed!(cleanup_checks) do
+    Enum.each(cleanup_checks, fn {table, query, id} ->
+      assert %{rows: [[0]]} = Repo.query!(query, [id]),
+             "committed fixture cleanup left rows in #{table}"
     end)
   end
 end
