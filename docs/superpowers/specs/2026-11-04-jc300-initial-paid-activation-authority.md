@@ -1,8 +1,24 @@
 # JC300 Initial Paid Activation Authority
 
-- **Status:** PROPOSED / NOT YET APPROVED
+- **Status:** APPROVED by explicit human decision on 2026-11-05, limited to JC-360 below.
 - **Baseline:** `853894f28d89ce8a6358dc088f40e4ee8721490b`
-- **Implementation authority:** NONE until human approval of this document and the applicable implementation issue.
+- **Implementation authority:** Bounded JC-360 admission only, subject to establishing and verifying both approval records before production implementation.
+
+## Human approval and bounded admission record
+
+On 2026-11-05, the repository owner explicitly approved this authority dated 2026-11-04 and creation and admission of the separate implementation issue [JC-360, JC300 initial paid activation — atomic AccessEffect establishment and exact-ID F1 cutover](https://linear.app/jc-dev/issue/JC-360/jc300-initial-paid-activation-atomic-accesseffect-establishment-and).
+
+The owner limited approval to the scope, seven test files, 12-task execution order, acceptance criteria, exclusions and STOP conditions in `docs/superpowers/plans/2026-11-04-jc300-initial-paid-activation-implementation-plan.md` as merged at `17603dc57fc3a8e31e66694219d3a52afa8ba946`. That exact plan controls implementation. Its original proposal and planning-only statements record its pre-approval history; this subsequent decision supplies the bounded human approval without changing its technical contract.
+
+Execute tasks in this exact order: `01 → 02 → 04 → 03 → 05 → 06 → 07 → 08 → 09 → 10 → 11 → 12`. Tasks 03 and 05 remain one indivisible production cutover. No intermediate merge, release, deployment or acceptance may leave the new initial producer and legacy initial direct writer active together.
+
+Production implementation may begin only after this governance record and the separate Linear implementation issue are established and verified. JC-360 is admitted in Todo; this approval-recording change does not start production implementation or certify runtime behavior, tests or CI. The canonical JC-300 issue remains Done for its CONTRACT_FROZEN contract and is not reopened or repurposed.
+
+No scope expansion or automatic merge is authorized. Human review and merge remain required. All frozen F0/F1/F2 and JC247-C contracts, exclusions and global/task-specific STOP conditions remain unchanged, including `INITIAL_ACTIVATION_RACE_SEAM_UNPROVEN`. Historical repair, missing payment-to-job enqueue recovery and full JC300 final cutover remain outside this admission.
+
+The decision source is the owner's explicit instruction in the JC300 admission-review conversation. The approval covers the authority records and bounded issue admission; it grants no broader implementation or merge authority.
+
+Performance & Scaling Review and Runtime Resource Safety Review for this approval-recording change are NOT_APPLICABLE because it changes documentation only. Runtime evidence required by Tasks 11 and 12 remains UNMEASURED until implementation validation.
 
 ## Decision requested
 
@@ -170,4 +186,4 @@ Focused test files:
 
 Acceptance requires deterministic proofs for atomic Subscription/SubscriptionItem/AccessEffect establishment; exact purchased PlanRevision and valid period boundaries; nil/nil EFFECTIVE handling; repeated paid-order worker execution; F1 failure and recovery; recovery of a committed activation REQUIRED effect through the existing `RunSubscriptionAccessEffectRecoveryWorker`, with no duplicate Subscription, SubscriptionItem, AccessEffect, or grant rows after recovery and replay; APPLIED projection repair; multi-line partial post-commit failure and retry; both cancellation lock orders; no initial-activation legacy writer invocation; and unchanged payment behavior and public result contract. Tests must use PostgreSQL fixtures and transaction/lock barriers where races are involved.
 
-Human approval of this proposed authority is required before implementation begins.
+The human approval recorded above satisfies the approval requirement only for the bounded JC-360 admission. Establish and verify both authority records before implementation begins.
