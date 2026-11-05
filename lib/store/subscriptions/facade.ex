@@ -2267,12 +2267,18 @@ defmodule Store.Subscriptions.Facade do
             }
           )
 
-        {:ok,
-         %{
-           created: tx_result.created,
-           skipped: tx_result.skipped,
-           entitlements: issue_subscription_entitlements_after_commit(tx_result.entitlements)
-         }}
+        case dispatch_initial_access_effects(tx_result.access_effects) do
+          {:ok, entitlement_issued_count} ->
+            {:ok,
+             %{
+               created: tx_result.created,
+               skipped: tx_result.skipped,
+               entitlements: entitlement_issued_count
+             }}
+
+          {:error, reason} ->
+            {:error, Normalize.normalize(reason)}
+        end
 
       {:error, reason} ->
         {:error, Normalize.normalize(reason)}
@@ -2311,7 +2317,7 @@ defmodule Store.Subscriptions.Facade do
        %{
          created: 0,
          skipped: 0,
-         entitlements: [],
+         access_effects: [],
          notifications: stored_payment_method_notifications
        }},
       fn line_item, {:ok, acc} ->
@@ -2328,13 +2334,15 @@ defmodule Store.Subscriptions.Facade do
 
   defp reduce_subscription_line_item(order, line_item, payment_intent, stored_payment_method, acc) do
     case create_subscription_from_line(order, line_item, payment_intent, stored_payment_method) do
-      {:ok, :created, %{subscription: subscription, plan: _plan, revision: revision},
+      {:ok, :created, %{access_effect_id: effect_id, complete_entitlement_pair?: complete_pair?},
        line_notifications} ->
         updated =
           %{
             created: acc.created + 1,
             skipped: acc.skipped,
-            entitlements: [{subscription, revision} | acc.entitlements],
+            access_effects: [
+              %{id: effect_id, complete_entitlement_pair?: complete_pair?} | acc.access_effects
+            ],
             notifications: acc.notifications ++ line_notifications
           }
 
@@ -3648,7 +3656,8 @@ defmodule Store.Subscriptions.Facade do
          %PaymentIntent{} = payment_intent,
          stored_payment_method
        ) do
-    with {:ok, nil} <- fetch_subscription_by_source_line(line_item.id),
+    with :ok <- ensure_paid_order_line_identity(order, line_item),
+         {:ok, nil} <- fetch_subscription_by_source_line(line_item.id),
          {:ok, plan} <- fetch_plan(Map.get(line_item, :subscription_plan_id_snapshot)),
          {:ok, revision} <-
            fetch_plan_revision(Map.get(line_item, :subscription_plan_revision_id_snapshot)),
@@ -3671,10 +3680,22 @@ defmodule Store.Subscriptions.Facade do
              payment_intent,
              stored_payment_method
            ),
-         {:ok, _item, item_notifications} <-
-           create_subscription_item_record(subscription, line_item, plan, revision) do
-      {:ok, :created, %{subscription: subscription, plan: plan, revision: revision},
-       subscription_notifications ++ item_notifications}
+         {:ok, item, item_notifications} <-
+           create_subscription_item_record(subscription, line_item, plan, revision),
+         {:ok, access_effect, complete_entitlement_pair?} <-
+           establish_initial_paid_access_effect(
+             order,
+             line_item,
+             plan,
+             revision,
+             subscription,
+             item
+           ) do
+      {:ok, :created,
+       %{
+         access_effect_id: access_effect.id,
+         complete_entitlement_pair?: complete_entitlement_pair?
+       }, subscription_notifications ++ item_notifications}
     else
       {:ok, %Subscription{}} ->
         {:ok, :skipped, []}
@@ -3751,6 +3772,153 @@ defmodule Store.Subscriptions.Facade do
        "VALIDATION_ERROR",
        "purchased plan revision was never effective"
      )}
+  end
+
+  defp ensure_paid_order_line_identity(%Order{id: order_id}, %OrderLineItem{order_id: order_id}),
+    do: :ok
+
+  defp ensure_paid_order_line_identity(%Order{}, %OrderLineItem{}) do
+    {:error,
+     Error.new(
+       "TARGET_ORDER_UNPROVABLE",
+       "purchased OrderLineItem does not belong to the paid Order"
+     )}
+  end
+
+  defp establish_initial_paid_access_effect(
+         %Order{} = order,
+         %OrderLineItem{} = line_item,
+         %SubscriptionPlan{} = plan,
+         %PlanRevision{} = revision,
+         %Subscription{} = subscription,
+         %SubscriptionItem{} = item
+       ) do
+    with :ok <-
+           ensure_initial_revision_identity(line_item, plan, revision, subscription),
+         :ok <- ensure_initial_source_identity(order, line_item, subscription, item),
+         :ok <- ensure_initial_period(subscription),
+         {:ok, complete_entitlement_pair?} <-
+           initial_entitlement_pair_complete?(
+             revision.entitlement_kind,
+             revision.entitlement_scope_key
+           ),
+         {:ok, target} <- AccessEffectTargetOrder.derive_current_target(subscription, revision),
+         attrs <-
+           Map.merge(target, %{
+             subscription_id: subscription.id,
+             source_version: subscription.aggregate_version,
+             contract_change_id: nil
+           }),
+         {:ok, input} <- EstablishAccessEffectInput.new(attrs),
+         {:ok, %AccessEffect{} = effect} <- establish_access_effect_for_system(input),
+         :ok <- ensure_initial_effect_matches(effect, input, target) do
+      {:ok, effect, complete_entitlement_pair?}
+    end
+  end
+
+  defp ensure_initial_revision_identity(
+         %OrderLineItem{} = line_item,
+         %SubscriptionPlan{} = plan,
+         %PlanRevision{} = revision,
+         %Subscription{} = subscription
+       ) do
+    cond do
+      line_item.subscription_plan_revision_id_snapshot != revision.id or
+          subscription.current_plan_revision_id != revision.id ->
+        {:error,
+         Error.new(
+           "TARGET_ORDER_UNPROVABLE",
+           "funded PlanRevision does not match the Subscription current plan revision"
+         )}
+
+      line_item.subscription_plan_id_snapshot != plan.id or
+        revision.subscription_plan_id != plan.id or
+          subscription.subscription_plan_id != revision.subscription_plan_id ->
+        {:error,
+         Error.new(
+           "TARGET_ORDER_UNPROVABLE",
+           "purchased plan revision does not belong to the snapshotted subscription plan"
+         )}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp ensure_initial_source_identity(
+         %Order{id: order_id},
+         %OrderLineItem{id: line_item_id},
+         %Subscription{} = subscription,
+         %SubscriptionItem{} = item
+       ) do
+    if subscription.source_order_id == order_id and
+         subscription.source_order_line_item_id == line_item_id and
+         item.subscription_id == subscription.id and
+         item.source_order_line_item_id == line_item_id and
+         is_integer(subscription.aggregate_version) and subscription.aggregate_version > 0 and
+         is_nil(subscription.current_contract_change_id) do
+      :ok
+    else
+      {:error,
+       Error.new(
+         "TARGET_ORDER_UNPROVABLE",
+         "persisted initial Subscription source identity is incomplete"
+       )}
+    end
+  end
+
+  defp ensure_initial_period(%Subscription{
+         current_period_start_at: %DateTime{} = period_start_at,
+         current_period_end_at: %DateTime{} = period_end_at
+       }) do
+    if DateTime.compare(period_start_at, period_end_at) == :lt do
+      :ok
+    else
+      invalid_initial_period_error()
+    end
+  end
+
+  defp ensure_initial_period(%Subscription{}), do: invalid_initial_period_error()
+
+  defp invalid_initial_period_error do
+    {:error,
+     Error.new(
+       "TARGET_ORDER_UNPROVABLE",
+       "current subscription period evidence is required to derive the effective target"
+     )}
+  end
+
+  defp initial_entitlement_pair_complete?(kind, scope)
+       when not is_nil(kind) and not is_nil(scope),
+       do: {:ok, true}
+
+  defp initial_entitlement_pair_complete?(nil, nil), do: {:ok, false}
+
+  defp initial_entitlement_pair_complete?(_kind, _scope) do
+    {:error,
+     Error.new(
+       "TARGET_ORDER_UNPROVABLE",
+       "PlanRevision entitlement pair must be complete or exactly nil"
+     )}
+  end
+
+  defp ensure_initial_effect_matches(
+         %AccessEffect{} = effect,
+         %EstablishAccessEffectInput{} = input,
+         target
+       ) do
+    if effect.disposition == :effective and
+         effect.subscription_id == input.subscription_id and
+         effect.source_version == input.source_version and
+         AccessEffectTargetOrder.covered?(effect, target) do
+      :ok
+    else
+      {:error,
+       Error.new(
+         "TARGET_ORDER_UNPROVABLE",
+         "established initial AccessEffect does not match the persisted purchased target"
+       )}
+    end
   end
 
   defp resolve_provider_and_billing_mode(%Order{} = order, _plan) do
@@ -3964,17 +4132,6 @@ defmodule Store.Subscriptions.Facade do
     |> unwrap_create_with_notifications()
   end
 
-  defp maybe_issue_entitlement(subscription, plan) do
-    if is_nil(plan.entitlement_kind) do
-      :skipped
-    else
-      case EntitlementsFacade.issue_subscription_entitlement_for_system(subscription, plan) do
-        {:ok, _grant} -> :issued
-        {:error, _reason} -> :skipped
-      end
-    end
-  end
-
   defp emit_paid_renewal_access_sync_boundary(
          %Subscription{},
          %RenewalAttempt{}
@@ -4001,15 +4158,37 @@ defmodule Store.Subscriptions.Facade do
   defp normalize_transaction_notifications({:error, reason}),
     do: {:error, Normalize.normalize(reason)}
 
-  defp issue_subscription_entitlements_after_commit(entitlement_pairs) do
-    entitlement_pairs
+  defp dispatch_initial_access_effects(access_effects) do
+    access_effects
     |> Enum.reverse()
-    |> Enum.reduce(0, fn {subscription, plan}, count ->
-      case maybe_issue_entitlement(subscription, plan) do
-        :issued -> count + 1
-        _ -> count
-      end
-    end)
+    |> Enum.reduce_while({:ok, 0}, &dispatch_initial_access_effect/2)
+  end
+
+  defp dispatch_initial_access_effect(
+         %{id: effect_id, complete_entitlement_pair?: complete_pair?},
+         {:ok, count}
+       ) do
+    case execute_effective_access_effect_for_system(effect_id) do
+      {:ok, outcome} -> dispatch_initial_access_outcome(outcome, complete_pair?, count)
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
+  end
+
+  defp dispatch_initial_access_outcome(outcome, true, count)
+       when outcome in [:applied, :applied_projection_pending],
+       do: {:cont, {:ok, count + 1}}
+
+  defp dispatch_initial_access_outcome(outcome, _complete_pair?, count)
+       when outcome in [:applied, :applied_projection_pending, :superseded, :noop],
+       do: {:cont, {:ok, count}}
+
+  defp dispatch_initial_access_outcome(outcome, _complete_pair?, _count) do
+    {:halt,
+     {:error,
+      Error.new(
+        "INTERNAL_ERROR",
+        "unsupported initial AccessEffect execution outcome: #{inspect(outcome)}"
+      )}}
   end
 
   defp run_cancel(%Subscription{} = subscription, mode, actor)

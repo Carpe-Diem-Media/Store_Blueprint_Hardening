@@ -24,8 +24,8 @@ defmodule Store.Subscriptions.FacadeTest do
   alias Store.Shipping.Facade, as: ShippingFacade
   alias Store.Shipping.Inputs.QuoteRequest
   alias Store.Shipping.{ShippingMethod, ShippingRateRule, ShippingZone}
-  alias Store.Subscriptions.ContractChange
   alias Store.Subscriptions.AccessEffectTargetOrder
+  alias Store.Subscriptions.ContractChange
   alias Store.Subscriptions.Facade, as: SubscriptionsFacade
   alias Store.Support.Errors.Error
 
