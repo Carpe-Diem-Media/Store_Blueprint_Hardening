@@ -635,6 +635,79 @@ defmodule Store.Subscriptions.FacadeTest do
     assert fetch_access_effect_unboxed!(newer_effect.id).status == :required
   end
 
+  @tag :jc360_task04
+  test "paid-order F1 failure preserves ordered committed sources and leaves later IDs recoverable" do
+    fixture = create_paid_order_with_three_revision_lines!("jc360_ordered_f1_failure")
+    [_first_line, failed_line, _unattempted_line] = fixture.line_items
+    order_before = fetch_order!(fixture.order.id)
+    [payment_intent_before] = succeeded_payment_intents_for_order(fixture.order.id)
+
+    assert order_before.state == :paid
+    assert payment_intent_before.state == :succeeded
+
+    result =
+      with_effect_application_rejection!(failed_line.id, fn ->
+        SubscriptionsFacade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+      end)
+
+    assert {:error, %Error{}} = result,
+           "expected the first F1 failure to reach the facade, got #{inspect(result)}"
+
+    assert fetch_order!(fixture.order.id) == order_before
+    assert succeeded_payment_intents_for_order(fixture.order.id) == [payment_intent_before]
+
+    subscriptions = subscriptions_for_order(fixture.order.id)
+    assert length(subscriptions) == 3
+    assert count_subscription_items_for_order(fixture.order.id) == 3
+    assert count_access_effects_for_order(fixture.order.id) == 3
+
+    line_results =
+      Enum.zip(fixture.line_items, [:applied, :failed_retryable, :required])
+      |> Enum.map(fn {line_item, expected_status} ->
+        [subscription] =
+          Enum.filter(subscriptions, &(&1.source_order_line_item_id == line_item.id))
+
+        [item] = subscription_items_for_source_line(line_item.id)
+        [effect] = access_effects_for_source_line(line_item.id)
+
+        assert item.subscription_id == subscription.id
+        assert item.source_order_line_item_id == line_item.id
+        assert effect.id
+        assert effect.subscription_id == subscription.id
+        assert effect.source_order_line_item_id == line_item.id
+        assert effect.source_version == subscription.aggregate_version
+        assert effect.status == expected_status
+
+        {subscription, effect}
+      end)
+
+    effect_ids = Enum.map(line_results, fn {_subscription, effect} -> effect.id end)
+    assert MapSet.size(MapSet.new(effect_ids)) == 3
+
+    [
+      {first_subscription, first_effect},
+      {failed_subscription, _failed_effect},
+      {unattempted_subscription, unattempted_effect}
+    ] = line_results
+
+    [first_grant] = entitlements_for_subscription(first_subscription.id)
+    assert first_grant.source_kind == :subscription
+    assert first_grant.source_id == first_subscription.id
+    assert first_grant.kind == first_effect.entitlement_kind
+    assert first_grant.scope_key == first_effect.entitlement_scope_key
+    assert first_grant.status == :active
+    assert entitlements_for_subscription(failed_subscription.id) == []
+    assert entitlements_for_subscription(unattempted_subscription.id) == []
+
+    assert {:ok, :applied} =
+             SubscriptionsFacade.execute_effective_access_effect_for_system(unattempted_effect.id)
+
+    assert fetch_access_effect!(unattempted_effect.id).status == :applied
+    assert length(entitlements_for_subscription(unattempted_subscription.id)) == 1
+    assert fetch_order!(fixture.order.id) == order_before
+    assert succeeded_payment_intents_for_order(fixture.order.id) == [payment_intent_before]
+  end
+
   test "run_due_renewals_for_system creates a virtual renewal attempt and waits for paid reconciliation" do
     customer = SubscriptionsFixtures.create_customer!("phase26_sub_renew_success")
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
@@ -2305,6 +2378,36 @@ defmodule Store.Subscriptions.FacadeTest do
     })
   end
 
+  defp create_paid_order_with_three_revision_lines!(prefix) do
+    fixture = create_paid_order_with_two_revision_lines!(prefix)
+
+    third_plan =
+      SubscriptionsFixtures.create_subscription_plan!(%{
+        entitlement_kind: :membership_access,
+        entitlement_scope_key: "#{prefix}:third:#{Ecto.UUID.generate()}"
+      })
+
+    _third_variant_plan =
+      SubscriptionsFixtures.attach_variant_plan!(fixture.variant.id, third_plan.id)
+
+    third_revision = SubscriptionsFixtures.create_plan_revision!(third_plan)
+
+    third_line =
+      create_subscription_order_line_for_revision!(
+        fixture.order,
+        fixture.variant,
+        third_plan,
+        third_revision,
+        3
+      )
+
+    Map.merge(fixture, %{
+      line_items: fixture.line_items ++ [third_line],
+      revisions: fixture.revisions ++ [third_revision],
+      plans: fixture.plans ++ [third_plan]
+    })
+  end
+
   defp create_subscription_order_line_for_revision!(order, variant, plan, revision, line_no) do
     OrderLineItem
     |> Ash.Changeset.for_create(
@@ -2425,6 +2528,28 @@ defmodule Store.Subscriptions.FacadeTest do
       ALTER TABLE access_effects
       ADD CONSTRAINT #{constraint}
       CHECK (plan_revision_id <> #{uuid_sql_literal!(revision_id)})
+      NOT VALID
+      """)
+
+      fun.()
+    after
+      Repo.query!("ALTER TABLE access_effects DROP CONSTRAINT IF EXISTS #{constraint}")
+    end
+  end
+
+  defp with_effect_application_rejection!(line_item_id, fun) do
+    constraint = "jc360_reject_f1_#{System.unique_integer([:positive])}"
+
+    try do
+      Repo.query!("SET LOCAL lock_timeout = '5s'")
+
+      Repo.query!("""
+      ALTER TABLE access_effects
+      ADD CONSTRAINT #{constraint}
+      CHECK (
+        status <> 'applied' OR
+        source_order_line_item_id <> #{uuid_sql_literal!(line_item_id)}
+      )
       NOT VALID
       """)
 
@@ -2772,6 +2897,13 @@ defmodule Store.Subscriptions.FacadeTest do
     |> Ash.Query.filter(expr(id == ^payment_intent_id))
     |> Ash.read!(domain: Store.Payments, authorize?: false, context: %{system?: true})
     |> List.first()
+  end
+
+  defp succeeded_payment_intents_for_order(order_id) do
+    PaymentIntent
+    |> Ash.Query.filter(expr(order_id == ^order_id and state == :succeeded))
+    |> Ash.Query.sort(inserted_at: :desc, id: :desc)
+    |> Ash.read!(domain: Store.Payments, authorize?: false, context: %{system?: true})
   end
 
   defp fetch_order!(order_id) do
