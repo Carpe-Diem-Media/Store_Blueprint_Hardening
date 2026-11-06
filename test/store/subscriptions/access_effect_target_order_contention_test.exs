@@ -206,6 +206,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
       cache_key = Cache.cache_key(fixture.customer.id)
       assert {:ok, true} = Cachex.put(Cache, cache_key, :jc360_task10_before_activation)
 
+      :ok = Sandbox.checkin(Repo)
       race = run_activation_locks_first_race!(fixture, context)
       assert_task10_final_state!(fixture, cache_key, race.cancel_result)
 
