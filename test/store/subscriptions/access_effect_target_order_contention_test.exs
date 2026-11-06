@@ -195,6 +195,250 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     end
   end
 
+  @tag :jc360_task10
+  test "initial F1 locks the source before cancel now and cancellation wins", context do
+    fixture = create_committed_initial_activation_source!("jc360_task10_activation_first")
+
+    try do
+      assert_committed_initial_activation_source!(fixture)
+
+      :ok = Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(fixture.customer.id))
+      cache_key = Cache.cache_key(fixture.customer.id)
+      assert {:ok, true} = Cachex.put(Cache, cache_key, :jc360_task10_before_activation)
+
+      race = run_activation_locks_first_race!(fixture, context)
+      assert_task10_final_state!(fixture, cache_key, race.cancel_result)
+
+      IO.puts(
+        "JC360_TASK10 activation_first pool_size=#{context.effective_repo_pool_size} " <>
+          "A=#{race.backend_a} B=#{race.backend_b} C=#{race.backend_c} " <>
+          "candidate=#{fixture.effect.id} " <>
+          "C_blocks_A_before_B=#{inspect(race.candidate_blockers_before_cancel)} " <>
+          "C_blocks_A=#{inspect(race.candidate_blockers_before_release)} " <>
+          "A_blocks_B=#{inspect(race.cancellation_blockers)} " <>
+          "C_reconfirmed_blocks_A=true initial=applied cancellation=applied " <>
+          "final_grants=one_revoked projection=empty"
+      )
+    after
+      cleanup_owned_source!(fixture)
+      Cachex.del(Cache, Cache.cache_key(fixture.customer.id))
+    end
+  end
+
+  defp run_activation_locks_first_race!(fixture, context) do
+    run_ref = make_ref()
+
+    barrier =
+      start_candidate_effect_lock_barrier!(
+        run_ref,
+        fixture.effect.id,
+        context.direct_repo_owner
+      )
+
+    try do
+      assert barrier.access_effect_id == fixture.effect.id
+
+      race =
+        run_initial_f1_while_candidate_is_locked!(
+          fixture,
+          context.direct_repo_owner,
+          run_ref,
+          barrier
+        )
+
+      Map.merge(race, %{backend_c: barrier.backend_pid})
+    after
+      release_candidate_effect_barrier!(barrier, run_ref)
+    end
+  end
+
+  defp run_initial_f1_while_candidate_is_locked!(fixture, direct_repo_owner, run_ref, barrier) do
+    task_a = start_initial_effect_task(run_ref, fixture.effect.id, direct_repo_owner)
+
+    try do
+      assert_receive {^run_ref, :initial_f1_waiting, backend_a, false}, @task_timeout
+      assert backend_a != barrier.backend_pid
+
+      send(task_a.pid, {run_ref, :execute_initial_f1})
+
+      candidate_blockers_before_cancel =
+        assert_candidate_effect_blocked_by_barrier!(
+          barrier,
+          run_ref,
+          backend_a,
+          barrier.backend_pid,
+          :initial_f1_waiting_on_candidate
+        )
+
+      cancellation_race =
+        run_cancel_now_while_f1_waits!(
+          fixture,
+          direct_repo_owner,
+          run_ref,
+          barrier,
+          task_a,
+          backend_a
+        )
+
+      Map.merge(cancellation_race, %{
+        backend_a: backend_a,
+        candidate_blockers_before_cancel: candidate_blockers_before_cancel
+      })
+    after
+      send(task_a.pid, {run_ref, :execute_initial_f1})
+      release_candidate_effect_barrier!(barrier, run_ref)
+      await_task_exit!(task_a, @task_timeout)
+    end
+  end
+
+  defp run_cancel_now_while_f1_waits!(
+         fixture,
+         direct_repo_owner,
+         run_ref,
+         barrier,
+         task_a,
+         backend_a
+       ) do
+    task_b = start_cancel_now_task(run_ref, fixture, direct_repo_owner)
+
+    try do
+      assert_receive {^run_ref, :cancel_now_started, backend_b, false}, @task_timeout
+      assert length(Enum.uniq([backend_a, backend_b, barrier.backend_pid])) == 3
+
+      send(task_b.pid, {run_ref, :run_cancel_now})
+
+      cancellation_blockers =
+        assert_candidate_effect_blocked_by_barrier!(
+          barrier,
+          run_ref,
+          backend_b,
+          backend_a,
+          :cancel_now_waiting_on_subscription
+        )
+
+      candidate_blockers_before_release =
+        assert_candidate_effect_blocked_by_barrier!(
+          barrier,
+          run_ref,
+          backend_a,
+          barrier.backend_pid,
+          :initial_f1_still_waiting_on_candidate
+        )
+
+      assert backend_a in cancellation_blockers
+      assert barrier.backend_pid in candidate_blockers_before_release
+      assert {:ok, :released} = release_candidate_effect_barrier!(barrier, run_ref)
+
+      assert_receive {^run_ref, :initial_f1_completed, f1_result, false}, @task_timeout
+      assert_task_exit!(task_a, @task_timeout)
+      assert f1_result == {:ok, :applied}
+      assert fetch_access_effect!(fixture.effect.id).status == :applied
+
+      assert_receive {^run_ref, :cancel_now_completed, cancel_result, false}, @task_timeout
+      assert_task_exit!(task_b, @task_timeout)
+
+      %{
+        backend_b: backend_b,
+        cancellation_blockers: cancellation_blockers,
+        candidate_blockers_before_release: candidate_blockers_before_release,
+        cancel_result: cancel_result
+      }
+    after
+      send(task_b.pid, {run_ref, :run_cancel_now})
+      release_candidate_effect_barrier!(barrier, run_ref)
+      send(task_a.pid, {run_ref, :execute_initial_f1})
+      await_task_exit!(task_b, @task_timeout)
+    end
+  end
+
+  defp assert_task10_final_state!(fixture, cache_key, cancel_response) do
+    assert {:ok, %Subscription{status: :canceled} = cancel_result} = cancel_response
+    canceled = fetch_subscription!(fixture.subscription.id)
+    assert cancellation_summary(cancel_result) == cancellation_summary(canceled)
+    assert canceled.status == :canceled
+    assert canceled.canceled_reason == "user_request"
+    assert canceled.aggregate_version > fixture.subscription.aggregate_version
+
+    initial_effect = fetch_access_effect!(fixture.effect.id)
+    assert initial_effect.status == :applied
+    assert initial_effect.disposition == :effective
+    assert initial_effect.source_order_line_item_id == fixture.line_item.id
+    assert initial_effect.source_version == fixture.subscription.aggregate_version
+
+    assert current_effect_count!(canceled.id, canceled.aggregate_version) == 1
+
+    cancellation_effect =
+      fetch_effect_for_source_version!(canceled.id, canceled.aggregate_version)
+
+    assert cancellation_effect.id != initial_effect.id
+    assert cancellation_effect.source_version > initial_effect.source_version
+    assert cancellation_effect.status == :applied
+    assert cancellation_effect.disposition == :non_effective
+    assert cancellation_effect.source_order_line_item_id == fixture.line_item.id
+    assert cancellation_effect.contract_change_id == canceled.current_contract_change_id
+    assert cancellation_effect.plan_revision_id == fixture.revision.id
+    assert is_nil(cancellation_effect.entitlement_kind)
+    assert is_nil(cancellation_effect.entitlement_scope_key)
+    assert is_nil(cancellation_effect.valid_from_at)
+    assert is_nil(cancellation_effect.valid_until_at)
+    assert cancellation_effect.projection_user_ids == [fixture.customer.id]
+    assert %DateTime{} = cancellation_effect.projection_delivered_at
+
+    assert effect_identity_snapshot!(fixture.subscription.id) == [
+             {initial_effect.id, initial_effect.source_version, :applied},
+             {cancellation_effect.id, canceled.aggregate_version, :applied}
+           ]
+
+    assert_receive {:entitlements_invalidated, user_id, "effective_access_effect_applied", _at},
+                   @task_timeout
+
+    assert_receive {:entitlements_invalidated, cancellation_user_id,
+                    "non_effective_access_effect_applied", _at},
+                   @task_timeout
+
+    assert user_id == fixture.customer.id
+    assert cancellation_user_id == fixture.customer.id
+    assert {:ok, nil} = Cachex.get(Cache, cache_key)
+
+    assert [%EntitlementGrant{} = grant] = grants_for_source!(fixture.subscription.id)
+    assert grant.status == :revoked
+    assert grant.revoked_reason == "canceled_now"
+    assert %DateTime{} = grant.revoked_at
+    assert grant.user_id == fixture.customer.id
+    assert grant.source_kind == :subscription
+    assert grant.source_id == fixture.subscription.id
+    assert grant.kind == fixture.revision.entitlement_kind
+    assert grant.scope_key == fixture.revision.entitlement_scope_key
+    assert grant.valid_from_at == initial_effect.valid_from_at
+    assert grant.valid_to_at == initial_effect.valid_until_at
+    assert active_grants_for!(fixture.subscription.id) == []
+
+    assert %{rows: [[1]]} =
+             Repo.query!(
+               "SELECT count(*) FROM subscriptions WHERE source_order_line_item_id = $1",
+               [Ecto.UUID.dump!(fixture.line_item.id)]
+             )
+
+    assert %{rows: [[1]]} =
+             Repo.query!(
+               "SELECT count(*) FROM subscription_items WHERE source_order_line_item_id = $1",
+               [Ecto.UUID.dump!(fixture.line_item.id)]
+             )
+
+    assert %{rows: [[2]]} =
+             Repo.query!(
+               "SELECT count(*) FROM access_effects WHERE subscription_id = $1",
+               [Ecto.UUID.dump!(fixture.subscription.id)]
+             )
+
+    assert {:ok, %EntitlementSet{} = projection} =
+             EntitlementsFacade.entitlement_set_for_user(fixture.customer)
+
+    assert projection.user_id == fixture.customer.id
+    assert projection.grants == []
+    assert {:ok, ^projection} = Cachex.get(Cache, cache_key)
+  end
+
   defp run_race!(fixture, order, direct_repo_owner) do
     parent = self()
     run_ref = make_ref()
@@ -576,6 +820,108 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
       end)
 
     %{pid: pid, monitor_ref: monitor_ref}
+  end
+
+  defp start_candidate_effect_lock_barrier!(run_ref, access_effect_id, direct_repo_owner) do
+    parent = self()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        :ok = Sandbox.allow(Store.DirectRepo, direct_repo_owner, self())
+
+        transaction_result =
+          Repo.transaction(
+            fn ->
+              backend_pid = backend_pid!()
+
+              %{rows: [[locked_effect_id]]} =
+                Repo.query!(
+                  "SELECT id FROM access_effects WHERE id = $1 FOR UPDATE",
+                  [Ecto.UUID.dump!(access_effect_id)],
+                  timeout: @task_timeout
+                )
+
+              locked_effect_id = Ecto.UUID.cast!(locked_effect_id)
+
+              send(
+                parent,
+                {run_ref, :candidate_effect_barrier_locked, backend_pid, locked_effect_id}
+              )
+
+              await_candidate_effect_barrier!(run_ref)
+            end,
+            timeout: @transaction_timeout
+          )
+
+        send(parent, {run_ref, :candidate_effect_barrier_completed, transaction_result})
+      end)
+
+    receive do
+      {^run_ref, :candidate_effect_barrier_locked, backend_pid, ^access_effect_id} ->
+        %{
+          pid: pid,
+          monitor_ref: monitor_ref,
+          backend_pid: backend_pid,
+          access_effect_id: access_effect_id
+        }
+    after
+      @task_timeout -> flunk("timed out acquiring the exact candidate AccessEffect row lock")
+    end
+  end
+
+  defp await_candidate_effect_barrier!(run_ref) do
+    receive do
+      {^run_ref, :observe_blockers, blocked_pid, expected_blocker_pid, observer, label} ->
+        blockers = await_blocking_pid!(blocked_pid, expected_blocker_pid)
+
+        send(observer, {run_ref, {:candidate_effect_blockers, label}, blockers})
+        await_candidate_effect_barrier!(run_ref)
+
+      {^run_ref, :release_candidate_effect} ->
+        :released
+    after
+      @transaction_timeout -> Repo.rollback(:candidate_effect_lock_release_timeout)
+    end
+  end
+
+  defp assert_candidate_effect_blocked_by_barrier!(
+         barrier,
+         run_ref,
+         blocked_pid,
+         expected_blocker_pid,
+         label
+       ) do
+    send(
+      barrier.pid,
+      {run_ref, :observe_blockers, blocked_pid, expected_blocker_pid, self(), label}
+    )
+
+    receive do
+      {^run_ref, {:candidate_effect_blockers, ^label}, blockers} ->
+        assert expected_blocker_pid in blockers
+        blockers
+    after
+      @task_timeout -> flunk("timed out observing PostgreSQL blocker evidence for #{label}")
+    end
+  end
+
+  defp release_candidate_effect_barrier!(barrier, run_ref) do
+    if Process.alive?(barrier.pid) do
+      send(barrier.pid, {run_ref, :release_candidate_effect})
+
+      receive do
+        {^run_ref, :candidate_effect_barrier_completed, transaction_result} ->
+          await_task_exit!(barrier, @task_timeout)
+          transaction_result
+      after
+        @task_timeout ->
+          Process.exit(barrier.pid, :kill)
+          flunk("candidate AccessEffect barrier did not finish after release")
+      end
+    else
+      Process.demonitor(barrier.monitor_ref, [:flush])
+      :already_released
+    end
   end
 
   defp input!(attrs) do
