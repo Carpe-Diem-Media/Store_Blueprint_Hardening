@@ -422,12 +422,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
             contract_change_id: fixture.subscription.current_contract_change_id,
             plan_revision_id: fixture.revision.id
           })
-          |> then(fn input ->
-            case Facade.establish_access_effect_for_system(input) do
-              {:ok, access_effect} -> access_effect
-              other -> Repo.rollback({:initial_effect_establishment_failed, other})
-            end
-          end)
+          |> establish_initial_access_effect!()
 
         Map.merge(fixture, %{
           customer: customer,
@@ -446,6 +441,13 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
 
       {:error, reason} ->
         raise "unable to create committed initial activation fixture: #{inspect(reason)}"
+    end
+  end
+
+  defp establish_initial_access_effect!(input) do
+    case Facade.establish_access_effect_for_system(input) do
+      {:ok, access_effect} -> access_effect
+      other -> Repo.rollback({:initial_effect_establishment_failed, other})
     end
   end
 
