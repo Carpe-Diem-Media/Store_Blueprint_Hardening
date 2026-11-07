@@ -28,7 +28,7 @@ Modify lib/store/subscriptions/payment_method_authority_gate.ex. Create test/sto
       }
 
 @doc """
-Serializes a fresh dispatch with cooperating binding and method writers.
+Serializes a charge dispatch with cooperating binding and method writers.
 
 The resolver runs after the binding gate is held. The callback runs outside a
 Repo transaction and must confirm the proof immediately before adapter invocation.
@@ -104,16 +104,26 @@ rescue
 end
 
  defp with_session_key(key, fun) do
-  case Repo.query("SELECT pg_try_advisory_lock($1)", [key], timeout: @session_query_timeout_ms) do
-    {:ok, %{rows: [[true]]}} ->
-      try do
-        fun.()
-      after
-        release_session_key_or_discard_owner!(key)
-      end
-
-    _ -> {:error, :lock_unavailable}
+  if acquire_session_key_or_discard_owner!(key) do
+    try do
+      fun.()
+    after
+      release_session_key_or_discard_owner!(key)
+    end
+  else
+    {:error, :lock_unavailable}
   end
+end
+
+ defp acquire_session_key_or_discard_owner!(key) do
+  case Repo.query("SELECT pg_try_advisory_lock($1)", [key], timeout: @session_query_timeout_ms) do
+    {:ok, %{rows: [[acquired?]]}} when is_boolean(acquired?) -> acquired?
+    _ -> Process.exit(self(), :kill)
+  end
+rescue
+  _error in [DBConnection.ConnectionError, Postgrex.Error] -> Process.exit(self(), :kill)
+catch
+  :exit, _reason -> Process.exit(self(), :kill)
 end
 
  defp release_session_key_or_discard_owner!(key) do
@@ -291,6 +301,34 @@ defmodule Store.Subscriptions.Jc290PaymentMethodDispatchCleanupTest do
     end
   end
 
+  test "method acquisition error discards the session after binding acquisition", %{identity: identity} do
+    parent = self()
+    ref = make_ref()
+    task = Task.async(fn ->
+      Gate.with_dispatch_session_gates(identity.user_id, identity.provider,
+        fn ->
+          [[backend_pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+          send(parent, {ref, :held, backend_pid})
+          receive do {^ref, :release} -> :ok after 3_000 -> raise "acquisition barrier timeout" end
+          Repo.query("SELECT pg_terminate_backend(pg_backend_pid())")
+          {:ok, identity}
+        end,
+        fn _, _ -> flunk("lost session invoked callback") end)
+    end)
+    Process.unlink(task.pid)
+    try do
+      assert_receive {^ref, :held, backend_pid}, 3_000
+      send(task.pid, {ref, :release})
+      assert_receive {:DOWN, monitor_ref, :process, task_pid, :killed}, 3_000
+      assert monitor_ref == task.ref
+      assert task_pid == task.pid
+      assert_eventually(fn -> Repo.query!("SELECT count(*) FROM pg_stat_activity WHERE pid = $1", [backend_pid]).rows == [[0]] end)
+      assert_keys_available!(identity, backend_pid)
+    after
+      Task.shutdown(task, :brutal_kill)
+    end
+  end
+
   for mode <- [:owner_death, :unlock_false, :connection_loss, :checkout_deadline] do
     test "#{mode} discards only its checkout and frees both keys", %{identity: identity} do
       mode = unquote(mode)
@@ -416,3 +454,15 @@ uses a 500 ms outer checkout to exercise that same production API without a minu
 of idle test time. The helper never claims a request occurred or sets payment
 state. Real physical transaction visibility and both race winners remain part of
 the following facade task, including exact-reference replay after a crash.
+
+The root review also requires disposal after an uncertain acquisition response.
+An explicit false proves no acquisition; a query error does not. The acquisition
+query has its own narrow error handler. The resolver-loss test exercises that
+branch after the binding lock was acquired. Arbitrary network lost-acknowledgement
+behavior remains unmeasured; no atomic cross-system receipt claim is made.
+
+Implementation review clarified exception transport. Resolver and callback
+exceptions retain their original class and stack after cleanup. A private tagged
+throw with a fresh reference may distinguish those exceptions from an initial
+checkout error handled by the outer rescue. This must not change the caller's
+exception into a lock-unavailable result or add any process, pool or global state.

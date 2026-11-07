@@ -27,6 +27,9 @@ defmodule Store.Subscriptions.PaymentMethodAuthorityGate do
   Repo transaction and must confirm the proof immediately before adapter invocation.
   The checkout deadline bounds the database checkout. It does not prove remote
   receipt or bound the lifetime of a synchronous HTTP callback after disconnection.
+  An uncertain acquisition or release terminates only the checkout owner so its
+  connection cannot return to the pool with unknown session locks. Resolver and
+  callback exceptions propagate after their acquired locks are released.
   """
   @spec with_dispatch_session_gates(
           Ecto.UUID.t(),
