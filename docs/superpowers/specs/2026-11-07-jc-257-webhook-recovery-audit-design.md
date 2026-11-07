@@ -14,6 +14,8 @@ Use an exact order-and-worker scoped test database trigger only if it can force 
 
 No production test seam, provider adapter, live API call, Redis authority or broad fault injection is allowed. Use the existing DevCore test database and four-connection limits. Diagnostic trigger names and predicates must be unique, ownership bounded and cleanup verified. One Mix process owns the environment at a time.
 
+The rollback probe observed that priority 10 is valid in the current database: Oban V12 replaced the old upper-bound constraint. A second probe set only the matching job's `max_attempts` to zero and obtained an Ecto changeset error for `positive_max_attempts`. Rollback left zero probe functions, triggers and jobs. The test plan will use this observed mechanism. It must state whether Store payment data remains under a test sandbox and avoid claiming process-exit durability from that setup.
+
 ## Work sequence
 
 1. Establish the smallest safe Oban enqueue-failure mechanism from installed source and a bounded rollback probe. Write the complete test plan only after observing the actual result.
