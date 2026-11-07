@@ -11,6 +11,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
   alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
+  alias Store.Support.Telemetry.RepoStats
   alias Store.TestSupport.StripeAPIStub
 
   @through_updated_at ~U[2026-10-20 12:00:00.000000Z]
@@ -181,6 +182,123 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
 
     assert normalize_predicate(predicate) ==
              "disposition='effective'andstatusin'required','pending','failed_retryable'"
+  end
+
+  @tag :jc360_task11
+  test "recovery, terminal sweep, and selector costs emit bounded measurements" do
+    measured_executions =
+      for status <- [:required, :failed_retryable], sample <- 1..4 do
+        effect = create_effect!(:effective)
+        effect = if status == :failed_retryable, do: transition_to!(effect, status), else: effect
+        recovery_started_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+        {result, stats, duration_us} =
+          measured_operation(fn ->
+            Facade.run_subscription_access_effect_recovery_for_system(
+              limit: 1,
+              as_of: recovery_started_at
+            )
+          end)
+
+        assert {:ok, recovery} = result
+        assert recovery.effective_execution_count == 1
+        assert recovery.effective_execution_cursor.id == effect.id
+        assert fetch_effect!(effect.id).status == :applied
+        assert length(grant_ids_for_source!(effect.subscription_id)) == 1
+
+        print_measurement!("#{status}_recovery", sample, 1, duration_us, stats, %{
+          effect_id: effect.id,
+          source_rows: 1,
+          eligibility_lag_us: DateTime.diff(recovery_started_at, effect.updated_at, :microsecond),
+          items_per_second: 1_000_000 / max(duration_us, 1),
+          lag_clock:
+            "recovery start wall clock minus persisted updated_at; may be nonpositive at timestamp granularity"
+        })
+
+        duration_us
+      end
+
+    terminal_effect = create_effect!(:effective) |> transition_to!(:applied)
+
+    terminal_sweep_durations =
+      for sample <- 1..4 do
+        {result, stats, duration_us} =
+          measured_operation(fn ->
+            Facade.run_subscription_access_effect_recovery_for_system(
+              limit: 10,
+              as_of: ~U[2099-01-01 00:00:00.000000Z]
+            )
+          end)
+
+        assert {:ok, recovery} = result
+        assert recovery.effective_execution_count == 0
+        assert fetch_effect!(terminal_effect.id).status == :applied
+        print_measurement!("terminal_recovery_sweep", sample, 0, duration_us, stats, %{})
+        duration_us
+      end
+
+    selected = Enum.map(1..4, fn _ -> create_effect!(:effective) end)
+    set_updated_at!(selected, ~U[2026-10-20 11:00:00.000000Z])
+
+    selector_durations =
+      for sample <- 1..6 do
+        {rows, stats, duration_us} =
+          measured_operation(fn ->
+            read_effects!(limit: 2, through_updated_at: @through_updated_at)
+          end)
+
+        assert length(rows) == 2
+
+        print_measurement!("recovery_selector_page", sample, 2, duration_us, stats, %{
+          page_limit: 2,
+          selected_ids: Enum.map(rows, & &1.id)
+        })
+
+        duration_us
+      end
+
+    indexes = measured_index_definitions!()
+
+    assert indexes["subscriptions_unique_source_order_line_item_id_index"] =~
+             "UNIQUE INDEX"
+
+    assert indexes["access_effects_unique_subscription_source_version_index"] =~
+             "UNIQUE INDEX"
+
+    assert indexes["entitlement_grants_source_index"] =~
+             "(source_kind, source_id)"
+
+    assert indexes["access_effects_effective_recovery_index"] =~
+             "(updated_at, id)"
+
+    assert indexes["access_effects_effective_recovery_index"] =~
+             "WHERE"
+
+    %{rows: selector_plan_rows} =
+      Repo.query!(
+        "EXPLAIN SELECT id FROM access_effects WHERE disposition = 'effective' AND status IN ('required', 'pending', 'failed_retryable') AND updated_at <= $1 ORDER BY updated_at, id LIMIT 2",
+        [@through_updated_at]
+      )
+
+    selector_plan = Enum.map_join(selector_plan_rows, "\n", fn [line] -> line end)
+
+    IO.puts(
+      Jason.encode!(%{
+        tag: "JC360_MEASUREMENTS",
+        operation: "recovery_summaries",
+        workload_class: "recovery_warm",
+        required_and_failed_retryable_sample_count: length(measured_executions),
+        terminal_sweep_sample_count: length(terminal_sweep_durations),
+        selector_page_sample_count: length(selector_durations),
+        required_and_failed_retryable_latency_us: latency_summary(measured_executions),
+        terminal_sweep_latency_us: latency_summary(terminal_sweep_durations),
+        selector_page_latency_us: latency_summary(selector_durations),
+        index_definitions: indexes,
+        bounded_selector_explain_plan: selector_plan,
+        planner_index_use_claim: "UNMEASURED at fixture volume",
+        limits: "fixture-scoped descriptive observations; no capacity claim"
+      })
+    )
   end
 
   @tag :jc360_task07
@@ -416,6 +534,63 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
   defp read_effects!(opts) do
     assert {:ok, effects} = read_effects(opts)
     effects
+  end
+
+  defp measured_operation(fun) do
+    started_at = System.monotonic_time(:microsecond)
+    {result, stats} = RepoStats.capture(fun)
+    {result, stats, System.monotonic_time(:microsecond) - started_at}
+  end
+
+  defp print_measurement!(operation, sample, row_count, duration_us, stats, extra) do
+    IO.puts(
+      Jason.encode!(
+        Map.merge(stats, extra)
+        |> Map.merge(%{
+          tag: "JC360_MEASUREMENTS",
+          operation: operation,
+          sample: sample,
+          sample_count: if(operation == "recovery_selector_page", do: 6, else: 4),
+          row_count: row_count,
+          wall_duration_us: duration_us,
+          queue_time_unit: "native telemetry units",
+          query_time_unit: "native telemetry units",
+          decode_time_unit: "native telemetry units",
+          workload_class: "recovery_warm"
+        })
+      )
+    )
+  end
+
+  defp measured_index_definitions! do
+    assert {:ok, %{rows: rows}} =
+             Repo.query(
+               "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ANY($1)",
+               [
+                 [
+                   "subscriptions_unique_source_order_line_item_id_index",
+                   "access_effects_unique_subscription_source_version_index",
+                   "entitlement_grants_source_index",
+                   "access_effects_effective_recovery_index"
+                 ]
+               ]
+             )
+
+    Map.new(rows, fn [name, definition] -> {name, definition} end)
+  end
+
+  defp percentile(values, fraction) do
+    sorted = Enum.sort(values)
+    index = max(1, ceil(length(sorted) * fraction))
+    Enum.at(sorted, index - 1)
+  end
+
+  defp latency_summary(values) do
+    %{
+      p50_us: percentile(values, 0.50),
+      p95_us: percentile(values, 0.95),
+      p99_us: percentile(values, 0.99)
+    }
   end
 
   defp read_effects(opts) do

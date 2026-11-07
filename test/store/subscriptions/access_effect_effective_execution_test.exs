@@ -427,6 +427,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert_effective_grant!(fixture)
   end
 
+  @tag :jc360_task11
   test "runtime resource review measures convergence with 128 exact-source historical rows" do
     for repetition <- 1..2 do
       fixture = create_committed_effective_effect_fixture!("jc245_resource_#{repetition}")
@@ -450,6 +451,9 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
           {gc_count_before, reclaimed_words_before, _} =
             :erlang.statistics(:garbage_collection)
 
+          {:message_queue_len, mailbox_before} = Process.info(self(), :message_queue_len)
+          handlers_before = length(:telemetry.list_handlers([:store, :repo, :query]))
+
           started_at = System.monotonic_time(:microsecond)
 
           {result, stats} =
@@ -459,9 +463,8 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
 
           duration_us = System.monotonic_time(:microsecond) - started_at
           {:memory, memory_after} = Process.info(self(), :memory)
-
-          {gc_count_after, reclaimed_words_after, _} =
-            :erlang.statistics(:garbage_collection)
+          {:message_queue_len, mailbox_after} = Process.info(self(), :message_queue_len)
+          handlers_after = length(:telemetry.list_handlers([:store, :repo, :query]))
 
           %{rows: [[source_rows_after, active_rows_after]]} =
             Repo.query!(
@@ -479,9 +482,39 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
             active_rows_after: active_rows_after,
             duration_us: duration_us,
             memory_delta_bytes: memory_after - memory_before,
-            global_gc_count_delta: gc_count_after - gc_count_before,
-            global_reclaimed_words_delta: reclaimed_words_after - reclaimed_words_before
+            mailbox_before: mailbox_before,
+            mailbox_after: mailbox_after,
+            telemetry_handlers_before: handlers_before,
+            telemetry_handlers_after: handlers_after
           }
+
+          %{num_rows: deleted_rows} =
+            Repo.query!(
+              "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+              [source_id]
+            )
+
+          %{rows: [[source_rows_after_cleanup]]} =
+            Repo.query!(
+              "SELECT count(*) FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+              [source_id]
+            )
+
+          {:memory, memory_after_cleanup} = Process.info(self(), :memory)
+          {:message_queue_len, mailbox_after_cleanup} = Process.info(self(), :message_queue_len)
+
+          {gc_count_after_cleanup, reclaimed_words_after_cleanup, _} =
+            :erlang.statistics(:garbage_collection)
+
+          resource =
+            Map.merge(resource, %{
+              cleanup_deleted_rows: deleted_rows,
+              source_rows_after_cleanup: source_rows_after_cleanup,
+              memory_after_cleanup_bytes: memory_after_cleanup,
+              mailbox_after_cleanup: mailbox_after_cleanup,
+              global_gc_count_delta: gc_count_after_cleanup - gc_count_before,
+              global_reclaimed_words_delta: reclaimed_words_after_cleanup - reclaimed_words_before
+            })
 
           {result, stats, resource}
         end)
@@ -490,15 +523,148 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
       assert resource.source_rows_before == 128
       assert resource.source_rows_after >= 128
       assert resource.active_rows_after == 1
+      assert resource.cleanup_deleted_rows == resource.source_rows_after
+      assert resource.source_rows_after_cleanup == 0
+      assert resource.telemetry_handlers_after == resource.telemetry_handlers_before
 
       IO.puts(
-        "JC245_RESOURCE repetition=#{repetition} exact_source_rows=#{resource.source_rows_before} " <>
-          "rows_after=#{resource.source_rows_after} active_after=#{resource.active_rows_after} " <>
-          "sql_queries=#{stats.query_count} convergence_duration_us=#{resource.duration_us} " <>
-          "process_memory_delta_bytes=#{resource.memory_delta_bytes} " <>
-          "global_gc_count_delta=#{resource.global_gc_count_delta} " <>
-          "global_reclaimed_words_delta=#{resource.global_reclaimed_words_delta}"
+        Jason.encode!(%{
+          tag: "JC360_MEASUREMENTS",
+          operation: "effective_execution_historical_source_fanout",
+          repetition: repetition,
+          repetition_count: 2,
+          subscription_id: fixture.subscription.id,
+          access_effect_id: fixture.effect.id,
+          historical_rows: 128,
+          source_rows_before: resource.source_rows_before,
+          source_rows_after: resource.source_rows_after,
+          active_rows_after: resource.active_rows_after,
+          source_rows_after_explicit_cleanup: resource.source_rows_after_cleanup,
+          cleanup_deleted_rows: resource.cleanup_deleted_rows,
+          wall_duration_us: resource.duration_us,
+          query_count: stats.query_count,
+          queue_time: stats.queue_time,
+          query_time: stats.query_time,
+          decode_time: stats.decode_time,
+          telemetry_time_unit: "native units",
+          process_memory_delta_bytes: resource.memory_delta_bytes,
+          process_memory_after_cleanup_bytes: resource.memory_after_cleanup_bytes,
+          mailbox_before: resource.mailbox_before,
+          mailbox_after: resource.mailbox_after,
+          mailbox_after_cleanup: resource.mailbox_after_cleanup,
+          global_gc_count_delta: resource.global_gc_count_delta,
+          global_reclaimed_words_delta: resource.global_reclaimed_words_delta,
+          telemetry_handlers_before: resource.telemetry_handlers_before,
+          telemetry_handlers_after: resource.telemetry_handlers_after,
+          workload_class: "recovery_warm",
+          historical_source_history_class: "historical_audit_cold",
+          limits: "two equivalent bounded repetitions; no convergence or capacity claim"
+        })
       )
+    end
+  end
+
+  @tag :jc360_task11
+  test "EFFECTIVE execution reports bounded PostgreSQL lock-wait observations" do
+    for repetition <- 1..2 do
+      fixture = create_committed_effective_effect_fixture!("jc360_lock_wait_#{repetition}")
+      run_ref = make_ref()
+      parent = self()
+
+      holder =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              Repo.query!("SELECT id FROM access_effects WHERE id = $1 FOR UPDATE", [
+                Ecto.UUID.dump!(fixture.effect.id)
+              ])
+
+              send(parent, {run_ref, :lock_held, backend_pid!()})
+
+              receive do
+                {^run_ref, :release_lock} -> :released
+              after
+                10_000 -> Repo.rollback(:lock_release_timeout)
+              end
+            end)
+          end)
+        end)
+
+      executor =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            executor_pid = backend_pid!()
+            send(parent, {run_ref, :executor_ready, executor_pid})
+
+            receive do
+              {^run_ref, :execute} -> :ok
+            after
+              5_000 -> raise "executor start timed out"
+            end
+
+            started_at = System.monotonic_time(:nanosecond)
+            send(parent, {run_ref, :executor_started, started_at})
+
+            {result, stats} =
+              RepoStats.capture(fn ->
+                Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+              end)
+
+            completed_at = System.monotonic_time(:nanosecond)
+            {result, stats, started_at, completed_at}
+          end)
+        end)
+
+      try do
+        assert_receive {^run_ref, :lock_held, holder_pid}, 5_000
+        assert_receive {^run_ref, :executor_ready, executor_pid}, 5_000
+        refute executor_pid == holder_pid
+        send(executor.pid, {run_ref, :execute})
+        assert_receive {^run_ref, :executor_started, executor_started_at}, 5_000
+
+        observed_at = await_lock_wait!(executor_pid, holder_pid, 5_000)
+        release_sent_at = System.monotonic_time(:nanosecond)
+        send(holder.pid, {run_ref, :release_lock})
+
+        assert {:ok, :released} = Task.await(holder, 5_000)
+
+        assert {{:ok, :applied}, stats, ^executor_started_at, completed_at} =
+                 Task.await(executor, 5_000)
+
+        assert observed_at > executor_started_at
+        assert release_sent_at > observed_at
+        assert completed_at > release_sent_at
+        assert fetch_effect!(fixture.effect.id).status == :applied
+
+        IO.puts(
+          Jason.encode!(%{
+            tag: "JC360_MEASUREMENTS",
+            operation: "effective_execution_lock_wait",
+            repetition: repetition,
+            repetition_count: 2,
+            effect_id: fixture.effect.id,
+            holder_backend_pid: holder_pid,
+            executor_backend_pid: executor_pid,
+            observed_blocker_backend_pids: [holder_pid],
+            wait_event_type: "Lock",
+            wait_observation_to_release_request_ns: release_sent_at - observed_at,
+            blocked_operation_wall_us: div(completed_at - executor_started_at, 1_000),
+            query_count: stats.query_count,
+            queue_time: stats.queue_time,
+            query_time: stats.query_time,
+            decode_time: stats.decode_time,
+            telemetry_time_unit: "native units",
+            workload_class: "paid_activation_hot",
+            limits:
+              "controlled single-row lock; observation-to-release is a minimum observed blocked interval; whole operation includes execution; no capacity claim"
+          })
+        )
+      after
+        send(holder.pid, {run_ref, :release_lock})
+        send(executor.pid, {run_ref, :execute})
+        Task.shutdown(holder, :brutal_kill)
+        Task.shutdown(executor, :brutal_kill)
+      end
     end
   end
 
@@ -1013,6 +1179,47 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   defp persisted_ids!(sql, params) do
     Repo.query!(sql, params).rows
     |> Enum.map(fn [id] -> Ecto.UUID.load!(id) end)
+  end
+
+  defp backend_pid! do
+    %{rows: [[backend_pid]]} = Repo.query!("SELECT pg_backend_pid()")
+    backend_pid
+  end
+
+  defp await_lock_wait!(executor_pid, holder_pid, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    await_lock_wait!(executor_pid, holder_pid, deadline, nil)
+  end
+
+  defp await_lock_wait!(executor_pid, holder_pid, deadline, last_observation) do
+    %{rows: rows} =
+      Repo.query!(
+        "SELECT wait_event_type, pg_blocking_pids(pid) FROM pg_stat_activity WHERE pid = $1",
+        [executor_pid],
+        timeout: 1_000
+      )
+
+    case rows do
+      [["Lock", blockers]] ->
+        if holder_pid in blockers do
+          System.monotonic_time(:nanosecond)
+        else
+          retry_lock_wait!(executor_pid, holder_pid, deadline, rows)
+        end
+
+      _ ->
+        retry_lock_wait!(executor_pid, holder_pid, deadline, last_observation || rows)
+    end
+  end
+
+  defp retry_lock_wait!(executor_pid, holder_pid, deadline, last_observation) do
+    if System.monotonic_time(:millisecond) < deadline do
+      await_lock_wait!(executor_pid, holder_pid, deadline, last_observation)
+    else
+      flunk(
+        "executor did not show the expected PostgreSQL lock wait: #{inspect(last_observation)}"
+      )
+    end
   end
 
   defp assert_effective_grant!(fixture) do

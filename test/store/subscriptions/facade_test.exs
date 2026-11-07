@@ -47,6 +47,7 @@ defmodule Store.Subscriptions.FacadeTest do
   }
 
   alias Store.SubscriptionsFixtures
+  alias Store.Support.Telemetry.RepoStats
   alias Store.TestSupport.StripeAPIStub
   alias Store.Workers.ProcessSubscriptionRenewalWorker
 
@@ -137,6 +138,83 @@ defmodule Store.Subscriptions.FacadeTest do
     assert count_subscription_items_for_order(order.id) == 2
     assert count_access_effects_for_order(order.id) == 2
     assert count_entitlements_for_order(order.id) == 2
+  end
+
+  @tag :jc360_task11
+  test "paid activation and replay report bounded operation-only measurements" do
+    samples =
+      for line_count <- [1, 2], sample <- 1..4 do
+        prefix = "jc360_measure_activation_#{line_count}_#{sample}"
+
+        fixture =
+          if line_count == 1,
+            do: create_paid_order_fixture!(prefix),
+            else: create_paid_order_with_two_revision_lines!(prefix)
+
+        {activation, activation_stats, activation_us} =
+          measured_operation(fn ->
+            SubscriptionsFacade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+          end)
+
+        assert {:ok, activation_result} = activation
+        assert activation_result.created_count == line_count
+        assert activation_result.entitlement_issued_count == line_count
+
+        {replay, replay_stats, replay_us} =
+          measured_operation(fn ->
+            SubscriptionsFacade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+          end)
+
+        assert {:ok, replay_result} = replay
+        assert replay_result.created_count == 0
+        assert replay_result.skipped_count == line_count
+        assert replay_result.entitlement_issued_count == 0
+        assert length(subscriptions_for_order(fixture.order.id)) == line_count
+        assert count_access_effects_for_order(fixture.order.id) == line_count
+        assert count_entitlements_for_order(fixture.order.id) == line_count
+
+        activation_row =
+          measurement_row(
+            "paid_activation",
+            sample,
+            line_count,
+            activation_us,
+            activation_stats,
+            fixture
+          )
+
+        replay_row =
+          measurement_row(
+            "paid_activation_replay",
+            sample,
+            line_count,
+            replay_us,
+            replay_stats,
+            fixture
+          )
+
+        IO.puts(Jason.encode!(activation_row))
+        IO.puts(Jason.encode!(replay_row))
+        {line_count, activation_us, replay_us}
+      end
+
+    one_line = Enum.filter(samples, &(elem(&1, 0) == 1))
+    two_lines = Enum.filter(samples, &(elem(&1, 0) == 2))
+
+    IO.puts(
+      Jason.encode!(%{
+        tag: "JC360_MEASUREMENTS",
+        operation: "paid_activation_latency_summary",
+        sample_count_per_fanout: 4,
+        one_line_activation_latency_us: latency_summary(one_line, 1),
+        one_line_replay_latency_us: latency_summary(one_line, 2),
+        two_line_activation_latency_us: latency_summary(two_lines, 1),
+        two_line_replay_latency_us: latency_summary(two_lines, 2),
+        workload:
+          "four equivalent fresh one-line and four two-line paid-order activations and replays",
+        limits: "descriptive only; four samples per fanout; no capacity claim"
+      })
+    )
   end
 
   @tag :jc360_task01
@@ -2447,6 +2525,45 @@ defmodule Store.Subscriptions.FacadeTest do
       plans: [fixture.plan, second_plan],
       same_plan_revision: same_plan_revision
     })
+  end
+
+  defp measured_operation(fun) do
+    started_at = System.monotonic_time(:microsecond)
+    {result, stats} = RepoStats.capture(fun)
+    {result, stats, System.monotonic_time(:microsecond) - started_at}
+  end
+
+  defp measurement_row(operation, sample, line_count, duration_us, stats, fixture) do
+    Map.merge(stats, %{
+      tag: "JC360_MEASUREMENTS",
+      operation: operation,
+      sample: sample,
+      sample_count: 4,
+      source_line_count: line_count,
+      order_id: fixture.order.id,
+      source_order_line_item_ids: Enum.map(fixture.line_items, & &1.id),
+      wall_duration_us: duration_us,
+      queue_time_unit: "native telemetry units",
+      query_time_unit: "native telemetry units",
+      decode_time_unit: "native telemetry units",
+      workload_class: "hot"
+    })
+  end
+
+  defp percentile(values, fraction) do
+    sorted = Enum.sort(values)
+    index = max(1, ceil(length(sorted) * fraction))
+    Enum.at(sorted, index - 1)
+  end
+
+  defp latency_summary(samples, latency_index) do
+    values = Enum.map(samples, &elem(&1, latency_index))
+
+    %{
+      p50_us: percentile(values, 0.50),
+      p95_us: percentile(values, 0.95),
+      p99_us: percentile(values, 0.99)
+    }
   end
 
   defp create_paid_order_with_three_revision_lines!(prefix) do
