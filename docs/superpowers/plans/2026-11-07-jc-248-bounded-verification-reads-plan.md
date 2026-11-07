@@ -4,13 +4,13 @@
 
 **Goal:** Read a bounded APPLIED key window with currentness evidence and at most two active grants per requested source in two database round trips.
 
-**Architecture:** Typed domain queries validate all bounds before Ecto reads. The APPLIED query retains stale rows so the caller can advance through the complete bounded window. The Entitlements query uses a typed UUID array and a lateral LIMIT 2 query, preserving empty sources in its result map. The later sweep task compares these read results and enqueues isolated repairs.
+**Architecture:** Typed domain queries validate all bounds before private Ash actions execute Ecto reads. The APPLIED query retains stale rows so the caller can advance through the complete bounded window. The Entitlements query uses a typed UUID array and a lateral LIMIT 2 query, preserving empty sources in its result map. The later sweep task compares these read results and enqueues isolated repairs.
 
 **Tech stack:** Existing Ash resources, Ecto 3.14, PostgreSQL, DevCore. No dependency, service, pool, queue or lifecycle changes.
 
 ## Task 2: Bounded query contracts and indexes
 
-Create `lib/store/subscriptions/queries/applied_access_verification_query.ex` and `lib/store/entitlements/queries/subscription_source_verification_query.ex`. Modify both domain facades, both resource index declarations, and the existing effective execution test module. Generate only the required index migrations and corresponding resource snapshots.
+Create `lib/store/subscriptions/queries/applied_access_verification_query.ex`, `lib/store/entitlements/queries/subscription_source_verification_query.ex`, `lib/store/subscriptions/actions/read_applied_access_verification_window.ex`, and `lib/store/entitlements/actions/read_active_subscription_source_grants.ex`. Modify both domain facades, both resources' actions/policies/index declarations, and the existing effective execution test module. Generate only the required index migrations and corresponding resource snapshots.
 
 - [ ] Add regression tests using the existing committed fixtures and helpers. Add aliases for the two new query modules. Use these test bodies before implementing the modules.
 
@@ -219,7 +219,79 @@ defmodule Store.Entitlements.Queries.SubscriptionSourceVerificationQuery do
 end
 ```
 
-- [ ] Add public, documented/typespecified facade reads using the corresponding aliases. Revalidate structs before executing Ecto. Neither read locks rows or makes repair decisions. Database exceptions retain the repository's normal Ecto behavior.
+- [ ] Declare these private generic actions and their specific runtime system-context policies. Generic actions are type `:action`, so the existing read policies and Entitlements admin/support read bypass do not apply. This follows the mandatory facade-to-resource-action contract. The installed Ash generic-actions guide confirms that generic actions do not cast return values, preserving nested typed resource fields.
+
+```elixir
+# AccessEffect actions
+action :read_applied_verification_window_for_system, {:array, :map} do
+  public?(false)
+  transaction?(false)
+  argument :as_of, :utc_datetime_usec, allow_nil?: false
+  argument :after_inserted_at, :utc_datetime_usec, allow_nil?: true
+  argument :after_id, :uuid, allow_nil?: true
+  argument :limit, :integer, allow_nil?: false, default: 100,
+    constraints: [min: 1, max: 500]
+  run(Store.Subscriptions.Actions.ReadAppliedAccessVerificationWindow)
+end
+
+# AccessEffect policies
+policy action(:read_applied_verification_window_for_system) do
+  access_type(:runtime)
+  authorize_if(context_equals(:system?, true))
+end
+
+# EntitlementGrant actions
+action :read_active_subscription_sources_for_system, :map do
+  public?(false)
+  transaction?(false)
+  argument :source_ids, {:array, :uuid}, allow_nil?: false,
+    constraints: [max_length: 500]
+  run(Store.Entitlements.Actions.ReadActiveSubscriptionSourceGrants)
+end
+
+# EntitlementGrant policies
+policy action(:read_active_subscription_sources_for_system) do
+  access_type(:runtime)
+  authorize_if(context_equals(:system?, true))
+end
+```
+
+- [ ] Implement the two read action modules. Reconstruct validated queries even for direct resource callers. Neither action locks rows, opens a transaction or changes grants.
+
+```elixir
+defmodule Store.Subscriptions.Actions.ReadAppliedAccessVerificationWindow do
+  @moduledoc false
+  use Ash.Resource.Actions.Implementation
+  alias Store.Repo
+  alias Store.Subscriptions.Queries.AppliedAccessVerificationQuery
+  @impl true
+  def run(input, _opts, _context) do
+    with {:ok, query} <- AppliedAccessVerificationQuery.new(input.arguments) do
+      {:ok, Repo.all(AppliedAccessVerificationQuery.to_ecto(query))}
+    end
+  end
+end
+
+defmodule Store.Entitlements.Actions.ReadActiveSubscriptionSourceGrants do
+  @moduledoc false
+  use Ash.Resource.Actions.Implementation
+  alias Store.Entitlements.Queries.SubscriptionSourceVerificationQuery
+  alias Store.Repo
+  @impl true
+  def run(input, _opts, _context) do
+    with {:ok, query} <- SubscriptionSourceVerificationQuery.new(input.arguments) do
+      groups = Map.new(query.source_ids, &{&1, []})
+      rows = if query.source_ids == [], do: [],
+        else: Repo.all(SubscriptionSourceVerificationQuery.to_ecto(query))
+      {:ok, Enum.reduce(rows, groups, fn row, acc ->
+        Map.update!(acc, row.source_id, &[row | &1])
+      end)}
+    end
+  end
+end
+```
+
+- [ ] Add public, documented/typespecified facade reads using the corresponding aliases. Revalidate structs, then run the resource action with system context and authorization enabled. Database exceptions retain the repository's normal Ecto behavior.
 
 ```elixir
 # Subscriptions facade
@@ -227,7 +299,12 @@ end
   {:ok, [map()]} | {:error, Error.t()}
 def list_applied_access_verification_window_for_system(%AppliedAccessVerificationQuery{} = query) do
   with {:ok, canonical} <- AppliedAccessVerificationQuery.new(Map.from_struct(query)) do
-    {:ok, Repo.all(AppliedAccessVerificationQuery.to_ecto(canonical))}
+    input = Ash.ActionInput.for_action(AccessEffect, :read_applied_verification_window_for_system,
+      Map.from_struct(canonical), domain: Store.Subscriptions, context: %{system?: true})
+    case Ash.run_action(input, domain: Store.Subscriptions, authorize?: true) do
+      {:ok, rows} -> {:ok, rows}
+      {:error, reason} -> {:error, Normalize.normalize(reason)}
+    end
   end
 end
 def list_applied_access_verification_window_for_system(_query),
@@ -238,16 +315,38 @@ def list_applied_access_verification_window_for_system(_query),
   {:ok, %{Ecto.UUID.t() => [map()]}} | {:error, Error.t()}
 def list_active_subscription_source_grants_for_system(%SubscriptionSourceVerificationQuery{} = query) do
   with {:ok, canonical} <- SubscriptionSourceVerificationQuery.new(Map.from_struct(query)) do
-    groups = Map.new(canonical.source_ids, &{&1, []})
-    rows = if canonical.source_ids == [], do: [],
-      else: Repo.all(SubscriptionSourceVerificationQuery.to_ecto(canonical))
-    {:ok, Enum.reduce(rows, groups, fn row, acc ->
-      Map.update!(acc, row.source_id, &[row | &1])
-    end)}
+    input = Ash.ActionInput.for_action(EntitlementGrant, :read_active_subscription_sources_for_system,
+      Map.from_struct(canonical), domain: Store.Entitlements, context: %{system?: true})
+    case Ash.run_action(input, domain: Store.Entitlements, authorize?: true) do
+      {:ok, rows} -> {:ok, rows}
+      {:error, reason} -> {:error, Normalize.normalize(reason)}
+    end
   end
 end
 def list_active_subscription_source_grants_for_system(_query),
   do: {:error, Error.new("VALIDATION_ERROR", "typed subscription source verification query is required")}
+```
+
+- [ ] Add this authorization regression. The ordinary facade integration tests already exercise the permitted system path. Raw actions without system context must fail before SQL.
+
+```elixir
+test "JC248 operational read actions require system context" do
+  inputs = [
+    {Store.Subscriptions, Ash.ActionInput.for_action(AccessEffect,
+      :read_applied_verification_window_for_system, %{as_of: DateTime.utc_now(), limit: 1},
+      domain: Store.Subscriptions)},
+    {Store.Entitlements, Ash.ActionInput.for_action(EntitlementGrant,
+      :read_active_subscription_sources_for_system, %{source_ids: []},
+      domain: Store.Entitlements)}
+  ]
+  assert {:ok, stats} = RepoStats.capture(fn ->
+    for {domain, input} <- inputs do
+      assert {:error, %Ash.Error.Forbidden{}} = Ash.run_action(input, domain: domain, authorize?: true)
+    end
+    :ok
+  end)
+  assert stats.query_count == 0
+end
 ```
 
 - [ ] Run the focused module to GREEN. Add the following cursor and diagnostic tests, then re-run the complete module. The diagnostic test runs before and after adding the indexes, with distinct log files. Do not mistake a fixture-sized sequential plan for production capacity evidence.
