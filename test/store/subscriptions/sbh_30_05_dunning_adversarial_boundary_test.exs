@@ -8,8 +8,8 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
   require Ash.Query
 
   alias Store.Comms.EmailOutbox
-  alias Store.Entitlements.EntitlementGrant
   alias Store.Orders.Order
+  alias Store.Payments.Inputs.ObservePaymentIntentInput
   alias Store.Payments.Inputs.ValidateRenewalCollectionOutcomeInput
   alias Store.Payments.PaymentIntent
   alias Store.Payments.Providers
@@ -25,9 +25,15 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
     Subscription
   }
 
-  alias Store.Subscriptions.RenewalCollectionAttempts.{PaymentIntentBindingInput, StartInput}
+  alias Store.Subscriptions.RenewalCollectionAttempts.{
+    ClaimDispatchInput,
+    PaymentIntentBindingInput,
+    ReservationGenerationInput,
+    StartInput
+  }
 
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   @system_context %{system?: true}
@@ -35,6 +41,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
   setup context do
     previous_payments = Application.get_env(:store, :payments, [])
     StripeAPIStub.setup_default(context)
+    StripeAPIStub.stub_unexpected!("dunning adversarial tests must not submit provider mutations")
 
     on_exit(fn -> Application.put_env(:store, :payments, previous_payments) end)
 
@@ -146,7 +153,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
   end
 
   describe "provider checkpoint boundary" do
-    # Invariant: equality with the persisted boundary is denied by the provider claim's strict SQL comparator.
+    # Invariant: equality with the persisted boundary is denied by the strict SQL comparator.
     # Mutation caught: changing the atomic claim predicate from < to <= permits dispatch at equality.
     test "provider claim SQL keeps the strict database-clock-before-boundary contract" do
       source = File.read!("lib/store/subscriptions/renewal_collection_attempts.ex")
@@ -163,67 +170,71 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
       refute String.contains?(normalized, "clock_timestamp() <= $5::timestamptz")
     end
 
-    # Invariant: a retry strictly before its bound boundary can cross the atomic dispatch claim once.
-    # Mutation caught: moving provider submission before the claim leaves not_started in provider evidence.
+    # Invariant: a retry strictly before its bound boundary creates one distinct exact collection.
+    # Mutation caught: reusing the failed collection identity or assigning the retry to another attempt.
     test "a retry before the boundary starts one exact collection once" do
-      now = db_now!()
-
-      %{subscription: subscription} =
-        create_due_subscription!(
-          "jc240_preboundary_start",
-          now,
-          [max_retry_attempts: 1, retry_schedule_hours: [0], grace_period_days: 7],
-          %{provider_billing_ref: "pm_jc240_preboundary"}
+      occurrence =
+        create_failed_then_inflight_occurrence!("jc240_preboundary_start",
+          max_retry_attempts: 1,
+          retry_schedule_hours: [0],
+          grace_period_days: 7
         )
 
-      parent = self()
-      calls = :atomics.new(1, [])
-      stub_collection_requests!(parent, calls, ["canceled", "processing"])
-
-      assert {:error, %{code: "PAYMENT_FAILED"}} =
-               Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-      failed = fetch_subscription!(subscription.id)
+      failed = fetch_subscription!(occurrence.subscription.id)
       assert failed.status == :past_due
-      assert failed.next_retry_at == now
-      assert DateTime.compare(now, failed.failed_payment_boundary_at) == :lt
+      assert failed.next_retry_at == occurrence.now
 
-      assert {:ok, :processed} =
-               Facade.process_due_subscription_renewal_for_system(subscription.id,
-                 now: failed.next_retry_at
-               )
+      assert DateTime.compare(
+               occurrence.inflight_reached.now,
+               failed.failed_payment_boundary_at
+             ) == :lt
 
-      assert :atomics.get(calls, 1) == 2
-      [first_request, retry_request] = drain_provider_requests()
-      assert first_request.number == 1
-      assert retry_request.number == 2
-      assert first_request.collection_id != retry_request.collection_id
-      assert first_request.dispatch_state == "may_have_been_reached"
-      assert retry_request.dispatch_state == "may_have_been_reached"
-      assert retry_request.idempotency_key == "renewal-collection:" <> retry_request.collection_id
+      assert occurrence.failed_collection.financial_outcome ==
+               :verified_terminal_financial_non_success
 
-      attempt = fetch_current_attempt!(subscription.id)
-      assert first_request.renewal_attempt_id == attempt.id
-      assert retry_request.renewal_attempt_id == attempt.id
+      assert occurrence.inflight_collection.dispatch_state == :may_have_been_reached
+      assert occurrence.inflight_collection.financial_outcome == :unresolved
+      assert occurrence.failed_collection.id != occurrence.inflight_collection.id
+      assert occurrence.failed_collection.renewal_attempt_id == occurrence.attempt.id
+      assert occurrence.inflight_collection.renewal_attempt_id == occurrence.attempt.id
+      assert occurrence.attempt.order_id == occurrence.order.id
+      assert occurrence.inflight_reached.payment_intent.order_id == occurrence.order.id
+
+      assert occurrence.inflight_reached.payment_intent.id ==
+               occurrence.inflight_collection.payment_intent_id
+
+      assert occurrence.inflight_reached.payment_intent.payment_intent_key ==
+               RenewalCollectionAttempts.payment_intent_key(occurrence.inflight_collection.id)
+
+      StripeAPIStub.stub_payment_observation(
+        occurrence.inflight_reached.payment_intent.provider_payment_id,
+        ReachedRenewalFixtures.observation_body(occurrence.inflight_reached, "processing")
+      )
+
+      for _ <- 1..2 do
+        assert {:error, %{code: "PAYMENT_OUTCOME_UNRESOLVED"}} =
+                 Facade.process_due_subscription_renewal_for_system(occurrence.subscription.id,
+                   now: occurrence.inflight_reached.now
+                 )
+      end
 
       assert [%RenewalCollectionAttempt{} = first, %RenewalCollectionAttempt{} = retry] =
-               list_collections!(attempt.id)
+               list_collections!(occurrence.attempt.id)
 
-      assert first.id == first_request.collection_id
-      assert retry.id == retry_request.collection_id
-      assert first.dispatch_state == :may_have_been_reached
+      assert first.id == occurrence.failed_collection.id
+      assert retry.id == occurrence.inflight_collection.id
       assert retry.dispatch_state == :may_have_been_reached
     end
 
     # Invariant: the persisted retry intent cannot authorize dispatch after the live DB boundary is reached.
-    # Mutation caught: removing the database-clock boundary predicate lets the second POST reach Stripe.
-    test "a retry scheduled at boundary equality has zero provider mutation after the boundary is persisted" do
+    # Mutation caught: removing the database-clock predicate admits a stale typed claim.
+    test "a retry scheduled at boundary equality is denied after the live boundary advances" do
       assert_boundary_retry_denied!("jc240_at_boundary", 0)
     end
 
     # Invariant: a persisted boundary one microsecond behind the claim still prevents provider dispatch.
-    # Mutation caught: removing the database-clock boundary predicate lets the second POST reach Stripe.
-    test "a retry scheduled after boundary equality has zero provider mutation after the boundary is persisted" do
+    # Mutation caught: removing the database-clock predicate admits a stale typed claim.
+    test "a retry scheduled after boundary equality is denied after the live boundary advances" do
       assert_boundary_retry_denied!("jc240_after_boundary", 1)
     end
 
@@ -240,21 +251,18 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
           %{provider_billing_ref: "pm_jc240_inflight"}
         )
 
-      parent = self()
-      calls = :atomics.new(1, [])
-      stub_collection_requests!(parent, calls, ["processing"])
-
-      assert {:ok, :processed} =
-               Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-      [request] = drain_provider_requests()
-      assert :atomics.get(calls, 1) == 1
+      reached = prepare_legacy_collection!(subscription.id, now)
       attempt = fetch_current_attempt!(subscription.id)
       [collection] = list_collections!(attempt.id)
-      assert collection.id == request.collection_id
+      assert collection.id == reached.collection.id
       assert collection.dispatch_state == :may_have_been_reached
 
       boundary_at = DateTime.add(db_now!(), -1, :second)
+
+      StripeAPIStub.stub_payment_observation(
+        reached.payment_intent.provider_payment_id,
+        ReachedRenewalFixtures.observation_body(reached, "processing")
+      )
 
       Repo.query!(
         "UPDATE subscriptions SET status = 'past_due', dunning_attempt_count = 1, past_due_since_at = $2, failed_payment_boundary_at = $3, next_retry_at = NULL, retry_suppressed_at = $2 WHERE id = $1",
@@ -274,8 +282,6 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
       assert recovered.payment_intent.id == collection.payment_intent_id
       assert recovered.collection_attempt.dispatch_state == :may_have_been_reached
       assert length(list_collections!(attempt.id)) == 1
-      assert :atomics.get(calls, 1) == 1
-      assert drain_provider_requests() == []
     end
   end
 
@@ -339,7 +345,6 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
 
       assert fetch_subscription!(subscription.id).aggregate_version == suspended_version
       assert access_effect_rows!(subscription.id) == effects_after_suspension
-      assert provider_mutation_count() == 0
     end
 
     # Invariant: max_retry_attempts=0 suppresses the first retry while preserving boundary discovery.
@@ -386,7 +391,6 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
                Facade.run_due_failed_payment_suspensions_for_system(now: boundary_at, limit: 20)
 
       assert fetch_subscription!(subscription.id).aggregate_version == suspended.aggregate_version
-      assert provider_mutation_count() == 0
     end
 
     # Invariant: changing current Plan and PlanRevision after binding cannot alter the bound retry or boundary policy.
@@ -467,7 +471,6 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
 
       assert updated_plan.access_on_past_due == :remove_immediately
       assert access_effect_rows!(subscription.id) == baseline_effects
-      assert provider_mutation_count() == 0
     end
   end
 
@@ -555,7 +558,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
       assert DateTime.compare(occurrence.now, boundary_at) == :lt
       assert occurrence.inflight_collection.dispatch_state == :may_have_been_reached
 
-      mark_collection_successful!(occurrence.inflight_collection, db_now!())
+      mark_collection_successful!(occurrence.inflight_collection)
 
       {:ok, handoff} =
         RenewalCollectionAttempts.success_handoff_for_system(occurrence.inflight_collection.id)
@@ -624,7 +627,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
       assert boundary_at == DateTime.add(occurrence.now, 1, :day)
       refute due_retry?(occurrence.subscription.id, boundary_at)
 
-      mark_collection_successful!(occurrence.collection, db_now!())
+      mark_collection_successful!(occurrence.collection)
 
       {:ok, handoff} =
         RenewalCollectionAttempts.success_handoff_for_system(occurrence.collection.id)
@@ -693,7 +696,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
         assert source.status == source_status
         assert occurrence.inflight_collection.renewal_attempt_id == occurrence.attempt.id
 
-        mark_collection_successful!(occurrence.inflight_collection, db_now!())
+        mark_collection_successful!(occurrence.inflight_collection)
 
         {:ok, handoff} =
           RenewalCollectionAttempts.success_handoff_for_system(occurrence.inflight_collection.id)
@@ -720,7 +723,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
     # Mutation caught: applying stale failure after success moves the Subscription back into dunning.
     test "success first keeps stale failure observation from regressing dunning or access" do
       occurrence = create_bound_occurrence!("jc240_success_first")
-      mark_collection_successful!(occurrence.collection, db_now!())
+      mark_collection_successful!(occurrence.collection)
 
       {:ok, handoff} =
         RenewalCollectionAttempts.success_handoff_for_system(occurrence.collection.id)
@@ -824,7 +827,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
                    context: @system_context
                  )
 
-        mark_collection_successful!(occurrence.collection, db_now!())
+        mark_collection_successful!(occurrence.collection)
 
         {:ok, handoff} =
           RenewalCollectionAttempts.success_handoff_for_system(occurrence.collection.id)
@@ -861,7 +864,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
       assert suspension_effect.source_version == suspended.aggregate_version
       assert suspension_effect.disposition == "non_effective"
 
-      mark_collection_successful!(occurrence.collection, db_now!())
+      mark_collection_successful!(occurrence.collection)
 
       {:ok, handoff} =
         RenewalCollectionAttempts.success_handoff_for_system(occurrence.collection.id)
@@ -901,7 +904,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
     # Mutation caught: any paid occurrence for the Subscription reactivates its current suspended episode.
     test "success from a different occurrence cannot recover the current suspension" do
       old_occurrence = create_bound_occurrence!("jc240_different_occurrence")
-      mark_collection_successful!(old_occurrence.collection, db_now!())
+      mark_collection_successful!(old_occurrence.collection)
 
       {:ok, old_handoff} =
         RenewalCollectionAttempts.success_handoff_for_system(old_occurrence.collection.id)
@@ -913,21 +916,18 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
                )
 
       next_period_at = old_occurrence.attempt.period_end_at
-      parent = self()
-      calls = :atomics.new(1, [])
-      stub_collection_requests!(parent, calls, ["canceled"])
 
-      assert {:error, %{code: "PAYMENT_FAILED"}} =
-               Facade.process_due_subscription_renewal_for_system(
-                 old_occurrence.subscription.id,
-                 now: next_period_at
-               )
+      new_reached =
+        prepare_legacy_collection!(old_occurrence.subscription.id, next_period_at)
+
+      assert :ok == apply_dunning_failure!(new_reached.collection, next_period_at)
 
       new_attempt = fetch_current_attempt!(old_occurrence.subscription.id)
       assert new_attempt.id != old_occurrence.attempt.id
       assert new_attempt.renewal_key != old_occurrence.attempt.renewal_key
-      assert :atomics.get(calls, 1) == 1
-      assert length(drain_provider_requests()) == 1
+      assert new_reached.collection.id != old_occurrence.collection.id
+      assert new_reached.payment_intent.id == new_reached.collection.payment_intent_id
+      assert new_reached.attempt.order_id == new_reached.order.id
 
       boundary_at = set_boundary_in_past!(old_occurrence.subscription.id, next_period_at)
 
@@ -940,7 +940,7 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
       assert hd(effects_before_replay).disposition == "non_effective"
 
       _same_old_success_replay =
-        mark_collection_successful!(old_occurrence.collection, db_now!())
+        mark_collection_successful!(old_occurrence.collection)
 
       assert {:ok, :noop} =
                Facade.reconcile_paid_subscription_renewal_for_system(
@@ -1023,7 +1023,6 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
 
       assert fetch_subscription!(subscription.id).aggregate_version == suspended.aggregate_version
       assert suspension_access_effect_row!(subscription.id) == effect
-      assert provider_mutation_count() == 0
     end
   end
 
@@ -1038,26 +1037,22 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
         %{provider_billing_ref: "pm_#{label}"}
       )
 
-    parent = self()
-    calls = :atomics.new(1, [])
-    stub_collection_requests!(parent, calls, ["processing"])
-
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    [request] = drain_provider_requests()
-    assert :atomics.get(calls, 1) == 1
-    attempt = fetch_current_attempt!(subscription.id)
-    [collection] = list_collections!(attempt.id)
-    assert collection.id == request.collection_id
+    reached = prepare_legacy_collection!(subscription.id, now)
+    attempt = reached.attempt
+    collection = reached.collection
     assert collection.dispatch_state == :may_have_been_reached
+    assert collection.financial_outcome == :unresolved
+    assert collection.renewal_attempt_id == attempt.id
+    assert reached.payment_intent.order_id == reached.order.id
 
     %{
       now: now,
       subscription: subscription,
       attempt: attempt,
-      order: fetch_order!(attempt.order_id),
-      collection: collection
+      order: reached.order,
+      collection: collection,
+      payment_intent: reached.payment_intent,
+      reached: reached
     }
   end
 
@@ -1075,79 +1070,53 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
         %{provider_billing_ref: "pm_#{label}"}
       )
 
-    parent = self()
-    calls = :atomics.new(1, [])
-    stub_collection_requests!(parent, calls, ["canceled", "processing"])
-
-    assert {:error, %{code: "PAYMENT_FAILED"}} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+    failed_collection = prepare_legacy_collection!(subscription.id, now)
+    assert :ok == apply_dunning_failure!(failed_collection.collection, now)
 
     first_failure = fetch_subscription!(subscription.id)
     assert first_failure.status == :past_due
     retry_at = first_failure.next_retry_at
     assert %DateTime{} = retry_at
 
-    [first_request] = drain_provider_requests()
-    assert first_request.number == 1
-    assert first_request.dispatch_state == "may_have_been_reached"
-
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: retry_at)
-
-    [retry_request] = drain_provider_requests()
-    assert :atomics.get(calls, 1) == 2
-    assert retry_request.number == 2
-    assert first_request.collection_id != retry_request.collection_id
+    retry_reached = prepare_legacy_collection!(subscription.id, retry_at)
 
     attempt = fetch_current_attempt!(subscription.id)
     assert length(list_collections!(attempt.id)) == 2
-    [failed_collection, inflight_collection] = list_collections!(attempt.id)
-    assert failed_collection.dispatch_state == :may_have_been_reached
-    assert failed_collection.id == first_request.collection_id
+    [failed, inflight_collection] = list_collections!(attempt.id)
+    assert failed.id == failed_collection.collection.id
+    assert failed.dispatch_state == :may_have_been_reached
     assert inflight_collection.dispatch_state == :may_have_been_reached
     assert inflight_collection.financial_outcome == :unresolved
-    assert inflight_collection.id == retry_request.collection_id
+    assert inflight_collection.id == retry_reached.collection.id
+    assert inflight_collection.payment_intent_id == retry_reached.payment_intent.id
+    assert retry_reached.attempt.id == attempt.id
+    assert retry_reached.attempt.order_id == retry_reached.order.id
 
     %{
       now: now,
       subscription: subscription,
       attempt: attempt,
-      order: fetch_order!(attempt.order_id),
-      failed_collection: failed_collection,
-      inflight_collection: inflight_collection
+      order: retry_reached.order,
+      failed_collection: failed,
+      inflight_collection: inflight_collection,
+      failed_reached: failed_collection,
+      inflight_reached: retry_reached
     }
   end
 
-  defp mark_collection_successful!(collection, observed_at) do
+  defp mark_collection_successful!(collection) do
     payment_intent = fetch_payment_intent!(collection.payment_intent_id)
 
-    {provider_reference, provider_reference_kind} =
-      if is_binary(payment_intent.provider_payment_id) do
-        {payment_intent.provider_payment_id, :payment_intent}
-      else
-        {payment_intent.provider_request_reference, :transaction_reference}
-      end
-
-    observation = %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: provider_reference,
-      provider_reference_kind: provider_reference_kind,
-      provider_transaction_id: payment_intent.provider_payment_id || "pi_#{payment_intent.id}",
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :authoritative_success,
-      raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: observed_at
+    reached = %{
+      payment_intent: payment_intent,
+      order: fetch_order!(payment_intent.order_id),
+      attempt: fetch_attempt!(collection.renewal_attempt_id)
     }
 
+    observed = observe_reached!(reached, "succeeded")
+
     assert {:ok, %{outcome: outcome}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               observation
-             )
+             Store.Payments.Facade.apply_observed_payment_outcome_for_system(observed)
 
     assert outcome in [:authoritative_success, :already_applied_success]
     updated_collection = fetch_collection!(collection.id)
@@ -1160,6 +1129,53 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
                  financial_outcome: :verified_success
                }
              )
+
+    updated_collection
+  end
+
+  defp prepare_legacy_collection!(subscription_id, now) do
+    StripeAPIStub.stub_unexpected!("legacy preparation must not contact Stripe")
+    ReachedRenewalFixtures.prepare_reached!(subscription_id, now)
+  end
+
+  defp observe_reached!(reached, status) do
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, status)
+    )
+
+    assert {:ok, observed} =
+             Store.Payments.Facade.observe_payment_intent_for_system(%ObservePaymentIntentInput{
+               payment_intent_id: reached.payment_intent.id
+             })
+
+    observed
+  end
+
+  defp apply_dunning_failure!(collection, now) do
+    payment_intent = fetch_payment_intent!(collection.payment_intent_id)
+
+    reached = %{
+      payment_intent: payment_intent,
+      order: fetch_order!(payment_intent.order_id),
+      attempt: fetch_attempt!(collection.renewal_attempt_id)
+    }
+
+    StripeAPIStub.stub_payment_observation(
+      payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "canceled")
+    )
+
+    assert {:error, %{code: "PAYMENT_FAILED"}} =
+             Facade.process_due_subscription_renewal_for_system(
+               reached.attempt.subscription_id,
+               now: now
+             )
+
+    assert fetch_collection!(collection.id).financial_outcome ==
+             :verified_terminal_financial_non_success
+
+    :ok
   end
 
   defp record_failure_observation!(payment_intent, observed_at) do
@@ -1238,15 +1254,6 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
     |> Ash.count!(domain: Store.Comms, authorize?: false, context: @system_context)
   end
 
-  defp subscription_entitlement_grants(subscription_id) do
-    EntitlementGrant
-    |> Ash.Query.filter(expr(source_kind == :subscription and source_id == ^subscription_id))
-    |> Ash.Query.sort(inserted_at: :asc, id: :asc)
-    |> Ash.read!(domain: Store.Entitlements, authorize?: false, context: @system_context)
-  end
-
-  defp provider_mutation_count, do: length(drain_provider_requests())
-
   defp handoff_opts(handoff) do
     [
       renewal_attempt_id: handoff.renewal_attempt_id,
@@ -1312,24 +1319,14 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
         %{provider_billing_ref: "pm_#{label}"}
       )
 
-    parent = self()
-    calls = :atomics.new(1, [])
-    stub_collection_requests!(parent, calls, ["canceled", "processing"])
-
-    assert {:error, %{code: "PAYMENT_FAILED"}} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: origin)
+    first_reached = prepare_legacy_collection!(subscription.id, origin)
+    assert :ok == apply_dunning_failure!(first_reached.collection, origin)
 
     failed = fetch_subscription!(subscription.id)
     original_boundary_at = failed.failed_payment_boundary_at
     retry_at = failed.next_retry_at
     assert retry_at == original_boundary_at
     assert failed.retry_suppressed_at == nil
-    assert :atomics.get(calls, 1) == 1
-
-    [first_request] = drain_provider_requests()
-    assert first_request.number == 1
-    assert first_request.dispatch_state == "may_have_been_reached"
-
     attempt = fetch_current_attempt!(subscription.id)
     order = fetch_order!(attempt.order_id)
     retry_collection = start_retry_collection!(attempt, retry_at)
@@ -1351,17 +1348,55 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
     boundary_at = persist_boundary_at_claim_seam!(subscription.id, offset_microseconds)
     assert DateTime.compare(retry_now, boundary_at) == :lt
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: retry_now)
+    assert {:ok, generation_result} =
+             RenewalCollectionAttempts.assign_reservation_generation_for_system(
+               %ReservationGenerationInput{
+                 collection_attempt_id: retry_collection.id,
+                 now: retry_now
+               }
+             )
 
-    assert :atomics.get(calls, 1) == 1
-    assert drain_provider_requests() == []
+    retry_collection = generation_result
+
+    assert {:error,
+            %{
+              code: "RENEWAL_AUTHORITY_WITHDRAWN",
+              message:
+                "Subscription authority was withdrawn at the provider submission checkpoint"
+            }} =
+             RenewalCollectionAttempts.claim_dispatch_for_system(%ClaimDispatchInput{
+               collection_attempt_id: retry_collection.id,
+               expected_epoch: retry_collection.dispatch_epoch,
+               now: retry_now
+             })
+
+    persisted_retry = fetch_collection!(retry_collection.id)
+    assert persisted_retry.dispatch_state == :not_started
+    assert persisted_retry.payment_intent_id == retry_intent.id
+    assert persisted_retry.reservation_generation_id == retry_collection.reservation_generation_id
+    assert persisted_retry.renewal_attempt_id == attempt.id
+    assert attempt.order_id == order.id
+    assert retry_intent.order_id == order.id
+
+    assert retry_intent.payment_intent_key ==
+             RenewalCollectionAttempts.payment_intent_key(retry_collection.id)
+
+    assert fetch_collection!(first_reached.collection.id).financial_outcome ==
+             :verified_terminal_financial_non_success
+
+    after_claim = fetch_subscription!(subscription.id)
+    assert after_claim.current_dunning_renewal_attempt_id == attempt.id
+    assert after_claim.failed_payment_boundary_at == boundary_at
+    assert after_claim.next_retry_at == retry_at
 
     [first_collection, denied_collection] = list_collections!(attempt.id)
     assert first_collection.dispatch_state == :may_have_been_reached
     assert denied_collection.id == retry_collection.id
     assert denied_collection.payment_intent_id == retry_intent.id
-    assert denied_collection.dispatch_state == :not_submitted
+    assert denied_collection.dispatch_state == :not_started
+
+    assert denied_collection.reservation_generation_id ==
+             retry_collection.reservation_generation_id
 
     assert fetch_subscription!(subscription.id).failed_payment_boundary_at == boundary_at
     assert length(list_collections!(attempt.id)) == 2
@@ -1418,47 +1453,6 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
     fetch_subscription!(subscription_id).failed_payment_boundary_at
   end
 
-  defp stub_collection_requests!(parent, calls, statuses) do
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      number = :atomics.add_get(calls, 1, 1)
-      collection_id = Map.fetch!(params, "metadata[collection_attempt_id]")
-      renewal_attempt_id = Map.fetch!(params, "metadata[renewal_attempt_id]")
-      [idempotency_key] = Plug.Conn.get_req_header(conn, "idempotency-key")
-
-      %{rows: [[dispatch_state]]} =
-        Repo.query!(
-          "SELECT dispatch_state::text FROM renewal_collection_attempts WHERE id = $1::uuid",
-          [Ecto.UUID.dump!(collection_id)]
-        )
-
-      send(parent, {
-        :jc240_provider_mutation,
-        %{
-          number: number,
-          collection_id: collection_id,
-          renewal_attempt_id: renewal_attempt_id,
-          idempotency_key: idempotency_key,
-          dispatch_state: dispatch_state
-        }
-      })
-
-      status = Enum.at(statuses, number - 1, "processing")
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => status})
-      )
-    end)
-  end
-
-  defp drain_provider_requests(acc \\ []) do
-    receive do
-      {:jc240_provider_mutation, request} -> drain_provider_requests([request | acc])
-    after
-      0 -> Enum.reverse(acc)
-    end
-  end
-
   defp due_boundary_ids(now) do
     Subscription
     |> Ash.Query.for_read(:read_due_failed_payment_boundary_for_system, %{now: now, limit: 100})
@@ -1475,6 +1469,14 @@ defmodule Store.Subscriptions.Sbh3005DunningAdversarialBoundaryTest do
     Subscription
     |> Ash.Query.filter(expr(id == ^id))
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: @system_context)
+  end
+
+  defp fetch_attempt!(id) do
+    Ash.get!(RenewalAttempt, id,
+      domain: Store.Subscriptions,
+      authorize?: false,
+      context: @system_context
+    )
   end
 
   defp fetch_current_attempt!(subscription_id) do
