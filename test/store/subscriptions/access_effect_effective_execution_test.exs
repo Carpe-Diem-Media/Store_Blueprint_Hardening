@@ -225,6 +225,15 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     fixture = create_committed_effective_effect_fixture!("jc248_sweep_conflict")
     other = create_committed_effective_effect_fixture!("jc248_sweep_conflict_other")
 
+    on_exit(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+          Ecto.UUID.dump!(fixture.subscription.id),
+          Ecto.UUID.dump!(fixture.revision.id)
+        ])
+      end)
+    end)
+
     Sandbox.unboxed_run(Repo, fn ->
       assert {:ok, :applied} =
                Facade.execute_effective_access_effect_for_system(fixture.effect.id)
@@ -291,13 +300,6 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
       assert conflict_id == fixture.subscription.id
     after
       :ok = :telemetry.detach(handler_id)
-
-      Sandbox.unboxed_run(Repo, fn ->
-        Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
-          Ecto.UUID.dump!(fixture.subscription.id),
-          Ecto.UUID.dump!(fixture.revision.id)
-        ])
-      end)
     end
   end
 
@@ -638,6 +640,37 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
              InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{
                args: %{"through_id" => Ecto.UUID.generate(), "unknown" => true}
              })
+  end
+
+  @tag :jc248_continuation_validation
+  test "verification continuation without its page limit is discarded before SQL" do
+    assert {{:discard, _}, stats} =
+             RepoStats.capture(fn ->
+               VerifySubscriptionAccessWorker.perform(%Oban.Job{
+                 args: %{
+                   "as_of" => "1990-01-01T00:00:00Z",
+                   "after_inserted_at" => "1990-01-01T00:00:00Z",
+                   "after_id" => "00000000-0000-0000-0000-000000000001"
+                 }
+               })
+             end)
+
+    assert stats.query_count == 0
+  end
+
+  @tag :jc248_continuation_validation
+  test "inventory continuation without its page limit is discarded before SQL" do
+    assert {{:discard, _}, stats} =
+             RepoStats.capture(fn ->
+               InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{
+                 args: %{
+                   "through_id" => "00000000-0000-0000-0000-000000000002",
+                   "after_id" => "00000000-0000-0000-0000-000000000001"
+                 }
+               })
+             end)
+
+    assert stats.query_count == 0
   end
 
   test "source reconciliation repairs current effective authority and worker reports outcomes" do

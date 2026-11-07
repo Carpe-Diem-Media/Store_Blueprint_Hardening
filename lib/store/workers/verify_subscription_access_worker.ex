@@ -33,7 +33,9 @@ defmodule Store.Workers.VerifySubscriptionAccessWorker do
 
   defp parse_query(args) do
     with true <- Enum.all?(Map.keys(args), &(&1 in @allowed_args)),
-         true <- not cursor_supplied?(args) or Map.has_key?(args, "as_of"),
+         true <-
+           not cursor_supplied?(args) or
+             (Map.has_key?(args, "as_of") and Map.has_key?(args, "limit")),
          true <- valid_cursor_args?(args),
          {:ok, as_of} <- parse_as_of(args),
          {:ok, after_inserted_at} <- parse_datetime(Map.get(args, "after_inserted_at")),

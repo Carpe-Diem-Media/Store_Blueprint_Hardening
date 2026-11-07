@@ -62,6 +62,9 @@ defmodule Store.Workers.InventorySubscriptionAccessAuthorityWorker do
       cursor_supplied?(args) and not Map.has_key?(args, "through_id") ->
         {:discard, "inventory cursor requires a fixed upper bound"}
 
+      cursor_supplied?(args) and not Map.has_key?(args, "limit") ->
+        {:discard, "inventory cursor requires its page limit"}
+
       true ->
         parse_bounded_query(args)
     end
