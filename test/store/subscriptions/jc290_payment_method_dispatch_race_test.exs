@@ -213,6 +213,58 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
     end
   end
 
+  test "not-due recovery keeps an unobservable same-method request unresolved" do
+    fixture = create_dispatch_fixture!("not_due_replay")
+    ref = make_ref()
+    parent = self()
+    handler = attach_dispatch_barrier!(fixture, ref, [:claimed])
+    posts = :atomics.new(1, [])
+
+    StripeAPIStub.stub_payment_intent(fn conn, params ->
+      :atomics.add(posts, 1, 1)
+      send(parent, {ref, :post, params})
+
+      StripeAPIStub.json_response(
+        conn,
+        StripeAPIStub.payment_intent_response(params, %{"status" => "succeeded"})
+      )
+    end)
+
+    dispatcher = start_dispatch(fixture)
+
+    try do
+      assert_receive {^ref, :claimed, _beam, _pg, _ids, false}, 10_000
+      before = reached_identity!(fixture)
+      Process.unlink(dispatcher.pid)
+      Process.exit(dispatcher.pid, :kill)
+      assert_receive {:DOWN, monitor, :process, pid, :killed}, 3_000
+      assert monitor == dispatcher.ref and pid == dispatcher.pid
+      :telemetry.detach(handler)
+
+      recovery_now = DateTime.add(fixture.subscription.next_renewal_at, -1, :microsecond)
+
+      assert {:error, %{code: "PAYMENT_OUTCOME_UNRESOLVED"}} =
+               Facade.process_due_subscription_renewal_for_system(
+                 fixture.subscription.id,
+                 now: recovery_now
+               )
+
+      assert :atomics.get(posts, 1) == 0
+      refute_receive {^ref, :post, _params}, 0
+
+      after_recovery = reached_identity!(fixture)
+      assert after_recovery.attempt_id == before.attempt_id
+      assert after_recovery.collection_id == before.collection_id
+      assert after_recovery.payment_intent_id == before.payment_intent_id
+      assert after_recovery.financial_outcome == "unresolved"
+    after
+      :telemetry.detach(handler)
+      send(dispatcher.pid, {ref, :release, :claimed})
+      Task.shutdown(dispatcher, :brutal_kill)
+      cleanup_dispatch_fixture!(fixture)
+    end
+  end
+
   defp start_dispatch(fixture) do
     Task.async(fn ->
       Repo.checkout(
@@ -535,7 +587,9 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
               provider_payment_method_ref: fixture.refs.new_method,
               status: :active,
               fingerprint: "fp_jc290_#{fixture.refs.new_method}"
-            }, context: %{system?: true})
+            },
+            context: %{system?: true}
+          )
           |> Ash.create(
             domain: Store.Subscriptions,
             authorize?: false,
@@ -551,7 +605,9 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
               provider_customer_ref: fixture.refs.provider_customer,
               provider_billing_ref: fixture.refs.new_method,
               stored_payment_method_id: method.id
-            }, context: %{system?: true})
+            },
+            context: %{system?: true}
+          )
           |> Ash.update(
             domain: Store.Subscriptions,
             authorize?: false,

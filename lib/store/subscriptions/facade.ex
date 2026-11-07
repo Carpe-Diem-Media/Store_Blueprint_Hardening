@@ -2906,6 +2906,7 @@ defmodule Store.Subscriptions.Facade do
              provider_payment_method,
              collection
            ),
+         {:ok, charge_response} <- charge_response,
          {:ok, updated_payment_intent} <-
            persist_payment_intent_provider_refs(submitted_payment_intent, charge_response),
          {:ok, %{outcome: outcome}} <-
@@ -2928,7 +2929,7 @@ defmodule Store.Subscriptions.Facade do
          )}
 
       {:observe_captured, exact_payment_intent} ->
-        reconcile_existing_renewal_collection(exact_payment_intent, collection)
+        reconcile_reached_collection(exact_payment_intent)
 
       {:error, reason} ->
         {:error, reason}
@@ -3508,8 +3509,7 @@ defmodule Store.Subscriptions.Facade do
     renewal_period = renewal_period_from_attempt(attempt)
 
     with {:ok, effective_contract} <- effective_renewal_contract(attempt, live_revision),
-         :ok <-
-           ensure_due_renewal_chargeability(subscription, attempt, effective_contract.plan, now),
+         :ok <- ensure_renewal_chargeability(subscription, effective_contract.plan),
          {:ok, checkout} <-
            build_or_reuse_renewal_checkout(
              subscription,
@@ -3530,6 +3530,9 @@ defmodule Store.Subscriptions.Facade do
     else
       {:error, %Error{code: "STALE_RECORD"} = reason} ->
         {:error, reason}
+
+      {:error, %Error{code: "PAYMENT_METHOD_REQUIRED"} = reason} ->
+        reconcile_reached_after_method_withdrawal(subscription, attempt, now, reason)
 
       {:error, %Error{code: "PAYMENT_AUTHENTICATION_REQUIRED"}} ->
         :ok
@@ -6076,26 +6079,34 @@ defmodule Store.Subscriptions.Facade do
     end
   end
 
-  defp ensure_due_renewal_chargeability(subscription, attempt, plan, now) do
-    case ensure_renewal_chargeability(subscription, plan) do
-      :ok ->
-        :ok
+  defp reconcile_reached_after_method_withdrawal(subscription, attempt, now, original_reason) do
+    case RenewalCollectionAttempts.recover_reached_for_subscription_for_system(
+           subscription.id,
+           now
+         ) do
+      {:ok,
+       %{
+         renewal_attempt: %RenewalAttempt{id: attempt_id},
+         payment_intent: %PaymentIntent{} = payment_intent,
+         collection_attempt: %RenewalCollectionAttempt{} = collection
+       }}
+      when attempt_id == attempt.id ->
+        reconcile_existing_renewal_collection(payment_intent, collection)
+        |> classify_claimed_renewal_charge_result(collection)
 
-      {:error, %Error{code: "PAYMENT_METHOD_REQUIRED"} = reason} ->
-        case RenewalCollectionAttempts.recover_reached_for_subscription_for_system(
-               subscription.id,
-               now
-             ) do
-          {:ok, %{renewal_attempt: %RenewalAttempt{id: attempt_id}}}
-          when attempt_id == attempt.id ->
-            :ok
+      {:ok, nil} ->
+        {:renewal_failure, original_reason, nil}
 
-          _ ->
-            {:error, reason}
-        end
+      {:ok, _other_occurrence} ->
+        {:error,
+         Error.new(
+           "PAYMENT_OUTCOME_UNRESOLVED",
+           "a different reached renewal occurrence prevents current dispatch",
+           %{existing_collection_replay?: true}
+         )}
 
-      other ->
-        other
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
