@@ -962,6 +962,8 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
         self()
       )
 
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     assert :ok =
              Sandbox.unboxed_run(Repo, fn ->
                ReconcileSubscriptionAccessWorker.perform(%Oban.Job{
@@ -988,7 +990,6 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
 
     assert is_integer(duration)
     assert subscription_id == fixture.subscription.id
-    :ok = :telemetry.detach(handler_id)
 
     assert {:discard, _} =
              ReconcileSubscriptionAccessWorker.perform(%Oban.Job{
@@ -1895,6 +1896,15 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     before_effect = fetch_effect!(fixture.effect.id)
     before_grants = grants_for_source!(fixture.subscription.id)
 
+    on_exit(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+          Ecto.UUID.dump!(fixture.subscription.id),
+          Ecto.UUID.dump!(fixture.revision.id)
+        ])
+      end)
+    end)
+
     Sandbox.unboxed_run(Repo, fn ->
       Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
         Ecto.UUID.dump!(fixture.subscription.id),
@@ -1911,13 +1921,6 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
 
     assert fetch_effect!(fixture.effect.id) == before_effect
     assert grants_for_source!(fixture.subscription.id) == before_grants
-
-    Sandbox.unboxed_run(Repo, fn ->
-      Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
-        Ecto.UUID.dump!(fixture.subscription.id),
-        Ecto.UUID.dump!(fixture.revision.id)
-      ])
-    end)
   end
 
   test "APPLIED source repair restores missing grants and retries projection without changing the effect" do
