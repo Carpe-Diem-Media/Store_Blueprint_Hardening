@@ -12,7 +12,7 @@
 
 Create `lib/store/subscriptions/queries/applied_access_verification_query.ex`, `lib/store/entitlements/queries/subscription_source_verification_query.ex`, `lib/store/subscriptions/actions/read_applied_access_verification_window.ex`, and `lib/store/entitlements/actions/read_active_subscription_source_grants.ex`. Modify both domain facades, both resources' actions/policies/index declarations, and the existing effective execution test module. Generate only the required index migrations and corresponding resource snapshots.
 
-- [ ] Add regression tests using the existing committed fixtures and helpers. Add aliases for the two new query modules. Use these test bodies before implementing the modules.
+- [x] Add regression tests using the existing committed fixtures and helpers. Add aliases for the two new query modules. Use these test bodies before implementing the modules.
 
 ```elixir
 test "JC248 verification rejects invalid bounds and incomplete cursors before database work" do
@@ -91,9 +91,9 @@ test "JC248 batch grant reads bound each source and preserve empty sources" do
 end
 ```
 
-- [ ] Run the complete effective execution test module to RED before implementation, preserving `tmp/jc248/task2-red.log`. Failures must identify missing query/read behavior, not a fixture defect. The raw SQL fixture timestamp updates above use the same DateTime parameter convention as existing tests; diagnose any codec mismatch before drawing a product conclusion.
+- [x] Run the complete effective execution test module to RED before implementation, preserving `tmp/jc248/task2-red.log`. Failures must identify missing query/read behavior, not a fixture defect. The raw SQL fixture timestamp updates above use the same DateTime parameter convention as existing tests; diagnose any codec mismatch before drawing a product conclusion.
 
-- [ ] Implement the APPLIED query module below. The inner LIMIT precedes the latest-source check. Both dispositions are included. Ecto resource selection must preserve typed AccessEffect/Subscription/PlanRevision fields. If the installed Ecto planner rejects a nested selection, preserve the same bounded shape with an explicit typed field map and reconstruct only the known AccessEffect fields, then add an integration assertion for that representation.
+- [x] Implement the APPLIED query module below. The inner LIMIT precedes the latest-source check. Both dispositions are included. Ecto resource selection must preserve typed AccessEffect/Subscription/PlanRevision fields. If the installed Ecto planner rejects a nested selection, preserve the same bounded shape with an explicit typed field map and reconstruct only the known AccessEffect fields, then add an integration assertion for that representation.
 
 ```elixir
 defmodule Store.Subscriptions.Queries.AppliedAccessVerificationQuery do
@@ -166,7 +166,7 @@ defmodule Store.Subscriptions.Queries.AppliedAccessVerificationQuery do
 end
 ```
 
-- [ ] Implement the Entitlements query module below. The explicit type is `Ecto.UUID`, not `:uuid`. The installed Ecto.Type base list does not include `:uuid`; its documentation maps the Ecto.UUID module to the adapter UUID type. Ecto 3.14's own query documentation contains the UNNEST plus correlated parent_as lateral pattern.
+- [x] Implement the Entitlements query module below. The explicit type is `Ecto.UUID`, not `:uuid`. The installed Ecto.Type base list does not include `:uuid`; its documentation maps the Ecto.UUID module to the adapter UUID type. Ecto 3.14's own query documentation contains the UNNEST plus correlated parent_as lateral pattern.
 
 ```elixir
 defmodule Store.Entitlements.Queries.SubscriptionSourceVerificationQuery do
@@ -219,7 +219,7 @@ defmodule Store.Entitlements.Queries.SubscriptionSourceVerificationQuery do
 end
 ```
 
-- [ ] Declare these private generic actions and their specific runtime system-context policies. Generic actions are type `:action`, so the existing read policies and Entitlements admin/support read bypass do not apply. This follows the mandatory facade-to-resource-action contract. The installed Ash generic-actions guide confirms that generic actions do not cast return values, preserving nested typed resource fields.
+- [x] Declare these private generic actions and their specific runtime system-context policies. Generic actions are type `:action`, so the existing read policies and Entitlements admin/support read bypass do not apply. This follows the mandatory facade-to-resource-action contract. The installed Ash generic-actions guide confirms that generic actions do not cast return values, preserving nested typed resource fields.
 
 ```elixir
 # AccessEffect actions
@@ -256,7 +256,7 @@ policy action(:read_active_subscription_sources_for_system) do
 end
 ```
 
-- [ ] Implement the two read action modules. Reconstruct validated queries even for direct resource callers. Neither action locks rows, opens a transaction or changes grants.
+- [x] Implement the two read action modules. Reconstruct validated queries even for direct resource callers. Neither action locks rows, opens a transaction or changes grants.
 
 ```elixir
 defmodule Store.Subscriptions.Actions.ReadAppliedAccessVerificationWindow do
@@ -291,7 +291,7 @@ defmodule Store.Entitlements.Actions.ReadActiveSubscriptionSourceGrants do
 end
 ```
 
-- [ ] Add public, documented/typespecified facade reads using the corresponding aliases. Revalidate structs, then run the resource action with system context and authorization enabled. Database exceptions retain the repository's normal Ecto behavior.
+- [x] Add public, documented/typespecified facade reads using the corresponding aliases. Revalidate structs, then run the resource action with system context and authorization enabled. Database exceptions retain the repository's normal Ecto behavior.
 
 ```elixir
 # Subscriptions facade
@@ -327,7 +327,7 @@ def list_active_subscription_source_grants_for_system(_query),
   do: {:error, Error.new("VALIDATION_ERROR", "typed subscription source verification query is required")}
 ```
 
-- [ ] Add this authorization regression. The ordinary facade integration tests already exercise the permitted system path. Raw actions without system context must fail before SQL.
+- [x] Add this authorization regression. The ordinary facade integration tests already exercise the permitted system path. Raw actions without system context must fail before SQL.
 
 ```elixir
 test "JC248 operational read actions require system context" do
@@ -349,7 +349,7 @@ test "JC248 operational read actions require system context" do
 end
 ```
 
-- [ ] Run the focused module to GREEN. Add the following cursor and diagnostic tests, then re-run the complete module. The diagnostic test runs before and after adding the indexes, with distinct log files. Do not mistake a fixture-sized sequential plan for production capacity evidence.
+- [x] Run the focused module to GREEN. Add the following cursor and diagnostic tests, then re-run the complete module. The diagnostic test runs before and after adding the indexes, with distinct log files. Do not mistake a fixture-sized sequential plan for production capacity evidence.
 
 ```elixir
 test "JC248 verification uses binary UUID ties and a fixed high-water" do
@@ -406,7 +406,7 @@ test "JC248 records verification plans with bounded historical source fanout" do
   assert stats.query_count == 1
 end
 ```
-- [ ] Add these two custom indexes in the existing resource DSL. Both are operational read indexes; they do not change business authority. The existing source-version unique index handles each bounded latest-version check. The new active partial index avoids scanning/sorting the full revoked source history for LIMIT 2.
+- [x] Add these two custom indexes in the existing resource DSL. Both are operational read indexes; they do not change business authority. The existing source-version unique index handles each bounded latest-version check. The new active partial index avoids scanning/sorting the full revoked source history for LIMIT 2.
 
 ```elixir
 # AccessEffect postgres/custom_indexes
@@ -418,11 +418,13 @@ index([:source_id, :id], where: "source_kind = 'subscription' AND status = 'acti
   name: "entitlement_grants_active_subscription_source_index", concurrently: true)
 ```
 
-- [ ] Generate the aligned migration/snapshots with `mix ash_postgres.generate_migrations --name jc248_access_verification_indexes`. The installed generator emits `@disable_ddl_transaction true` and `@disable_migration_lock true` for concurrent indexes. Inspect the complete generated diff; stop for unexpected unrelated schema drift. Re-run the focused module, `mix ash_postgres.generate_migrations --check`, format checks and strict Credo. Capture the indexed plans and verify native UUID ordering, bounded inner APPLIED LIMIT and lateral LIMIT 2. Record small-volume planner choices honestly.
-- [ ] Self-review all changed files and commit this task. Do not enqueue repairs, add a cron, implement missing-authority inventory or complete JC-248 yet. Separate specification and quality reviews follow.
+- [x] Generate the aligned migration/snapshots with `mix ash_postgres.generate_migrations --name jc248_access_verification_indexes`. The installed generator emits `@disable_ddl_transaction true` and `@disable_migration_lock true` for concurrent indexes. Inspect the complete generated diff; stop for unexpected unrelated schema drift. Re-run the focused module, `mix ash_postgres.generate_migrations --check`, format checks and strict Credo. Capture the indexed plans and verify native UUID ordering, bounded inner APPLIED LIMIT and lateral LIMIT 2. Record small-volume planner choices honestly.
+- [x] Self-review all changed files and commit this task. Do not enqueue repairs, add a cron, implement missing-authority inventory or complete JC-248 yet. Separate specification and quality reviews follow.
 
 All Mix commands run sequentially through this exact environment, replacing only the final command:
 
 `MIX_ENV=test STORE_TEST_DB_SUFFIX=_t3_132f19be_hardening STORE_BENCH_POOL_SIZE=4 STORE_BENCH_WRITER_POOL_SIZE=4 ERL_FLAGS='+S 4:4' mise exec -- devcore-project run test -- mix test test/store/subscriptions/access_effect_effective_execution_test.exs`
 
 The query API only reads. Stale/current flags and source snapshots are diagnostic until a later source-fenced repair revalidates authority. This task makes no runtime capacity or production index-build duration claim.
+
+Specification review passed and independent quality review approved head `7a4608d9ea4b04a9fff127f70a397dbb41c46936`. Root observed both execution modules pass, 47 tests and zero failures. Worker observed compile warnings-as-errors, strict Credo and migration alignment pass. Tiny-fixture plans do not establish production capacity or stable index-only work.
