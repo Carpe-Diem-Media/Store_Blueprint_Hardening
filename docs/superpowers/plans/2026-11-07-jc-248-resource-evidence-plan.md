@@ -67,7 +67,7 @@ test "JC248 discovery and repair have repeated bounded resource evidence" do
         assert {:ok, grants_query} = SubscriptionSourceVerificationQuery.new(%{source_ids: ids})
         sorted_ids = BinaryUuidSort.sort_uuids(ids)
         <<first::unsigned-big-128>> = Ecto.UUID.dump!(hd(sorted_ids))
-        predecessor = Ecto.UUID.load!(<<first - 1::unsigned-big-128>>)
+        predecessor = Ecto.UUID.load!(<<(first - 1)::unsigned-big-128>>)
 
         assert {:ok, inventory_query} =
                  SubscriptionAccessInventoryQuery.new(%{

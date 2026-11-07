@@ -12,7 +12,7 @@
 
 Modify only `test/store/subscriptions/source_fence_contention_test.exs`. Existing CI already includes the source-fence module in both required real-connection repetitions, so no new workflow or test pool is needed. Add aliases for `AppliedAccessVerificationQuery`, `ReconcileSubscriptionAccessInput` where used.
 
-- [ ] Add this separate-connection delayed-target test to the source-fence module. Use the existing committed pair fixture and exact cleanup helper. A checked-out old worker deliberately owns no transaction while waiting. The later producer commits before the delayed repair runs. Test-only SQL simulates the durable source transition; it must establish the new target in the same transaction.
+- [x] Add this separate-connection delayed-target test to the source-fence module. Use the existing committed pair fixture and exact cleanup helper. A checked-out old worker deliberately owns no transaction while waiting. The later producer commits before the delayed repair runs. Test-only SQL simulates the durable source transition; it must establish the new target in the same transaction.
 
 ```elixir
 test "a delayed drift candidate cannot recreate access after a newer non-effective target" do
@@ -121,9 +121,9 @@ test "a delayed drift candidate cannot recreate access after a newer non-effecti
 end
 ```
 
-- [ ] Verify every producer and repair task is awaited or terminated before fixture cleanup. Keep the nested cleanup structure when adding assertions; do not change production or cleanup timeouts.
+- [x] Verify every producer and repair task is awaited or terminated before fixture cleanup. Keep the nested cleanup structure when adding assertions; do not change production or cleanup timeouts.
 
-- [ ] Add a real blocked-repair test with producer-first source locking. Reuse existing `backend_pid!`, `await_blocking_pid!`, `wait_for_release!` and committed fixture cleanup. The nested cleanup releases or terminates both task handles before deleting owned fixtures.
+- [x] Add a real blocked-repair test with producer-first source locking. Reuse existing `backend_pid!`, `await_blocking_pid!`, `wait_for_release!` and committed fixture cleanup. The nested cleanup releases or terminates both task handles before deleting owned fixtures.
 
 ```elixir
 test "an APPLIED repair blocked behind a newer producer revalidates and leaves another source free" do
@@ -226,7 +226,7 @@ test "an APPLIED repair blocked behind a newer producer revalidates and leaves a
 end
 ```
 
-- [ ] Add the exact effect reader used above. It is test-only and reads through the resource action.
+- [x] Add the exact effect reader used above. It is test-only and reads through the resource action.
 
 ```elixir
 defp fetch_jc248_effect!(id) do
@@ -238,7 +238,7 @@ end
 
 ## Validation and handoff
 
-- [ ] Run both focused execution modules and all four required real-connection modules. Run the required real-connection command twice and preserve distinct logs. Existing CI already runs the four paths below twice.
+- [x] Run both focused execution modules and all four required real-connection modules. Run the required real-connection command twice and preserve distinct logs. Existing CI already runs the four paths below twice.
 
 ```text
 test/store/subscriptions/source_fence_contention_test.exs
@@ -247,7 +247,7 @@ test/store/subscriptions/jc290_payment_method_dispatch_cleanup_test.exs
 test/store/subscriptions/jc290_payment_method_dispatch_race_test.exs
 ```
 
-- [ ] Run format checks, scoped strict Credo with positional file paths, compile warnings-as-errors and migration alignment. Self-review/commit only the real-connection test changes, with exact head and observed limits. Independent spec and quality review follow. A separate Task7 covers the remaining exact-source acceptance matrix and repeated resource measurements. Root then inspects the entire ticket diff, removes temporary implementation plans from the final PR diff while retaining ignored local copies/history, and runs the complete repository gates and exact-head reviews before publication.
+- [x] Run format checks, scoped strict Credo with positional file paths, compile warnings-as-errors and migration alignment. Self-review/commit only the real-connection test changes, with exact head and observed limits. Independent spec and quality review follow. A separate Task7 covers the remaining exact-source acceptance matrix and repeated resource measurements. Root then inspects the entire ticket diff, removes temporary implementation plans from the final PR diff while retaining ignored local copies/history, and runs the complete repository gates and exact-head reviews before publication.
 
 Every Mix command is sequential and uses:
 
@@ -256,3 +256,5 @@ Every Mix command is sequential and uses:
 Use `test --only real_connections` followed by the four paths for the required repetitions. Do not start another test pool or PostgreSQL/Redis stack. No production edits, test skips, weakened query bounds or timing guarantees are authorized by a passing fixture run.
 
 Root self-review confirmed the two test bodies and reader parse as Elixir, task cleanup precedes owned fixture cleanup, and existing required CI paths cover both repetitions. Production capacity and arbitrary source-history fanout are outside this task.
+
+Implementation `19dc3af84640fd3ef2bccce5f0add661bc947017` passed independent specification review and quality review against base `072a4cfb2a66239389a2e7d4afcc15d857e5c402`. Root inspected the entire 227-line test addition and both saved real-connection logs, each with 43 tests and zero failures. The implementer also observed 71 focused execution tests and scoped static checks passing. The disconnect diagnostics match existing JC290 forced-session cleanup tests. These results cover the bounded local contention cases, not production capacity or the entire ticket.
