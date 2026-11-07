@@ -56,10 +56,6 @@ defmodule Store.Workers.ReconcileSubscriptionAccessWorker do
 
         emit(started, subscription_id, args["expected_access_effect_id"], outcome)
         {:error, error}
-
-      {:error, reason} ->
-        emit(started, subscription_id, args["expected_access_effect_id"], :execution_failure)
-        {:error, reason}
     end
   end
 
