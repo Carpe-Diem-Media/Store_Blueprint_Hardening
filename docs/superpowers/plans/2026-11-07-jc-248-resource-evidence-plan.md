@@ -252,3 +252,13 @@ Every Mix command uses this sequential prefix:
 `MIX_ENV=test STORE_TEST_DB_SUFFIX=_t3_132f19be_hardening STORE_BENCH_POOL_SIZE=4 STORE_BENCH_WRITER_POOL_SIZE=4 ERL_FLAGS='+S 4:4' mise exec -- devcore-project run test -- mix`
 
 Root self-review checked helper names, native UUID ordering, fixed historical cursors, initial revoked-history insertion, exact APPLIED preservation, dedicated-process ownership and cleanup. All code blocks must parse before dispatch. The final ticket review and full repository gates follow this task.
+
+## Authorized measurement refinements and root verification
+
+The installed Sandbox proxy returns its physical connection asynchronously. The implemented helper waits conditionally for an idle pool baseline whose summed ready count equals the configured pool size and whose queues are empty. It retains every metric entry, including empty proxies, normalizes source identities and ordering, and polls for the exact baseline after task return. Baseline and return wait times and poll counts are recorded. Each wait has a three-second diagnostic deadline and ten-millisecond polling interval. No production timeout changed.
+
+Ownership setup occurs before the measurement timer, but the proxy checks out a physical connection lazily on the first SQL call. The first measured API may include that checkout. Task scheduling and initial Sandbox ownership setup are excluded.
+
+Root authorized one explicitly labeled test-only ANALYZE entitlement_grants follow-up after all timed operations in repetition two. The same source batch runs before and after this refresh, with index readiness, validity, predicate and catalog estimates recorded. This does not change either timed repetition. Natural plans before the refresh remain recorded. The earlier stale-statistics diagnostic is preserved in tmp/jc248/task8-explicit-analyze-diagnostic.log. No VACUUM or planner override is allowed.
+
+The worker's first combined check selected access_effect_execution_test.exs rather than access_effect_non_effective_execution_test.exs. Its 57-test result did not cover the required pair. Root ran the explicit effective/non-effective pair at ca7c790b48b36b70d467a5ea47089852edfe557a and observed 75 tests, zero failures. Output is in tmp/jc248/task8-root-pair.log. Root compared the full test diff and every recorded measurement and plan in tmp/jc248/task8-tagged.log, then corrected two copied sample ranges in the design. Independent spec and quality review remain pending.
