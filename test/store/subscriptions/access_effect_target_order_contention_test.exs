@@ -194,8 +194,17 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
           assert observer_backend_pid != caller_backend_pid
 
           Repo.transaction(fn ->
+            order = fetch_order!(fixture.order.id)
+            line_item = fetch_order_line_item!(fixture.line_item.id)
+            assert order.state == :paid
+            assert order.user_id == fixture.customer.id
+            assert line_item.order_id == order.id
+            assert line_item.subscription_plan_id_snapshot == fixture.plan.id
+            assert line_item.subscription_plan_revision_id_snapshot == fixture.revision.id
+
             [subscription] = subscriptions_for_source!(fixture.line_item.id)
             [item] = subscription_items_for_source!(fixture.line_item.id)
+            assert subscription.source_order_id == order.id
 
             initial =
               fetch_effect_for_source_version!(subscription.id, subscription.aggregate_version)
