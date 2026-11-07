@@ -1933,6 +1933,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
 
     effect_snapshot = fetch_effect!(fixture.effect.id)
     user_id = fixture.subscription.user_id
+    on_exit(fn -> Cachex.del(Cache, Cache.cache_key(user_id)) end)
     Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(user_id))
 
     Sandbox.unboxed_run(Repo, fn ->

@@ -50,6 +50,15 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
     foreign_effect = fetch_effect!(foreign.effect_id)
     before_grants = grants_for_source!(fixture.subscription_id)
 
+    on_exit(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+          Ecto.UUID.dump!(fixture.subscription_id),
+          Ecto.UUID.dump!(before_effect.plan_revision_id)
+        ])
+      end)
+    end)
+
     Sandbox.unboxed_run(Repo, fn ->
       Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
         Ecto.UUID.dump!(fixture.subscription_id),
@@ -66,13 +75,6 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
 
     assert fetch_effect!(fixture.effect_id) == before_effect
     assert grants_for_source!(fixture.subscription_id) == before_grants
-
-    Sandbox.unboxed_run(Repo, fn ->
-      Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
-        Ecto.UUID.dump!(fixture.subscription_id),
-        Ecto.UUID.dump!(before_effect.plan_revision_id)
-      ])
-    end)
   end
 
   test "current non-effective effect revokes past-due source grants with purchased-policy reason" do
