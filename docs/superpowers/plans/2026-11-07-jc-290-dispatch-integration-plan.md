@@ -14,7 +14,7 @@ Modify lib/store/subscriptions/facade.ex. Create test/store/subscriptions/jc290_
 
 ## Task 3: Guard every charge request
 
-- [ ] Write the functional regression cases below before production changes. The dispatcher-first case must fail because a writer commits before the actual POST, not because an event is absent. The crash-before-request case must fail because recovery POSTs the stale captured method after replacement. Retain the raw RED output.
+- [ ] Write the functional regression cases below before production changes. The dispatcher-first case must fail because a writer commits before the actual POST, not because an event is absent. The crash-before-request case characterizes exact recovery and must not POST a stale method. All installed adapters currently prohibit replay POSTs, so this case already passed before integration. Retain the raw RED output.
 - [ ] Keep request_off_session_renewal_charge/6's existing pre-claim observation event, reconciliation decision, typed input and outer authentication settlement. Replace only the attach-and-submit case with this call:
 
 ```elixir
@@ -776,7 +776,7 @@ end
 
 ## Validation and commit
 
-- [ ] Run the regression module before production and retain its RED output in ignored tmp/jc290/task3-red.log. Expected failures are a replacement committed before POST, a stale recovery POST, and blocked observation after revocation.
+- [ ] Run the regression module before production and retain its RED output in ignored tmp/jc290/task3-red.log. Expected product failures are a replacement committed before POST and blocked observation after revocation. Crash recovery is characterization because all installed adapters prohibit same-request POST replay.
 - [ ] Implement the facade changes above. Add the existing PaymentMethodAuthorityGate alias alongside the other Subscriptions aliases.
 - [ ] Run the new module twice and the existing subscription regression suite. Do not run database commands concurrently.
 
@@ -794,3 +794,7 @@ Expected: zero failures. Real-connection cases remain excluded from the normal s
 ## Root self-review
 
 The production snippets cover both charge POST paths, keep the short claim transaction committed before provider I/O, and release session gates before applying financial evidence. They preserve the same collection and request on method changes. The due preflight fallback permits only observation of the same reached occurrence. Types and fields match current resource code, and the session callback returns its value without another tuple wrapper. Tests use actual facade and fixture APIs, distinct PostgreSQL backends, an entered POST, and a committed writer. The crash case retains a checkout on both RED and GREEN so process death owns a database session. The complete ticket also needs the final proof task's reverse arrival order, revocation, terminal non-success, mutation contention, stale CAS, unrelated work and resource measurements. No provider-contract change or remote receipt claim is authorized.
+
+## Execution correction
+
+At 9d7be0859fcad8d2c6280eb236d65e38a35aa8dd, the facade and four focused tests passed separate spec and quality reviews. All installed adapters disable or omit supports_same_request_replay?, so generic replay POST logic cannot be dynamically exercised through the public facade. An attempted successful replay expectation was incorrect and was replaced with observation-only characterization. The response tuple handling in that dormant path was corrected by inspection. The due fallback uses the direct same-attempt observation helper in this plan and preserves lookup errors. Meaningful original RED coverage contains two failures, followed by four passing focused tests twice and 132 passing related tests.

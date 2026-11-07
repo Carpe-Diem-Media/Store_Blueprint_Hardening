@@ -171,7 +171,7 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchCleanupTest do
     assert_keys_available!(identity)
   end
 
-  test "discards the owner when method acquisition loses its acknowledgement", %{
+  test "discards the owner when method acquisition follows connection loss", %{
     identity: identity
   } do
     parent = self()
