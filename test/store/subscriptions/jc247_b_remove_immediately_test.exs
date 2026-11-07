@@ -7,6 +7,7 @@ defmodule Store.Subscriptions.Jc247BRemoveImmediatelyTest do
   alias Store.Repo
   alias Store.Subscriptions.{AccessEffect, Facade, Subscription}
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   setup context do
@@ -16,32 +17,16 @@ defmodule Store.Subscriptions.Jc247BRemoveImmediatelyTest do
 
   test "first payment failure establishes one non-effective effect" do
     fixture = create_due_fixture!("jc247_b_failure")
-    stub_payment!("canceled")
+    fixture = prepare_observation!(fixture, "canceled")
     assert {:error, %{code: "PAYMENT_FAILED"}} = fixture.run.()
     assert_non_effective!(fixture.subscription.id)
   end
 
   test "first authentication-required transition establishes one non-effective effect" do
     fixture = create_due_fixture!("jc247_b_auth")
-    stub_payment!("requires_action")
+    fixture = prepare_observation!(fixture, "requires_action")
     assert {:ok, :processed} = fixture.run.()
     assert_non_effective!(fixture.subscription.id)
-  end
-
-  defp stub_payment!(status) do
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      response =
-        if status == "requires_action",
-          do: %{
-            "status" => status,
-            "next_action" => %{
-              "redirect_to_url" => %{"url" => "https://payments.example.test/authenticate/jc247"}
-            }
-          },
-          else: %{"status" => status}
-
-      StripeAPIStub.json_response(conn, StripeAPIStub.payment_intent_response(params, response))
-    end)
   end
 
   defp create_due_fixture!(label) do
@@ -72,8 +57,21 @@ defmodule Store.Subscriptions.Jc247BRemoveImmediatelyTest do
 
     %{
       subscription: subscription,
+      now: now,
       run: fn -> Facade.process_due_subscription_renewal_for_system(subscription.id, now: now) end
     }
+  end
+
+  defp prepare_observation!(fixture, status) do
+    StripeAPIStub.stub_unexpected!("legacy preparation must not contact Stripe")
+    reached = ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, fixture.now)
+
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, status)
+    )
+
+    fixture
   end
 
   defp assert_non_effective!(subscription_id) do
