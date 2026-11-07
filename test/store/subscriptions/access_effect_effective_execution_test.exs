@@ -245,7 +245,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
            }
   end
 
-  test "a same-source captured ContractChange remains valid after a later instruction supersedes it" do
+  test "a captured ContractChange survives supersession and requires its original source owner" do
     fixture = create_committed_effective_effect_fixture!("jc248_historical_contract_reference")
 
     future_plans =
@@ -397,6 +397,35 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
              subscription_id: fixture.subscription.id,
              ordering_version: historical_effect.source_version
            }
+
+    foreign = create_committed_effective_effect_fixture!("jc248_foreign_contract_owner")
+    grants_before = grants_for_source!(fixture.subscription.id)
+    reference_id = Ecto.UUID.dump!(historical_effect.contract_change_id)
+
+    try do
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("UPDATE contract_changes SET subscription_id = $2 WHERE id = $1", [
+          reference_id,
+          Ecto.UUID.dump!(foreign.subscription.id)
+        ])
+      end)
+
+      assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+               Sandbox.unboxed_run(Repo, fn ->
+                 Facade.repair_applied_access_effect_for_system(historical_effect.id)
+               end)
+
+      assert fetch_effect!(historical_effect.id) == applied_effect
+      assert grants_for_source!(fixture.subscription.id) == grants_before
+      assert grants_for_source!(foreign.subscription.id) == []
+    after
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("UPDATE contract_changes SET subscription_id = $2 WHERE id = $1", [
+          reference_id,
+          Ecto.UUID.dump!(fixture.subscription.id)
+        ])
+      end)
+    end
   end
 
   test "source reconciliation rejects a too-new captured ContractChange without writes" do

@@ -14,7 +14,7 @@ Create `lib/store/subscriptions/inputs/reconcile_subscription_access_input.ex` a
 
 ## Task 3: Source operation and worker
 
-- [ ] Add regression tests before production changes. Reuse each module's committed fixture and cleanup helpers. Run all calls that own a transaction through `Sandbox.unboxed_run`. Add these effective-module aliases and tests.
+- [x] Add regression tests before production changes. Reuse each module's committed fixture and cleanup helpers. Run all calls that own a transaction through `Sandbox.unboxed_run`. Add these effective-module aliases and tests.
 
 ```elixir
 alias Store.Subscriptions.Inputs.ReconcileSubscriptionAccessInput
@@ -78,11 +78,11 @@ test "source operation rejects an obsolete expected effect without applying eith
 end
 ```
 
-- [ ] Add a non-effective worker regression with `create_committed_suspended_effect_fixture!`, its `subscription_id` and `effect_id`, expecting `:ok`, no active exact-source grants and APPLIED. Add a caller-transaction regression using `Repo.transaction` inside `unboxed_run`, asserting a VALIDATION_ERROR and unchanged effect/grants. Add immutable-provenance regression tests in both modules: create a fixture and a foreign fixture, update only the tested Subscription's `source_order_line_item_id` to the foreign line item, call the typed source operation, expect VALIDATION_ERROR and unchanged effect/grants, and restore the original pointer in `after` before fixture cleanup. The effect fingerprint remains valid, so the test exercises commercial provenance rather than F0 fingerprint rejection. Use existing fixture field names and helpers, not test seams in production.
+- [x] Add a non-effective worker regression with `create_committed_suspended_effect_fixture!`, its `subscription_id` and `effect_id`, expecting `:ok`, no active exact-source grants and APPLIED. Add a caller-transaction regression using `Repo.transaction` inside `unboxed_run`, asserting a VALIDATION_ERROR and unchanged effect/grants. Add immutable-provenance regression tests in both modules: create a fixture and a foreign fixture, update only the tested Subscription's `current_plan_revision_id` to the foreign revision, call the typed source operation, expect VALIDATION_ERROR and unchanged effect/grants, and restore the original pointer in `after` before fixture cleanup. The source order-line pointer is unique and cannot be assigned from another live Subscription without violating its constraint. The effect fingerprint remains valid, so the test exercises commercial provenance rather than F0 fingerprint rejection. Use existing fixture field names and helpers, not test seams in production.
 
-- [ ] Run both execution modules to RED and preserve `tmp/jc248/task3-red.log`. Confirm missing APIs or the missing provenance guard cause failures before production changes.
+- [x] Run both execution modules to RED and preserve `tmp/jc248/task3-red.log`. Confirm missing APIs or the missing provenance guard cause failures before production changes.
 
-- [ ] Implement this strictly bounded input. It accepts atom-keyed internal maps, matching the verification queries. Unknown fields cannot introduce caller-authored grant truth.
+- [x] Implement this strictly bounded input. It accepts atom-keyed internal maps, matching the verification queries. Unknown fields cannot introduce caller-authored grant truth.
 
 ```elixir
 defmodule Store.Subscriptions.Inputs.ReconcileSubscriptionAccessInput do
@@ -108,7 +108,7 @@ defmodule Store.Subscriptions.Inputs.ReconcileSubscriptionAccessInput do
 end
 ```
 
-- [ ] Add the input alias and this facade operation. `fetch_subscription_for_renewal/1` and `read_current_access_effect/1` already exist and call resource actions. Selection is diagnostic until the called executor proves currentness again under its source lock. An expected-ID mismatch does not authorize execution of the stale target; existing recovery remains responsible for allowed stale nonterminal supersession.
+- [x] Add the input alias and this facade operation. `fetch_subscription_for_renewal/1` and `read_current_access_effect/1` already exist and call resource actions. Selection is diagnostic until the called executor proves currentness again under its source lock. An expected-ID mismatch does not authorize execution of the stale target; existing recovery remains responsible for allowed stale nonterminal supersession.
 
 ```elixir
 @doc """
@@ -155,13 +155,13 @@ defp reconcile_selected_source_effect(_input, %AccessEffect{}) do
 end
 ```
 
-- [ ] Add a shared private provenance guard and invoke it before any nonterminal transition or grant write inside each existing executor's source-locked path. Do not add another preflight transaction or change F0 stale supersession. Both helper call sites already run under F0's Subscription lock.
+- [x] Add a shared private provenance guard and invoke it before any nonterminal transition or grant write inside each existing executor's source-locked path. Do not add another preflight transaction or change F0 stale supersession. Both helper call sites already run under F0's Subscription lock.
 
 ```elixir
 defp validate_current_access_effect_provenance(effect, subscription_id) do
-  with {:ok, current_provenance} <- lock_access_effect_subscription(subscription_id),
-       :ok <- validate_access_effect_provenance(effect, current_provenance) do
-    validate_access_effect_target_entitlement(effect, current_provenance)
+  with {:ok, provenance} <- lock_access_effect_subscription(subscription_id),
+       {:ok, reference} <- access_effect_contract_reference(effect.contract_change_id) do
+    validate_persisted_access_effect_provenance(effect, provenance, reference)
   end
 end
 
@@ -190,7 +190,7 @@ else
 end
 ```
 
-- [ ] Implement the worker. Use finite uniqueness so an orphaned executing job cannot suppress all future rediscovery. Completed, cancelled and discarded jobs do not suppress new repairs. Queue state never marks business convergence. A committed execution with pending projection must trigger a retry through the source boundary.
+- [x] Implement the worker. Use finite uniqueness so an orphaned executing job cannot suppress all future rediscovery. Completed, cancelled and discarded jobs do not suppress new repairs. Queue state never marks business convergence. A committed execution with pending projection must trigger a retry through the source boundary.
 
 ```elixir
 defmodule Store.Workers.ReconcileSubscriptionAccessWorker do
@@ -235,11 +235,64 @@ defmodule Store.Workers.ReconcileSubscriptionAccessWorker do
 end
 ```
 
-- [ ] Run the focused modules to GREEN, strict Credo on changed files and format check. Existing fixed query-count checks may need exactly one extra provenance read for each executor. Update only the documented fixed allowance if an observed failure proves that exact extra query; preserve batch/N+1 bounds. Add worker malformed-argument and telemetry-outcome assertions, and verify source replay does not change APPLIED identity.
-- [ ] Self-review the full task diff, commit, and report exact RED/GREEN commands and results. Separate specification and quality reviewers follow before the next implementation task.
+- [x] Run the focused modules to GREEN, strict Credo on changed files and format check. Existing fixed query-count checks may need exactly one extra provenance read for each executor. Update only the documented fixed allowance if an observed failure proves that exact extra query; preserve batch/N+1 bounds. Add worker malformed-argument and telemetry-outcome assertions, and verify source replay does not change APPLIED identity.
+- [x] Self-review the full task diff, commit, and report exact RED/GREEN commands and results. Separate specification and quality reviewers follow before the next implementation task.
 
 Use sequential commands with this prefix for every Mix invocation:
 
 `MIX_ENV=test STORE_TEST_DB_SUFFIX=_t3_132f19be_hardening STORE_BENCH_POOL_SIZE=4 STORE_BENCH_WRITER_POOL_SIZE=4 ERL_FLAGS='+S 4:4' mise exec -- devcore-project run test -- mix`
 
 Focused test arguments are `test test/store/subscriptions/access_effect_effective_execution_test.exs test/store/subscriptions/access_effect_non_effective_execution_test.exs`. No other agent or root may run Mix while the implementer owns it. Do not weaken provenance validation to satisfy tests; diagnose fixture or compatibility conflicts first.
+
+## Correction from the actual future-instruction contract
+
+Root found that the original three-ID execution comparison was wrong. `persist_contract_change_tx` writes `current_contract_change_id` on queueing an unpaid future instruction. `consume_contract_change_for_renewal` clears it. Existing producers copy that pointer into an AccessEffect as ordering context, including while the funded revision is still the old one. This correction applies to Task1 APPLIED repair, Task3 current nonterminal execution and the upcoming batch comparator. It leaves establishment validation unchanged.
+
+- [x] Before changing production code, add a committed-fixture regression that uses the real `queue_subscription_plan_change_for_user` facade to queue a different published revision. Assert the queue operation leaves the funded current revision unchanged, changes the future pointer, advances the aggregate, and does not create another AccessEffect. Prove both a still-REQUIRED original effect and a previously-APPLIED original effect can converge their original exact grant target. Mutate the public SubscriptionPlan's entitlement pair and confirm repair still uses the immutable revision. Capture a semantic RED from the current guard, not a malformed fixture or missing API.
+- [x] Add tests for a current effect whose non-null captured reference belongs to this source, then that instruction is superseded by a later queued change. Its original target remains valid. A fingerprint-valid reference to a foreign Subscription's ContractChange, or to this source's later instruction with ordering version greater than the effect's source version, must fail before grant writes. Restore test-corrupted effect rows in `after`; never disable database constraints.
+- [x] Replace Task3's private execution provenance helper with the following shared execution path. Task1's `repair_current_applied_access_effect` must call it instead of the establishment-only three-ID validator. Do not change `validate_access_effect_provenance/2`, which still checks exact live pointers at establishment.
+
+```elixir
+defp validate_current_access_effect_provenance(effect, subscription_id) do
+  with {:ok, provenance} <- lock_access_effect_subscription(subscription_id),
+       {:ok, reference} <- access_effect_contract_reference(effect.contract_change_id) do
+    validate_persisted_access_effect_provenance(effect, provenance, reference)
+  end
+end
+defp access_effect_contract_reference(nil), do: {:ok, nil}
+defp access_effect_contract_reference(id), do: fetch_contract_change_by_id(id)
+
+defp validate_persisted_access_effect_provenance(effect, provenance, reference) do
+  with true <- effect.source_order_line_item_id == provenance.source_order_line_item_id and
+         effect.plan_revision_id == provenance.plan_revision_id,
+       :ok <- validate_access_effect_target_entitlement(effect, provenance),
+       :ok <- validate_access_effect_contract_reference(effect, reference) do
+    :ok
+  else
+    false -> {:error, Error.new("VALIDATION_ERROR", "AccessEffect funded source and revision evidence conflict")}
+    {:error, _reason} = error -> error
+  end
+end
+defp validate_access_effect_contract_reference(%{contract_change_id: nil}, _reference), do: :ok
+defp validate_access_effect_contract_reference(
+       %{contract_change_id: id, subscription_id: source_id, source_version: version},
+       %{id: id, subscription_id: source_id, ordering_version: ordering})
+     when is_integer(ordering) and ordering > 0 and ordering <= version, do: :ok
+defp validate_access_effect_contract_reference(_effect, _reference),
+  do: {:error, Error.new("VALIDATION_ERROR", "AccessEffect historical ContractChange evidence conflicts")}
+```
+
+- [x] Extend the existing APPLIED verification query with the historical reference join below. It remains one SQL query, after the raw window limit. No additional index or migration is required for a primary-key join. The upcoming comparator will call the same pure persisted-provenance validator using this map.
+
+```elixir
+alias Store.Subscriptions.ContractChange
+# After the existing source and revision joins:
+left_join: reference in ContractChange, on: reference.id == effect.contract_change_id,
+# Add to the existing selected row:
+contract_reference: %{id: reference.id, subscription_id: reference.subscription_id,
+  ordering_version: reference.ordering_version}
+```
+
+- [x] Re-run both execution modules, scoped strict Credo, format and compile warnings-as-errors. A null reference adds no historical-reference SQL. A non-null reference adds one Ash-backed exact primary-key read inside the source transaction. Document that fixed difference without weakening discovery query-count bounds. Root and fresh reviewers must include this correction in Task3's final review.
+
+Task3 implementation commit: `88968db0f9929098294acabe77408faa753b01d7`. Root added an ownership-corruption assertion to the historical-reference regression, restored the reference before cleanup, and observed both execution modules pass with 57 tests and zero failures. The semantic RED at `/tmp/jc248/task3-semantic-red-final.log` fails at reconciliation under the original strict current-pointer guard. Earlier fixture/queue failures are preserved separately and are not semantic RED evidence. Independent reviews follow this root checkpoint.
