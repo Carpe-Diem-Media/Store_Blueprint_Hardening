@@ -10,9 +10,9 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
   alias Store.Subscriptions.{
     ContractChange,
     Facade,
+    PlanRevision,
     RenewalAttempt,
     RenewalCollectionAttempt,
-    PlanRevision,
     Scheduler,
     Subscription
   }

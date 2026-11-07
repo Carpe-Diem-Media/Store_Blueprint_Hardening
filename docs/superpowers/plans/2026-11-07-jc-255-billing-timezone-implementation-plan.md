@@ -208,12 +208,12 @@ database = Calendar.get_time_zone_database()
 
 with :ok <- BillingTimezone.validate(billing_timezone, database) do
   case interval_unit do
-    :day -> {:ok, DateTime.add(period_start_at, day_seconds, :second)}
+    :day -> {:ok, DateTime.add(period_start_at, day_seconds, :second, database)}
     :month -> shift_calendar_months(period_start_at, interval_count, anchor_mode,
                   anchor_day_of_month, billing_timezone, database)
     :year -> shift_calendar_months(period_start_at, interval_count * 12, anchor_mode,
                   anchor_day_of_month, billing_timezone, database)
-    _ -> {:ok, DateTime.add(period_start_at, day_seconds, :second)}
+    _ -> {:ok, DateTime.add(period_start_at, day_seconds, :second, database)}
   end
 end
 ```
@@ -271,7 +271,7 @@ In `due_renewal_identity/2`, retain contract resolution, revision read, and owne
 
 ## Final verification and publication
 
-- [ ] Run `mix check`, `mix test --max-failures 1`, the real-connection gate, and `mix ash_postgres.generate_migrations --check` with the DevCore prefix above. Real-connection gate command is `mix test --include real_connections test/store/subscriptions/source_fence_contention_test.exs test/store/subscriptions/access_effect_target_order_contention_test.exs`. Do not run database commands concurrently.
+- [ ] Run `mix check`, `mix test --max-failures 1`, the real-connection gate twice, and `mix ash_postgres.generate_migrations --check` with the DevCore prefix above. Real-connection gate command is `mix test --only real_connections test/store/subscriptions/source_fence_contention_test.exs test/store/subscriptions/access_effect_target_order_contention_test.exs`. Do not run database commands concurrently.
 - [ ] Inspect `git diff 1629b6442b7ed0d00399a60f4ff14ff8e6b76f5c...HEAD`, `git diff --check`, and exact head. Confirm no secrets, defaults changes, migrations, extra dependencies, or unrelated production files.
 - [ ] Record two equivalent bounded scheduling measurements, including query count, process memory/mailbox, and limits. Do not claim convergence or capacity from functional tests. Add Performance & Scaling Review and Runtime Resource Safety Review to the PR. Database indexes, Oban uniqueness, caching, and logging retain their existing ownership; scheduling adds local timezone lookups only.
 - [ ] Push the issue branch and create a draft PR targeting `jc360-initial-paid-activation`, with JC-255 acceptance evidence and explicit stack order. Link the PR to this thread as the next tool call. Move JC-255 to In Review when ready for human review. Never mark it Done or merge it.

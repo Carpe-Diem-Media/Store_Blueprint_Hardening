@@ -1,6 +1,12 @@
 defmodule Store.Subscriptions.Scheduler do
   @moduledoc """
   Pure subscription period and renewal scheduling helpers.
+
+  Day intervals add fixed multiples of 86,400 seconds. Month and year intervals
+  preserve the local commercial clock and clamp the day to the target month.
+  Ambiguous local times use the first occurrence; gaps use the first boundary
+  returned by the timezone database. Period calculations return an explicit error
+  when the configured database cannot resolve the billing timezone.
   """
 
   @spec renewal_key(Ecto.UUID.t(), DateTime.t()) :: String.t()
@@ -89,7 +95,7 @@ defmodule Store.Subscriptions.Scheduler do
     with :ok <- BillingTimezone.validate(billing_timezone, database) do
       case interval_unit do
         :day ->
-          {:ok, DateTime.add(period_start_at, day_seconds, :second)}
+          {:ok, DateTime.add(period_start_at, day_seconds, :second, database)}
 
         :month ->
           shift_calendar_months(
@@ -112,7 +118,7 @@ defmodule Store.Subscriptions.Scheduler do
           )
 
         _ ->
-          {:ok, DateTime.add(period_start_at, day_seconds, :second)}
+          {:ok, DateTime.add(period_start_at, day_seconds, :second, database)}
       end
     end
   end
@@ -160,9 +166,8 @@ defmodule Store.Subscriptions.Scheduler do
       shifted_date = shift_date_months(local_date, month_count, anchor_day)
 
       with {:ok, shifted_local} <-
-             local_datetime(shifted_date, local_time, local.time_zone, database),
-           {:ok, utc} <- shift_zone(shifted_local, "Etc/UTC", database) do
-        {:ok, utc}
+             local_datetime(shifted_date, local_time, local.time_zone, database) do
+        shift_zone(shifted_local, "Etc/UTC", database)
       end
     end
   end
