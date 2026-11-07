@@ -84,6 +84,260 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
            ]
   end
 
+  @tag :jc248_resource_evidence
+  test "JC248 discovery and repair have repeated bounded resource evidence" do
+    for repetition <- 1..2 do
+      fixtures =
+        Enum.map(1..16, fn index ->
+          create_committed_effective_effect_fixture!("jc248_resource_#{repetition}_#{index}")
+        end)
+
+      timestamp = DateTime.add(~U[2094-01-01 00:00:00Z], repetition, :day)
+
+      try do
+        Sandbox.unboxed_run(Repo, fn ->
+          Enum.each(fixtures, fn fixture ->
+            assert {:ok, :applied} =
+                     Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+            insert_revoked_history!(fixture, 128, timestamp)
+
+            Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+              Ecto.UUID.dump!(fixture.effect.id),
+              timestamp
+            ])
+          end)
+        end)
+
+        assert {:ok, page_query} =
+                 AppliedAccessVerificationQuery.new(%{
+                   as_of: timestamp,
+                   after_inserted_at: timestamp,
+                   after_id: "00000000-0000-0000-0000-000000000000",
+                   limit: 16
+                 })
+
+        for page_size <- [1, 16] do
+          query = %{page_query | limit: page_size}
+
+          sample =
+            jc248_measure_operation!(fn ->
+              Facade.verify_subscription_access_window_for_system(query)
+            end)
+
+          assert {:ok, result} = sample.result
+          assert result.healthy_count == page_size
+          assert result.raw_count == page_size
+          assert result.repairs == []
+          assert result.conflicts == []
+          assert sample.stats.query_count == 2
+          jc248_print_measurement!(sample, repetition, "healthy_verification_#{page_size}")
+        end
+
+        Sandbox.unboxed_run(Repo, fn ->
+          ids = Enum.map(fixtures, & &1.subscription.id)
+          assert {:ok, grants_query} = SubscriptionSourceVerificationQuery.new(%{source_ids: ids})
+          sorted_ids = BinaryUuidSort.sort_uuids(ids)
+          <<first::unsigned-big-128>> = Ecto.UUID.dump!(hd(sorted_ids))
+          predecessor = Ecto.UUID.load!(<<first - 1::unsigned-big-128>>)
+
+          assert {:ok, inventory_query} =
+                   SubscriptionAccessInventoryQuery.new(%{
+                     through_id: List.last(sorted_ids),
+                     after_id: predecessor,
+                     limit: 16
+                   })
+
+          for {operation, query} <- [
+                {"applied_window", AppliedAccessVerificationQuery.to_ecto(page_query)},
+                {"active_source_batch",
+                 SubscriptionSourceVerificationQuery.to_ecto(grants_query)},
+                {"authority_inventory", SubscriptionAccessInventoryQuery.to_ecto(inventory_query)}
+              ] do
+            {sql, params} = EctoSQL.to_sql(:all, Repo, query)
+
+            %{rows: [[plan]]} =
+              Repo.query!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " <> sql, params)
+
+            IO.puts(
+              "JC248_RESOURCE_QUERY_PLAN " <>
+                Jason.encode!(%{
+                  repetition: repetition,
+                  operation: operation,
+                  plan: plan,
+                  sources: 16,
+                  initially_revoked_rows_per_source: 128,
+                  explicit_statistics_refresh: false,
+                  planner_override: false,
+                  limits:
+                    "natural local plan; fixture volume and existing private diagnostic rows only"
+                })
+            )
+          end
+        end)
+
+        fixture = hd(fixtures)
+        effect_before = fetch_effect!(fixture.effect.id)
+
+        history_before =
+          grants_for_source!(fixture.subscription.id)
+          |> Enum.reject(&(&1.status == :active))
+
+        assert length(history_before) == 128
+
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.query!(
+            "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1 AND status = 'active'",
+            [Ecto.UUID.dump!(fixture.subscription.id)]
+          )
+        end)
+
+        repair_sample =
+          jc248_measure_operation!(fn ->
+            Facade.repair_applied_access_effect_for_system(fixture.effect.id)
+          end)
+
+        assert repair_sample.result == {:ok, :repaired}
+        assert fetch_effect!(fixture.effect.id) == effect_before
+        after_grants = grants_for_source!(fixture.subscription.id)
+        assert length(Enum.filter(after_grants, &(&1.status == :active))) == 1
+
+        Enum.each(history_before, fn historical ->
+          assert Enum.find(after_grants, &(&1.id == historical.id)) == historical
+        end)
+
+        jc248_print_measurement!(repair_sample, repetition, "applied_missing_grant_repair")
+
+        stale_timestamp = DateTime.add(timestamp, 1, :second)
+
+        Sandbox.unboxed_run(Repo, fn ->
+          create_newer_untransitioned_effect!(fixture)
+
+          Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+            Ecto.UUID.dump!(fixture.effect.id),
+            stale_timestamp
+          ])
+        end)
+
+        assert {:ok, stale_query} =
+                 AppliedAccessVerificationQuery.new(%{
+                   as_of: stale_timestamp,
+                   after_inserted_at: stale_timestamp,
+                   after_id: "00000000-0000-0000-0000-000000000000",
+                   limit: 1
+                 })
+
+        stale_sample =
+          jc248_measure_operation!(fn ->
+            Facade.verify_subscription_access_window_for_system(stale_query)
+          end)
+
+        assert {:ok, %{raw_count: 1, stale_count: 1, repairs: []}} = stale_sample.result
+        assert stale_sample.stats.query_count == 1
+        jc248_print_measurement!(stale_sample, repetition, "stale_verification_1")
+
+        if repetition == 2 do
+          Sandbox.unboxed_run(Repo, fn ->
+            ids = Enum.map(fixtures, & &1.subscription.id)
+
+            assert {:ok, grants_query} =
+                     SubscriptionSourceVerificationQuery.new(%{source_ids: ids})
+
+            index_metadata_before = jc248_entitlement_index_metadata!()
+
+            IO.puts(
+              "JC248_RESOURCE_INDEX_METADATA " <>
+                Jason.encode!(%{
+                  phase: "before_explicit_analyze",
+                  indexes: index_metadata_before
+                })
+            )
+
+            {sql, params} =
+              EctoSQL.to_sql(
+                :all,
+                Repo,
+                SubscriptionSourceVerificationQuery.to_ecto(grants_query)
+              )
+
+            %{rows: [[before_plan]]} =
+              Repo.query!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " <> sql, params)
+
+            IO.puts(
+              "JC248_RESOURCE_QUERY_PLAN " <>
+                Jason.encode!(%{
+                  repetition: repetition,
+                  operation: "active_source_batch_before_explicit_analyze",
+                  plan: before_plan,
+                  sources: 16,
+                  initially_revoked_rows_per_source: 128,
+                  explicit_statistics_refresh: false,
+                  planner_override: false,
+                  limits: "natural local plan before the authorized test-only ANALYZE"
+                })
+            )
+
+            Repo.query!("ANALYZE entitlement_grants")
+            index_metadata_after = jc248_entitlement_index_metadata!()
+
+            IO.puts(
+              "JC248_RESOURCE_INDEX_METADATA " <>
+                Jason.encode!(%{phase: "after_explicit_analyze", indexes: index_metadata_after})
+            )
+
+            %{rows: [[after_plan]]} =
+              Repo.query!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " <> sql, params)
+
+            IO.puts(
+              "JC248_RESOURCE_QUERY_PLAN " <>
+                Jason.encode!(%{
+                  repetition: repetition,
+                  operation: "active_source_batch_after_explicit_analyze",
+                  plan: after_plan,
+                  sources: 16,
+                  initially_revoked_rows_per_source: 128,
+                  explicit_statistics_refresh: true,
+                  planner_override: false,
+                  limits:
+                    "test-only ANALYZE of entitlement_grants; fixture volume and local plan only"
+                })
+            )
+          end)
+        end
+      after
+        Enum.each(fixtures, &cleanup_fixture!/1)
+      end
+
+      Sandbox.unboxed_run(Repo, fn ->
+        ids = Enum.map(fixtures, &Ecto.UUID.dump!(&1.subscription.id))
+
+        for {table, predicate} <- [
+              {"subscriptions", "id"},
+              {"access_effects", "subscription_id"},
+              {"entitlement_grants", "source_id"}
+            ] do
+          assert %{rows: [[0]]} =
+                   Repo.query!(
+                     "SELECT count(*) FROM " <>
+                       table <> " WHERE " <> predicate <> " = ANY($1::uuid[])",
+                     [ids]
+                   )
+        end
+      end)
+
+      IO.puts(
+        "JC248_RESOURCE_CLEANUP " <>
+          Jason.encode!(%{
+            repetition: repetition,
+            owned_subscription_rows: 0,
+            owned_effect_rows: 0,
+            owned_grant_rows: 0,
+            limits: "owned fixture identities only; unrelated database rows preserved"
+          })
+      )
+    end
+  end
+
   test "JC248 verification worker queues exact drift and reports page counts" do
     fixture = create_committed_effective_effect_fixture!("jc248_sweep_worker")
 
@@ -3128,6 +3382,187 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert grant.valid_to_at == fixture.effect.valid_until_at
     assert grant.revoked_at == nil
     assert grant.revoked_reason == nil
+  end
+
+  defp jc248_measure_operation!(operation) do
+    {pool_before, pool_baseline_wait_us, pool_baseline_polls} = jc248_wait_for_idle_pool()
+
+    task =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          :erlang.garbage_collect()
+          {:memory, memory_before} = Process.info(self(), :memory)
+          {:message_queue_len, mailbox_before} = Process.info(self(), :message_queue_len)
+          handlers_before = length(:telemetry.list_handlers([:store, :repo, :query]))
+          dictionary_before = Process.get_keys() |> MapSet.new()
+          {gc_before, words_before, _} = :erlang.statistics(:garbage_collection)
+          started = System.monotonic_time(:microsecond)
+          {result, stats} = RepoStats.capture(operation)
+          wall_us = System.monotonic_time(:microsecond) - started
+          {:memory, memory_after} = Process.info(self(), :memory)
+          :erlang.garbage_collect()
+          {:memory, memory_after_gc} = Process.info(self(), :memory)
+          {:message_queue_len, mailbox_after} = Process.info(self(), :message_queue_len)
+          handlers_after = length(:telemetry.list_handlers([:store, :repo, :query]))
+          {gc_after, words_after, _} = :erlang.statistics(:garbage_collection)
+
+          added_repo_stats_keys =
+            Process.get_keys()
+            |> MapSet.new()
+            |> MapSet.difference(dictionary_before)
+            |> Enum.filter(&jc248_repo_stats_key?/1)
+
+          assert added_repo_stats_keys == []
+          assert handlers_after == handlers_before
+          assert mailbox_before == 0
+          assert mailbox_after == 0
+          refute Repo.in_transaction?()
+
+          %{
+            result: result,
+            stats: stats,
+            wall_us: wall_us,
+            memory_before_gc_bytes: memory_before,
+            memory_after_bytes: memory_after,
+            memory_after_gc_bytes: memory_after_gc,
+            mailbox_before: mailbox_before,
+            mailbox_after: mailbox_after,
+            handlers_before: handlers_before,
+            handlers_after: handlers_after,
+            global_gc_count_delta: gc_after - gc_before,
+            global_reclaimed_words_delta: words_after - words_before,
+            transaction_after: false,
+            repo_stats_dictionary_keys_remaining: 0
+          }
+        end)
+      end)
+
+    try do
+      sample = Task.await(task, 30_000)
+      pool_wait_started = System.monotonic_time(:microsecond)
+      {pool_after, pool_return_polls} = jc248_wait_for_pool_metrics(pool_before)
+      pool_return_wait_us = System.monotonic_time(:microsecond) - pool_wait_started
+      assert pool_after == pool_before
+
+      Map.merge(sample, %{
+        pool_before: pool_before,
+        pool_after: pool_after,
+        pool_baseline_wait_us: pool_baseline_wait_us,
+        pool_baseline_polls: pool_baseline_polls,
+        pool_return_wait_us: pool_return_wait_us,
+        pool_return_polls: pool_return_polls
+      })
+    after
+      Task.shutdown(task, :brutal_kill)
+    end
+  end
+
+  defp jc248_pool_metrics do
+    meta = Ecto.Adapter.lookup_meta(Repo)
+
+    DBConnection.get_connection_metrics(meta.pid, pool: Keyword.fetch!(meta.opts, :pool))
+    |> Enum.map(fn metric ->
+      %{
+        source: jc248_pool_source(metric),
+        ready_conn_count: metric.ready_conn_count,
+        checkout_queue_length: metric.checkout_queue_length
+      }
+    end)
+    |> Enum.sort_by(&{&1.source, &1.ready_conn_count, &1.checkout_queue_length})
+  end
+
+  defp jc248_pool_source(%{source: {:proxy, _pid}}), do: "proxy"
+  defp jc248_pool_source(%{source: _source}), do: "pool"
+
+  defp jc248_repo_stats_key?(key) do
+    is_tuple(key) and tuple_size(key) > 0 and elem(key, 0) == RepoStats
+  end
+
+  defp jc248_entitlement_index_metadata! do
+    %{rows: rows, columns: columns} =
+      Repo.query!("""
+      SELECT index_class.relname AS index_name,
+             index_meta.indisvalid,
+             index_meta.indisready,
+             pg_get_expr(index_meta.indpred, index_meta.indrelid) AS predicate,
+             index_class.reltuples::bigint AS index_reltuples,
+             index_class.relpages AS index_relpages,
+             table_class.reltuples::bigint AS table_reltuples,
+             table_class.relpages AS table_relpages
+      FROM pg_index AS index_meta
+      JOIN pg_class AS index_class ON index_class.oid = index_meta.indexrelid
+      JOIN pg_class AS table_class ON table_class.oid = index_meta.indrelid
+      WHERE table_class.relname = 'entitlement_grants'
+        AND index_class.relname IN (
+          'entitlement_grants_source_index',
+          'entitlement_grants_active_subscription_source_index'
+        )
+      ORDER BY index_class.relname
+      """)
+
+    Enum.map(rows, fn row ->
+      columns |> Enum.zip(row) |> Map.new()
+    end)
+  end
+
+  defp jc248_wait_for_idle_pool(
+         deadline \\ System.monotonic_time(:millisecond) + 3_000,
+         polls \\ 0,
+         started \\ System.monotonic_time(:microsecond)
+       ) do
+    metrics = jc248_pool_metrics()
+    expected_size = Keyword.fetch!(Repo.config(), :pool_size)
+
+    if Enum.sum_by(metrics, & &1.ready_conn_count) == expected_size and
+         Enum.all?(metrics, &(&1.checkout_queue_length == 0)) do
+      {metrics, System.monotonic_time(:microsecond) - started, polls}
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk(
+          "Repo pool did not reach an idle #{expected_size}-connection baseline: #{inspect(metrics)}"
+        )
+      else
+        Process.sleep(10)
+        jc248_wait_for_idle_pool(deadline, polls + 1, started)
+      end
+    end
+  end
+
+  defp jc248_wait_for_pool_metrics(
+         expected,
+         deadline \\ System.monotonic_time(:millisecond) + 3_000,
+         polls \\ 0
+       ) do
+    current = jc248_pool_metrics()
+
+    cond do
+      current == expected ->
+        {current, polls}
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {current, polls}
+
+      true ->
+        Process.sleep(10)
+        jc248_wait_for_pool_metrics(expected, deadline, polls + 1)
+    end
+  end
+
+  defp jc248_print_measurement!(sample, repetition, operation) do
+    sample
+    |> Map.delete(:result)
+    |> Map.merge(%{
+      tag: "JC248_RESOURCE_MEASUREMENT",
+      repetition: repetition,
+      operation: operation,
+      sources: 16,
+      initially_revoked_rows_per_source: 128,
+      telemetry_time_unit: "native units",
+      limits:
+        "two equivalent bounded local repetitions; global GC is process-external; no capacity or stable-memory claim"
+    })
+    |> Jason.encode!()
+    |> IO.puts()
   end
 
   defp cleanup_fixture!(fixture) do
