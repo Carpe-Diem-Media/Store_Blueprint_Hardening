@@ -1,5 +1,5 @@
 defmodule Store.Entitlements.Queries.SubscriptionSourceVerificationQuery do
-  @moduledoc false
+  @moduledoc "Typed source IDs for a batch read of up to two active grants per source."
 
   import Ecto.Query
 

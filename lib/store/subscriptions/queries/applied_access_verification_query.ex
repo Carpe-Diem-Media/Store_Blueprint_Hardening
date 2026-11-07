@@ -1,5 +1,5 @@
 defmodule Store.Subscriptions.Queries.AppliedAccessVerificationQuery do
-  @moduledoc false
+  @moduledoc "Typed bounds for scanning an APPLIED effect window before currentness checks."
 
   import Ecto.Query
 

@@ -78,27 +78,33 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   test "verification resource actions require system context" do
     timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
-    assert {:error, reason} =
-             AccessEffect
-             |> Ash.ActionInput.for_action(
-               :read_applied_verification_window_for_system,
-               %{as_of: timestamp, limit: 1},
-               domain: Store.Subscriptions
-             )
-             |> Ash.run_action(authorize?: true)
+    assert {:ok, stats} =
+             RepoStats.capture(fn ->
+               assert {:error, reason} =
+                        AccessEffect
+                        |> Ash.ActionInput.for_action(
+                          :read_applied_verification_window_for_system,
+                          %{as_of: timestamp, limit: 1},
+                          domain: Store.Subscriptions
+                        )
+                        |> Ash.run_action(authorize?: true)
 
-    assert %Error{code: "FORBIDDEN"} = Normalize.normalize(reason)
+               assert %Error{code: "FORBIDDEN"} = Normalize.normalize(reason)
 
-    assert {:error, reason} =
-             EntitlementGrant
-             |> Ash.ActionInput.for_action(
-               :read_active_subscription_sources_for_system,
-               %{source_ids: []},
-               domain: Store.Entitlements
-             )
-             |> Ash.run_action(authorize?: true)
+               assert {:error, reason} =
+                        EntitlementGrant
+                        |> Ash.ActionInput.for_action(
+                          :read_active_subscription_sources_for_system,
+                          %{source_ids: []},
+                          domain: Store.Entitlements
+                        )
+                        |> Ash.run_action(authorize?: true)
 
-    assert %Error{code: "FORBIDDEN"} = Normalize.normalize(reason)
+               assert %Error{code: "FORBIDDEN"} = Normalize.normalize(reason)
+               :ok
+             end)
+
+    assert stats.query_count == 0
   end
 
   test "bounded verification reads retain stale window rows and return both dispositions" do
