@@ -1,8 +1,8 @@
 defmodule Store.Workers.ProcessSubscriptionRenewalWorker do
   @moduledoc false
 
-  # Cancelled occurrences require an explicit retry after reviewed provider
-  # fencing support exists; recurring sweeps must not recreate unsupported work.
+  # Retained cancelled jobs deduplicate later sweeps. Normal Oban pruning can
+  # permit another job; strict rejection still prevents provider submission.
   use Oban.Worker,
     queue: :subscriptions,
     max_attempts: 5,

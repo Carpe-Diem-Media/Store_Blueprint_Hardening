@@ -483,13 +483,6 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
   end
 
   defp create_committed_suspended_effect_fixture!(prefix) do
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
-
     fixture =
       Sandbox.unboxed_run(Repo, fn ->
         create_suspended_effect_fixture!(prefix)
@@ -517,7 +510,7 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
 
     %{subscription: subscription, order: order, line_item: line_item} =
       SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
-        provider_billing_ref: "pm_#{prefix}",
+        provider_billing_ref: nil,
         next_renewal_at: DateTime.add(setup_now, -1, :second)
       })
 
@@ -541,7 +534,7 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
       )
       |> Ash.create!(domain: Store.Entitlements, authorize?: false, context: %{system?: true})
 
-    assert {:error, %{code: "PAYMENT_FAILED"}} =
+    assert {:error, %{code: "PAYMENT_METHOD_REQUIRED"}} =
              Facade.process_due_subscription_renewal_for_system(subscription.id, now: failure_now)
 
     Repo.query!(
