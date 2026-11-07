@@ -274,25 +274,7 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchCleanupTest do
             3_000 -> raise "gate barrier timeout"
           end
 
-          case mode do
-            :owner_death ->
-              :ok
-
-            :unlock_false ->
-              assert {:ok, %{rows: [[true]]}} =
-                       Repo.query("SELECT pg_advisory_unlock($1)", [method_key(identity)])
-
-              :ok
-
-            :connection_loss ->
-              _ = Repo.query("SELECT pg_terminate_backend(pg_backend_pid())")
-              :ok
-
-            :checkout_deadline ->
-              with :ok <- Gate.confirm_dispatch_session(proof) do
-                send(parent, {ref, :unexpected_invocation})
-              end
-          end
+          apply_discard_mode(mode, identity, proof, parent, ref)
         end
       )
     end
@@ -353,6 +335,28 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchCleanupTest do
     end)
   end
 
+  defp apply_discard_mode(mode, identity, proof, parent, ref) do
+    case mode do
+      :owner_death ->
+        :ok
+
+      :unlock_false ->
+        assert {:ok, %{rows: [[true]]}} =
+                 Repo.query("SELECT pg_advisory_unlock($1)", [method_key(identity)])
+
+        :ok
+
+      :connection_loss ->
+        _ = Repo.query("SELECT pg_terminate_backend(pg_backend_pid())")
+        :ok
+
+      :checkout_deadline ->
+        with :ok <- Gate.confirm_dispatch_session(proof) do
+          send(parent, {ref, :unexpected_invocation})
+        end
+    end
+  end
+
   defp assert_keys_available!(identity, excluded_pid \\ nil) do
     keys = [binding_key(identity), method_key(identity)]
 
@@ -364,20 +368,22 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchCleanupTest do
       [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
 
       if pid == excluded_pid do
-        task =
-          Task.async(fn ->
-            Repo.checkout(fn ->
-              [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
-              assert pid != excluded_pid
-              probe_keys!(keys)
-            end)
-          end)
-
-        assert :ok = Task.await(task, 3_000)
+        assert :ok = probe_keys_on_another_backend!(keys, excluded_pid)
       else
         probe_keys!(keys)
       end
     end)
+  end
+
+  defp probe_keys_on_another_backend!(keys, excluded_pid) do
+    Task.async(fn ->
+      Repo.checkout(fn ->
+        [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+        assert pid != excluded_pid
+        probe_keys!(keys)
+      end)
+    end)
+    |> Task.await(3_000)
   end
 
   defp probe_keys!([binding, method]) do

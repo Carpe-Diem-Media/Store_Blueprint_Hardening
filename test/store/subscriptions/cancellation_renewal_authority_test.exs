@@ -2212,7 +2212,9 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
       end)
 
     assert {:ok, :processed} = renewal_result
-    assert renewal_stats.query_count <= 85
+    # Fresh dispatch adds ten fixed statements: six session-protocol statements and four
+    # current Subscription/payment-method authority reads.
+    assert renewal_stats.query_count <= 85 + 10
 
     attempt = fetch_attempt!(fixture.subscription.id)
     payment_intent = fetch_payment_intent!(attempt.payment_intent_id)

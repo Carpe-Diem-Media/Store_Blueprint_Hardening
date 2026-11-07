@@ -7,8 +7,9 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
   require Ash.Query
   alias Ecto.Adapters.SQL.Sandbox
   alias Store.Repo
-  alias Store.Subscriptions.{PaymentMethodAuthorityGate, StoredPaymentMethod, Subscription}
   alias Store.Subscriptions.Facade
+  alias Store.Subscriptions.Facade.StaleWrite
+  alias Store.Subscriptions.{PaymentMethodAuthorityGate, StoredPaymentMethod, Subscription}
   alias Store.SubscriptionsFixtures
   alias Store.Support.AshNotifications
   alias Store.TestSupport.StripeAPIStub
@@ -461,7 +462,7 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
         |> Ash.update(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
 
       assert {:error, error} = result
-      assert Store.Subscriptions.Facade.StaleWrite.stale_record_error?(error)
+      assert StaleWrite.stale_record_error?(error)
 
       assert current_subscription!(fixture).stored_payment_method_id ==
                winner.stored_payment_method_id
@@ -779,25 +780,27 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
         handler,
         events,
         fn event, _, metadata, _ ->
-          if metadata.subscription_id == fixture.subscription.id do
-            phase =
-              if List.last(event) == :renewal_charge_dispatch_claimed,
-                do: :claimed,
-                else: :released
-
-            send(parent, {ref, phase, self(), backend_pid!(), metadata, Repo.in_transaction?()})
-
-            receive do
-              {^ref, :release, ^phase} -> :ok
-            after
-              15_000 -> raise "JC290 dispatch barrier expired"
-            end
-          end
+          await_dispatch_event(fixture, ref, parent, event, metadata)
         end,
         nil
       )
 
     handler
+  end
+
+  defp await_dispatch_event(fixture, ref, parent, event, metadata) do
+    if metadata.subscription_id == fixture.subscription.id do
+      phase =
+        if List.last(event) == :renewal_charge_dispatch_claimed, do: :claimed, else: :released
+
+      send(parent, {ref, phase, self(), backend_pid!(), metadata, Repo.in_transaction?()})
+
+      receive do
+        {^ref, :release, ^phase} -> :ok
+      after
+        15_000 -> raise "JC290 dispatch barrier expired"
+      end
+    end
   end
 
   defp event_name(:claimed), do: :renewal_charge_dispatch_claimed

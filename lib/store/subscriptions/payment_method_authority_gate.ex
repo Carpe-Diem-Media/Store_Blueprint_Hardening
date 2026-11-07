@@ -49,28 +49,29 @@ defmodule Store.Subscriptions.PaymentMethodAuthorityGate do
           else
             binding = binding_key(user_id, provider)
 
-            with {:ok, %{rows: [[backend_pid]]}} <-
-                   Repo.query("SELECT pg_backend_pid()", [], timeout: @session_query_timeout_ms) do
-              with_session_key(binding, fn ->
-                with {:ok, identity} <-
-                       invoke_dispatch_callback(dispatch_ref, resolve_identity, []) do
-                  method =
-                    method_key(identity.provider, identity.customer_ref, identity.method_ref)
+            case Repo.query("SELECT pg_backend_pid()", [], timeout: @session_query_timeout_ms) do
+              {:ok, %{rows: [[backend_pid]]}} ->
+                with_session_key(binding, fn ->
+                  with {:ok, identity} <-
+                         invoke_dispatch_callback(dispatch_ref, resolve_identity, []) do
+                    method =
+                      method_key(identity.provider, identity.customer_ref, identity.method_ref)
 
-                  with_session_key(method, fn ->
-                    invoke_dispatch_callback(dispatch_ref, fun, [
-                      identity,
-                      %{
-                        backend_pid: backend_pid,
-                        binding_key: binding,
-                        method_key: method
-                      }
-                    ])
-                  end)
-                end
-              end)
-            else
-              _ -> {:error, :lock_unavailable}
+                    with_session_key(method, fn ->
+                      invoke_dispatch_callback(dispatch_ref, fun, [
+                        identity,
+                        %{
+                          backend_pid: backend_pid,
+                          binding_key: binding,
+                          method_key: method
+                        }
+                      ])
+                    end)
+                  end
+                end)
+
+              _ ->
+                {:error, :lock_unavailable}
             end
           end
         end,
@@ -144,9 +145,8 @@ defmodule Store.Subscriptions.PaymentMethodAuthorityGate do
   @doc "Acquires the binding gate until the current transaction ends; fails outside a transaction."
   @spec lock_binding_for_transaction(Ecto.UUID.t(), atom()) :: :ok | {:error, lock_error()}
   def lock_binding_for_transaction(user_id, provider) do
-    with :ok <- require_transaction(),
-         :ok <- acquire_xact(binding_key(user_id, provider)) do
-      :ok
+    with :ok <- require_transaction() do
+      acquire_xact(binding_key(user_id, provider))
     end
   end
 
@@ -154,9 +154,8 @@ defmodule Store.Subscriptions.PaymentMethodAuthorityGate do
   @spec lock_method_for_transaction(atom(), String.t(), String.t()) ::
           :ok | {:error, lock_error()}
   def lock_method_for_transaction(provider, customer_ref, payment_method_ref) do
-    with :ok <- require_transaction(),
-         :ok <- acquire_xact(method_key(provider, customer_ref, payment_method_ref)) do
-      :ok
+    with :ok <- require_transaction() do
+      acquire_xact(method_key(provider, customer_ref, payment_method_ref))
     end
   end
 

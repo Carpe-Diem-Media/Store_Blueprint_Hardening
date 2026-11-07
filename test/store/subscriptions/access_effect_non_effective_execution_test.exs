@@ -492,8 +492,7 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
 
     fixture =
       Sandbox.unboxed_run(Repo, fn ->
-        {:ok, fixture} = Repo.transaction(fn -> create_suspended_effect_fixture!(prefix) end)
-        fixture
+        create_suspended_effect_fixture!(prefix)
       end)
 
     on_exit(fn -> cleanup_fixture!(fixture) end)

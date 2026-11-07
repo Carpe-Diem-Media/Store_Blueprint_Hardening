@@ -1951,18 +1951,7 @@ defmodule Store.Subscriptions.Facade do
 
   defp persist_updated_payment_method(subscription, payment_intent) do
     case Repo.transaction(fn ->
-           case PaymentMethodAuthorityGate.lock_binding_for_transaction(
-                  subscription.user_id,
-                  subscription.provider
-                ) do
-             :ok ->
-               persist_updated_payment_method_tx(subscription, payment_intent)
-
-             {:error, _reason} ->
-               Repo.rollback(
-                 Error.new("STALE_RECORD", "payment method authority gate is unavailable")
-               )
-           end
+           persist_updated_payment_method_in_transaction(subscription, payment_intent)
          end)
          |> normalize_transaction_notifications() do
       {:ok, result, notifications} ->
@@ -1980,6 +1969,19 @@ defmodule Store.Subscriptions.Facade do
 
       {:error, reason} ->
         {:error, Normalize.normalize(reason)}
+    end
+  end
+
+  defp persist_updated_payment_method_in_transaction(subscription, payment_intent) do
+    case PaymentMethodAuthorityGate.lock_binding_for_transaction(
+           subscription.user_id,
+           subscription.provider
+         ) do
+      :ok ->
+        persist_updated_payment_method_tx(subscription, payment_intent)
+
+      {:error, _reason} ->
+        Repo.rollback(Error.new("STALE_RECORD", "payment method authority gate is unavailable"))
     end
   end
 
@@ -6831,52 +6833,7 @@ defmodule Store.Subscriptions.Facade do
   end
 
   defp dispatch_renewal_collection(subscription, plan, bound_attempt, collection, input, now) do
-    result =
-      if collection.dispatch_state == :not_started do
-        PaymentMethodAuthorityGate.with_dispatch_session_gates(
-          subscription.user_id,
-          subscription.provider,
-          fn -> current_dispatch_identity(subscription) end,
-          fn identity, proof ->
-            with {:ok, current} <- current_dispatch_identity(subscription),
-                 true <- current == identity,
-                 {:ok, claim} <-
-                   RenewalCollectionAttempts.attach_and_claim_dispatch_for_system(input) do
-              if claim.dispatch_claimed? do
-                attempt = claim.renewal_attempt || bound_attempt
-                emit_fresh_dispatch_claimed(subscription, attempt, claim)
-
-                with {:ok, payment_intent} <-
-                       maybe_submit_virtual_payment_intent(claim.payment_intent),
-                     :ok <- PaymentMethodAuthorityGate.confirm_dispatch_session(proof) do
-                  response =
-                    initiate_renewal_charge(
-                      subscription,
-                      attempt,
-                      claim.order,
-                      payment_intent,
-                      claim.provider_payment_method,
-                      claim.collection_attempt
-                    )
-
-                  {:fresh_response, attempt, claim.order, payment_intent,
-                   claim.collection_attempt, response}
-                end
-              else
-                {:existing_claim, claim}
-              end
-            else
-              false -> {:error, :method_authority_changed}
-              error -> error
-            end
-          end
-        )
-      else
-        case RenewalCollectionAttempts.attach_and_claim_dispatch_for_system(input) do
-          {:ok, claim} -> {:existing_claim, claim}
-          error -> error
-        end
-      end
+    result = claim_renewal_collection_for_dispatch(subscription, bound_attempt, collection, input)
 
     case result do
       {:fresh_response, attempt, order, payment_intent, claimed_collection, response} ->
@@ -6904,6 +6861,74 @@ defmodule Store.Subscriptions.Facade do
 
       error ->
         error
+    end
+  end
+
+  defp claim_renewal_collection_for_dispatch(
+         subscription,
+         bound_attempt,
+         %RenewalCollectionAttempt{dispatch_state: :not_started},
+         input
+       ) do
+    PaymentMethodAuthorityGate.with_dispatch_session_gates(
+      subscription.user_id,
+      subscription.provider,
+      fn -> current_dispatch_identity(subscription) end,
+      fn identity, proof ->
+        claim_fresh_renewal_collection(subscription, bound_attempt, input, identity, proof)
+      end
+    )
+  end
+
+  defp claim_renewal_collection_for_dispatch(
+         _subscription,
+         _bound_attempt,
+         %RenewalCollectionAttempt{},
+         input
+       ) do
+    case RenewalCollectionAttempts.attach_and_claim_dispatch_for_system(input) do
+      {:ok, claim} -> {:existing_claim, claim}
+      error -> error
+    end
+  end
+
+  defp claim_fresh_renewal_collection(subscription, bound_attempt, input, identity, proof) do
+    with {:ok, current} <- current_dispatch_identity(subscription),
+         true <- current == identity,
+         {:ok, claim} <- RenewalCollectionAttempts.attach_and_claim_dispatch_for_system(input) do
+      dispatch_fresh_renewal_claim(subscription, bound_attempt, claim, proof)
+    else
+      false -> {:error, :method_authority_changed}
+      error -> error
+    end
+  end
+
+  defp dispatch_fresh_renewal_claim(subscription, bound_attempt, claim, proof) do
+    case claim.dispatch_claimed? do
+      true ->
+        attempt = claim.renewal_attempt || bound_attempt
+        emit_fresh_dispatch_claimed(subscription, attempt, claim)
+        submit_fresh_renewal_claim(subscription, attempt, claim, proof)
+
+      false ->
+        {:existing_claim, claim}
+    end
+  end
+
+  defp submit_fresh_renewal_claim(subscription, attempt, claim, proof) do
+    with {:ok, payment_intent} <- maybe_submit_virtual_payment_intent(claim.payment_intent),
+         :ok <- PaymentMethodAuthorityGate.confirm_dispatch_session(proof) do
+      response =
+        initiate_renewal_charge(
+          subscription,
+          attempt,
+          claim.order,
+          payment_intent,
+          claim.provider_payment_method,
+          claim.collection_attempt
+        )
+
+      {:fresh_response, attempt, claim.order, payment_intent, claim.collection_attempt, response}
     end
   end
 

@@ -147,23 +147,16 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     assert fetch_subscription!(fixture.subscription.id).current_dunning_renewal_attempt_id ==
              attempt.id
 
-    parent = self()
-    barrier = make_ref()
-
     StripeAPIStub.stub_payment_intent(fn conn, params ->
-      send(parent, {:jc247_retry_provider_started, self(), params})
-
-      receive do
-        {:jc247_release_retry_provider, ^barrier} -> :ok
-      after
-        10_000 -> raise "retry provider barrier timed out"
-      end
-
       StripeAPIStub.json_response(
         conn,
         StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
       )
     end)
+
+    parent = self()
+    {:ok, barrier} = Agent.start_link(fn -> %{release_dispatch?: false} end)
+    handler_id = attach_dispatch_release_barrier(fixture.subscription.id, parent, barrier)
 
     retry_task =
       Task.async(fn ->
@@ -172,7 +165,16 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
         )
       end)
 
-    assert_receive {:jc247_retry_provider_started, provider_pid, _params}, 10_000
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      release_dispatch_barrier(barrier)
+
+      if Process.alive?(retry_task.pid) do
+        Task.shutdown(retry_task, :brutal_kill)
+      end
+    end)
+
+    assert_receive {:jc247_dispatch_released, ^barrier, _metadata}, 10_000
     :ok = Sandbox.allow(Store.Repo, context.sandbox_owners[Store.Repo], retry_task.pid)
 
     :ok =
@@ -183,7 +185,7 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
       [Ecto.UUID.dump!(fixture.subscription.id), Ecto.UUID.dump!(other_attempt.id)]
     )
 
-    send(provider_pid, {:jc247_release_retry_provider, barrier})
+    Agent.update(barrier, &Map.put(&1, :release_dispatch?, true))
     assert {:error, _reason} = Task.await(retry_task, 10_000)
 
     unchanged = fetch_subscription!(fixture.subscription.id)
@@ -234,13 +236,17 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
       )
     end)
 
-    {result, stats} = RepoStats.capture(fixture.run)
+    {result, stats, protocol_query_count} = capture_dispatch_query_stats(fixture.run)
 
     IO.puts("JC-235 current collection-identity failure query_count=#{stats.query_count}")
     assert {:error, %{code: "PAYMENT_FAILED"}} = result
     assert stats.query_count > 0
-    # JC247-A keep-grace establishment measured 120 queries on 2026-10-27 (was <=110 pre-JC247-A).
-    assert stats.query_count <= 122
+    # The old 122-query allowance includes the renewal workload. Fresh dispatch adds six
+    # session-protocol statements and four authority reads: PID, two acquisitions, two
+    # current identity reads, confirmation, and two unlocks. The protocol statements are
+    # counted below; the four current reads follow current_dispatch_identity/1.
+    assert protocol_query_count == 6
+    assert stats.query_count <= 122 + 10
     assert fetch_subscription!(fixture.subscription.id).status == :past_due
     assert fetch_attempt_for_subscription!(fixture.subscription.id).status == :failed
   end
@@ -505,7 +511,7 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     assert fetch_attempt!(fixture.attempt.id).status == :succeeded
     assert fetch_collection!(collection.id).financial_outcome == :verified_success
 
-    Agent.update(fixture.barrier, &Map.put(&1, :release_provider?, true))
+    Agent.update(fixture.barrier, &Map.put(&1, :release_dispatch?, true))
     assert {:ok, :processed} = Task.await(fixture.task, 10_000)
 
     final_attempt = fetch_attempt!(fixture.attempt.id)
@@ -544,7 +550,7 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     attempt_after_cancel = fetch_attempt!(fixture.attempt.id)
     [collection_after_cancel] = list_collections!(fixture.attempt.id)
 
-    Agent.update(fixture.barrier, &Map.put(&1, :release_provider?, true))
+    Agent.update(fixture.barrier, &Map.put(&1, :release_dispatch?, true))
     assert {:ok, :processed} = Task.await(fixture.task, 10_000)
 
     final_attempt = fetch_attempt!(fixture.attempt.id)
@@ -625,12 +631,10 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     parent = self()
 
     {:ok, barrier} =
-      Agent.start_link(fn -> %{release_provider?: false, started?: false, params: nil} end)
+      Agent.start_link(fn -> %{release_dispatch?: false, params: nil} end)
 
     StripeAPIStub.stub_payment_intent(fn conn, params ->
-      Agent.update(barrier, fn state -> %{state | started?: true, params: params} end)
-      send(parent, {:jc235_provider_started, params})
-      wait_until(fn -> Agent.get(barrier, & &1.release_provider?) end)
+      Agent.update(barrier, fn state -> %{state | params: params} end)
 
       StripeAPIStub.json_response(
         conn,
@@ -638,21 +642,25 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
       )
     end)
 
+    handler_id = attach_failure_dispatch_barrier(fixture.subscription.id, parent, barrier)
     task = Task.async(fixture.run)
-    assert_receive {:jc235_provider_started, params}, 10_000
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      release_dispatch_barrier(barrier)
+
+      if Process.alive?(task.pid) do
+        Task.shutdown(task, :brutal_kill)
+      end
+    end)
+
+    assert_receive {:jc235_dispatch_released, ^barrier, params}, 10_000
     :ok = Sandbox.allow(Store.Repo, sandbox_owners[Store.Repo], task.pid)
     :ok = Sandbox.allow(Store.DirectRepo, sandbox_owners[Store.DirectRepo], task.pid)
 
     attempt = fetch_attempt_for_subscription!(fixture.subscription.id)
     collection_id = Map.fetch!(params, "metadata[collection_attempt_id]")
     payment_intent_id = Map.fetch!(params, "metadata[local_intent_id]")
-
-    on_exit(fn ->
-      if Process.alive?(task.pid) do
-        Agent.update(barrier, &Map.put(&1, :release_provider?, true))
-        Task.shutdown(task, :brutal_kill)
-      end
-    end)
 
     Map.merge(fixture, %{
       task: task,
@@ -661,6 +669,95 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
       collection_id: collection_id,
       payment_intent_id: payment_intent_id
     })
+  end
+
+  defp attach_dispatch_release_barrier(subscription_id, parent, barrier) do
+    handler_id = {__MODULE__, :retry_dispatch_release, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :subscriptions, :renewal_charge_dispatch_released],
+        fn _event, _measurements, metadata, config ->
+          if metadata.subscription_id == config.subscription_id do
+            send(config.parent, {:jc247_dispatch_released, config.barrier, metadata})
+            wait_for_dispatch_release!(config.barrier)
+          end
+        end,
+        %{parent: parent, subscription_id: subscription_id, barrier: barrier}
+      )
+
+    handler_id
+  end
+
+  defp attach_failure_dispatch_barrier(subscription_id, parent, barrier) do
+    handler_id = {__MODULE__, :failure_dispatch_release, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :subscriptions, :renewal_charge_dispatch_released],
+        fn _event, _measurements, metadata, config ->
+          if metadata.subscription_id == config.subscription_id do
+            params = Agent.get(config.barrier, & &1.params)
+            send(config.parent, {:jc235_dispatch_released, config.barrier, params})
+            wait_for_dispatch_release!(config.barrier)
+          end
+        end,
+        %{parent: parent, subscription_id: subscription_id, barrier: barrier}
+      )
+
+    handler_id
+  end
+
+  defp wait_for_dispatch_release!(barrier) do
+    wait_until(fn -> Agent.get(barrier, & &1.release_dispatch?) end, 2_000)
+
+    unless Agent.get(barrier, & &1.release_dispatch?) do
+      raise "renewal dispatch release barrier timed out"
+    end
+  end
+
+  defp release_dispatch_barrier(barrier) do
+    if Process.alive?(barrier) do
+      Agent.update(barrier, &Map.put(&1, :release_dispatch?, true))
+    end
+  end
+
+  defp capture_dispatch_query_stats(fun) do
+    counter_key = {__MODULE__, :dispatch_protocol_query_count, make_ref()}
+    handler_id = {__MODULE__, :dispatch_protocol_queries, make_ref()}
+    Process.put(counter_key, 0)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :repo, :query],
+        fn _event, _measurements, metadata, config ->
+          count_dispatch_protocol_query(metadata, config)
+        end,
+        %{owner: self(), counter_key: counter_key}
+      )
+
+    try do
+      {result, stats} = RepoStats.capture(fun)
+      {result, stats, Process.get(counter_key, 0)}
+    after
+      :telemetry.detach(handler_id)
+      Process.delete(counter_key)
+    end
+  end
+
+  defp count_dispatch_protocol_query(metadata, config) do
+    if self() == config.owner do
+      query = String.downcase(metadata.query || "")
+
+      if String.contains?(query, "pg_backend_pid") or
+           String.contains?(query, "pg_try_advisory_lock") or
+           String.contains?(query, "pg_advisory_unlock") do
+        Process.put(config.counter_key, Process.get(config.counter_key, 0) + 1)
+      end
+    end
   end
 
   defp mark_collection_successful!(collection, observed_at) do
@@ -906,7 +1003,7 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
 
   defp unique_label(label), do: "#{label}_#{System.unique_integer([:positive])}"
 
-  defp wait_until(predicate, attempts \\ 200) do
+  defp wait_until(predicate, attempts) do
     if predicate.() do
       :ok
     else

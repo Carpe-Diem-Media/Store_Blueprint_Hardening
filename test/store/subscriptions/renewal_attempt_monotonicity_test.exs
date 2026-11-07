@@ -297,15 +297,21 @@ defmodule Store.Subscriptions.RenewalAttemptMonotonicityTest do
         next_renewal_at: DateTime.add(now, -10, :second)
       })
 
-    {:ok, barrier} = Agent.start_link(fn -> %{phase: :waiting} end)
+    {:ok, barrier} = Agent.start_link(fn -> %{release_dispatch?: false} end)
+    parent = self()
+    handler_id = {__MODULE__, :dispatch_release, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :subscriptions, :renewal_charge_dispatch_released],
+        fn _event, _measurements, metadata, config ->
+          await_stale_failure_dispatch(metadata, config)
+        end,
+        %{parent: parent, subscription_id: subscription.id, barrier: barrier}
+      )
 
     StripeAPIStub.stub_payment_intent(fn conn, params ->
-      Agent.update(barrier, &Map.put(&1, :phase, :at_charge))
-
-      wait_until(fn ->
-        match?(%{release_charge?: true}, Agent.get(barrier, & &1))
-      end)
-
       StripeAPIStub.payment_intent_error(
         conn,
         params,
@@ -320,9 +326,19 @@ defmodule Store.Subscriptions.RenewalAttemptMonotonicityTest do
         Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
       end)
 
-    wait_until(fn ->
-      match?(%{phase: :at_charge}, Agent.get(barrier, & &1))
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+
+      if Process.alive?(barrier) do
+        Agent.update(barrier, &Map.put(&1, :release_dispatch?, true))
+      end
+
+      if Process.alive?(renewal_task.pid) do
+        Task.shutdown(renewal_task, :brutal_kill)
+      end
     end)
+
+    assert_receive {:sbh7002_dispatch_released, ^barrier}, 10_000
 
     attempt =
       RenewalAttempt
@@ -380,7 +396,7 @@ defmodule Store.Subscriptions.RenewalAttemptMonotonicityTest do
                payment_intent_id: collection.payment_intent_id
              )
 
-    Agent.update(barrier, &Map.put(&1, :release_charge?, true))
+    Agent.update(barrier, &Map.put(&1, :release_dispatch?, true))
 
     assert {:ok, :processed} = Task.await(renewal_task, 10_000)
 
@@ -392,7 +408,19 @@ defmodule Store.Subscriptions.RenewalAttemptMonotonicityTest do
     refute reloaded_subscription.status == :past_due
   end
 
-  defp wait_until(predicate, attempts \\ 200) do
+  defp await_stale_failure_dispatch(metadata, config) do
+    if metadata.subscription_id == config.subscription_id do
+      send(config.parent, {:sbh7002_dispatch_released, config.barrier})
+
+      wait_until(fn -> Agent.get(config.barrier, & &1.release_dispatch?) end, 2_000)
+
+      unless Agent.get(config.barrier, & &1.release_dispatch?) do
+        raise "stale failure dispatch release barrier timed out"
+      end
+    end
+  end
+
+  defp wait_until(predicate, attempts) do
     if predicate.() or attempts <= 0 do
       :ok
     else

@@ -92,7 +92,7 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
              queued
              |> Ash.Changeset.for_update(
                :set_provider_billing_reference,
-               %{provider_billing_ref: "pm_sbh_10_03_target_after_queue"},
+               %{billing_status_reason: "JC_290_UNRELATED_UPDATE"},
                context: %{system?: true}
              )
              |> Ash.update(
@@ -148,8 +148,9 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
       end)
 
     assert {:ok, :processed} = renewal_result
-    # Provider outcome certification adds fixed persistence and validation work.
-    assert renewal_stats.query_count <= 100
+    # Fresh dispatch adds ten fixed statements: six session-protocol statements and four
+    # current Subscription/payment-method authority reads.
+    assert renewal_stats.query_count <= 100 + 10
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
     contract_change = fetch_contract_change!(contract_change_id)
@@ -430,8 +431,9 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
       end)
 
     assert {:ok, :processed} = result
-    # Provider outcome certification adds fixed persistence and validation work.
-    assert stats.query_count <= 93
+    # Fresh dispatch adds ten fixed statements: six session-protocol statements and four
+    # current Subscription/payment-method authority reads.
+    assert stats.query_count <= 93 + 10
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
     after_binding = fetch_subscription!(subscription.id)

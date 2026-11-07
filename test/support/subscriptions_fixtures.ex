@@ -474,8 +474,7 @@ defmodule Store.SubscriptionsFixtures do
           %{
             user_id: user_id,
             provider: provider,
-            provider_customer_ref:
-              Map.get(overrides, :provider_customer_ref, "cust_#{String.slice(user_id, 0, 8)}"),
+            provider_customer_ref: Map.get(overrides, :provider_customer_ref, "cust_#{user_id}"),
             provider_payment_method_ref: Map.get(overrides, :provider_billing_ref),
             status: Map.get(overrides, :stored_payment_method_status, :active),
             fingerprint:

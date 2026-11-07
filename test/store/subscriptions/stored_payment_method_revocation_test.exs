@@ -6,6 +6,7 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
   require Ash.Query
 
   alias Store.Payments.PaymentIntent
+  alias Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority
   alias Store.Subscriptions.Facade, as: SubscriptionsFacade
   alias Store.Subscriptions.{StoredPaymentMethod, Subscription}
   alias Store.SubscriptionsFixtures
@@ -189,7 +190,7 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
       create_changeset =
         StoredPaymentMethod
         |> Ash.Changeset.for_create(:create_or_reuse, create_attrs, context: %{system?: true})
-        |> Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority.change([], %{})
+        |> AcquireStoredPaymentMethodAuthority.change([], %{})
 
       assert {%Ash.Changeset{valid?: false}, _instructions} =
                Ash.Changeset.run_before_actions(create_changeset)
@@ -202,7 +203,7 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
         update_changeset =
           spm
           |> Ash.Changeset.for_update(action, %{}, context: %{system?: true})
-          |> Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority.change([], %{})
+          |> AcquireStoredPaymentMethodAuthority.change([], %{})
 
         assert {%Ash.Changeset{valid?: false}, _instructions} =
                  Ash.Changeset.run_before_actions(update_changeset)
