@@ -2749,27 +2749,7 @@ defmodule Store.Subscriptions.Facade do
         |> Ash.Query.for_read(:read_due_for_system, args)
         |> Ash.Query.load([:subscription_plan])
 
-      selected_limit = Ash.Query.get_argument(query, :limit) || @default_due_limit
-
-      case Ash.read(query, domain: Subscriptions, authorize?: false, context: %{system?: true}) do
-        {:ok, due_subscriptions} ->
-          with {:ok, jobs} <- build_due_renewal_jobs(due_subscriptions, now) do
-            cursor =
-              if length(due_subscriptions) == selected_limit do
-                last = List.last(due_subscriptions)
-                %{timestamp: last.next_renewal_at, id: last.id}
-              end
-
-            {:ok, %{jobs: Enum.reverse(jobs), cursor: cursor, now: now}}
-          else
-            {:error, reason} -> {:error, Normalize.normalize(reason)}
-          end
-
-        {:error, reason} ->
-          {:error, Normalize.normalize(reason)}
-      end
-    else
-      {:error, _reason} = error -> error
+      read_due_renewal_job_page(query, now)
     end
   end
 
@@ -2777,13 +2757,33 @@ defmodule Store.Subscriptions.Facade do
     {:error, Error.new("VALIDATION_ERROR", "due renewal page options must be a keyword list")}
   end
 
-  defp validate_due_page_now(%DateTime{} = now) do
-    try do
-      DateTime.to_unix(now, :microsecond)
-      :ok
-    rescue
-      _ -> {:error, Error.new("VALIDATION_ERROR", "now must be a valid DateTime")}
+  defp read_due_renewal_job_page(query, now) do
+    with {:ok, due_subscriptions} <-
+           Ash.read(query, domain: Subscriptions, authorize?: false, context: %{system?: true}),
+         {:ok, jobs} <- build_due_renewal_jobs(due_subscriptions, now) do
+      {:ok,
+       %{
+         jobs: Enum.reverse(jobs),
+         cursor: due_renewal_cursor(due_subscriptions, Ash.Query.get_argument(query, :limit)),
+         now: now
+       }}
+    else
+      {:error, reason} -> {:error, Normalize.normalize(reason)}
     end
+  end
+
+  defp due_renewal_cursor(subscriptions, limit) when length(subscriptions) == limit do
+    last = List.last(subscriptions)
+    %{timestamp: last.next_renewal_at, id: last.id}
+  end
+
+  defp due_renewal_cursor(_subscriptions, _limit), do: nil
+
+  defp validate_due_page_now(%DateTime{} = now) do
+    DateTime.to_unix(now, :microsecond)
+    :ok
+  rescue
+    _ -> {:error, Error.new("VALIDATION_ERROR", "now must be a valid DateTime")}
   end
 
   defp validate_due_page_now(_now),
