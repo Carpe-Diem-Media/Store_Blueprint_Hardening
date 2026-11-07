@@ -22,13 +22,13 @@ After commit, use the shared notification wrapper and Entitlements invalidation/
 
 ## Bounded discovery
 
-Verification walks immutable `(inserted_at, id)` keysets over current APPLIED effects, using a fixed sweep high-water and a limit no greater than 500. A query-level latest-source predicate avoids loading every effect history. Batch-read actual active grants for each page, then compare source-local target equality. Healthy candidates must not cause per-source database round trips. Only mismatches enter isolated, fence-checked repair transactions.
+Verification walks immutable `(inserted_at, id)` keysets over APPLIED effects, using a fixed sweep high-water and a limit no greater than 500. Limit the scanned key window before checking latest-source authority, so a page of historical effects cannot trigger an unbounded search for current rows. Advance the cursor across the whole window even when every row is stale. Check currentness within that bounded query, then batch-read at most two active grants per current source. Two rows already prove a mismatch against Store's zero-or-one target. Healthy candidates must not cause per-source database round trips. Only mismatches enter isolated, fence-checked repair transactions.
 
 Add the smallest required APPLIED verification index and keep its Ash snapshot/migration aligned. Use the existing source identity indexes for exact lookups. If the bounded batch read needs another index to avoid source-history work, include only that index and demonstrate the query shape with EXPLAIN. Do not introduce OFFSET, a global reconciliation lock, another pool, service or dependency.
 
 An Oban sweep worker continues bounded pages and periodically restarts a complete sweep. Cursors record operational progress only. Losing a cursor can repeat work but cannot erase a target or make grants authoritative. Preserve finite execution failure as unresolved work, never manufactured APPLIED state. Reuse the existing nonterminal recovery lane and prove old/exhausted obligations remain discoverable.
 
-Missing-effect inventory is diagnostic. The schema has no rollout or backfill marker, so absence alone cannot distinguish legacy rows, ordinary pre-access states and a violated transition invariant. Report that absence and available immutable provenance without granting, revoking, synthesizing effects or changing aggregate versions. A source-specific repair with no target fails closed. No one-time backfill is authorized by this design.
+Missing-effect inventory is diagnostic. Walk bounded Subscription primary-key windows before testing effect absence, with a fixed upper UUID captured at sweep start. Advance past healthy rows as well as missing-authority rows. The schema has no rollout or backfill marker, so absence alone cannot distinguish legacy rows, ordinary pre-access states and a violated transition invariant. Report that absence and available immutable provenance without granting, revoking, synthesizing effects or changing aggregate versions. A source-specific repair with no target fails closed. No one-time backfill is authorized by this design.
 
 ## Proof and review
 

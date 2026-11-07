@@ -73,6 +73,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
                     _at}
 
     repaired_grants = grants_for_source!(fixture.subscription.id)
+    assert {:ok, true} = Cachex.put(Cache, Cache.cache_key(user_id), :jc248_stale_replay)
 
     assert {:ok, :already_converged} =
              Sandbox.unboxed_run(Repo, fn ->
@@ -81,6 +82,10 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
 
     assert grants_for_source!(fixture.subscription.id) == repaired_grants
     assert fetch_effect!(fixture.effect.id) == effect_snapshot
+    assert {:ok, nil} = Cachex.get(Cache, Cache.cache_key(user_id))
+
+    assert_receive {:entitlements_invalidated, ^user_id, "subscription_source_reconciliation",
+                    _at}
   end
 
   test "APPLIED source repair restores the exact target validity interval" do
