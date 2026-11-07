@@ -94,7 +94,7 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
         ]
       )
 
-      Req.Test.json(conn, response)
+      StripeAPIStub.json_response(conn, response)
     end)
 
     assert {:ok, result} =
@@ -146,7 +146,7 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
         ]
       )
 
-      Req.Test.json(conn, response)
+      StripeAPIStub.json_response(conn, response)
     end)
 
     fixtures_and_results =
