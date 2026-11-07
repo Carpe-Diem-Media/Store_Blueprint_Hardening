@@ -342,7 +342,7 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
                owner_input
              )
 
-    assert_queued_variant_change!(owner_result, owner_target.id)
+    assert_queued_variant_change!(owner_result, owner_target.id, owner_fixture.subscription.id)
 
     admin = actor_with_role!(:admin, "jc258_variant_admin")
     admin_fixture = subscription_fixture!("jc258_variant_admin")
@@ -356,7 +356,7 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
                admin_input
              )
 
-    assert_queued_variant_change!(admin_result, admin_target.id)
+    assert_queued_variant_change!(admin_result, admin_target.id, admin_fixture.subscription.id)
 
     non_owner = SubscriptionsFixtures.create_customer!("jc258_variant_non_owner")
     non_owner_fixture = subscription_fixture!("jc258_variant_non_owner_target")
@@ -461,6 +461,7 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
   end
 
   defp assert_queued_plan_change!(result, target_plan_id, target_revision_id, fixture) do
+    assert result.id == fixture.subscription.id
     assert result.pending_subscription_plan_id == target_plan_id
     refute result.pending_subscription_plan_id == fixture.subscription.subscription_plan_id
     change = fetch_contract_change!(result.current_contract_change_id)
@@ -468,15 +469,24 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
     assert change.status == :queued
     assert change.instruction_kind == :plan_change
     assert change.target_plan_revision_id == target_revision_id
+
+    persisted = fetch_subscription!(fixture.subscription.id)
+    assert persisted.pending_subscription_plan_id == target_plan_id
+    assert persisted.current_contract_change_id == change.id
   end
 
-  defp assert_queued_variant_change!(result, target_variant_id) do
+  defp assert_queued_variant_change!(result, target_variant_id, subscription_id) do
+    assert result.id == subscription_id
     assert result.pending_variant_id == target_variant_id
     change = fetch_contract_change!(result.current_contract_change_id)
-    assert change.subscription_id == result.id
+    assert change.subscription_id == subscription_id
     assert change.status == :queued
     assert change.instruction_kind == :variant_change
     assert change.target_variant_id == target_variant_id
+
+    persisted = fetch_subscription!(subscription_id)
+    assert persisted.pending_variant_id == target_variant_id
+    assert persisted.current_contract_change_id == change.id
   end
 
   defp assert_unchanged_subscription!(before) do
