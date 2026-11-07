@@ -147,12 +147,12 @@ defmodule Store.Subscriptions.JC290DispatchRuntimeConfigTest do
   defp primary_pool_size(config), do: Keyword.fetch!(primary_repo(config), :pool_size)
 
   defp assert_topology(config, mode) do
-    store = Keyword.fetch!(config, :store)
-    assert Keyword.fetch!(store, :database_pool_mode) == mode
-
-    assert Keyword.has_key?(Keyword.fetch!(store, Store.Repo), :prepare) ==
+    assert Keyword.has_key?(Keyword.fetch!(Keyword.fetch!(config, :store), Store.Repo), :prepare) ==
              (mode == "transaction")
 
-    refute Keyword.has_key?(Keyword.fetch!(store, Store.DirectRepo), :prepare)
+    refute Keyword.has_key?(
+             Keyword.fetch!(Keyword.fetch!(config, :store), Store.DirectRepo),
+             :prepare
+           )
   end
 end

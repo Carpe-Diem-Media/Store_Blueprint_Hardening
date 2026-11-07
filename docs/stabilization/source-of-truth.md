@@ -59,8 +59,8 @@ Based on `config/runtime.exs`:
   - `DATABASE_URL`, optional `ECTO_IPV6`, `POOL_SIZE`
   - `STORE_DB_POOL_MODE` supports `session` or `transaction`
   - `POOL_SIZE` must be at least 3, leaving at least two primary Repo connections outside subscription workers
-  - In `transaction` mode, `Store.Repo` uses `prepare: :unnamed`; the renewal facade rejects fresh renewal POSTs unless the declared mode is `session`
-  - `session` mode requires a direct PostgreSQL endpoint or a session-pooled endpoint; the declared mode does not detect an undeclared proxy topology
+  - In `transaction` mode, `Store.Repo` uses `prepare: :unnamed`
+  - Fresh off-session renewal dispatch returns `RENEWAL_DISPATCH_UNAVAILABLE` in every database mode because no installed provider implements the required revocation fence. Changing pool mode cannot enable it. Exact-ID observation and checkpoint-D application of existing collections remain available.
   - `STORE_SUBSCRIPTIONS_QUEUE_LIMIT` optionally overrides the automatic subscriptions queue limit and must be a positive integer no greater than `POOL_SIZE - 2`
 - Payments:
   - enabled providers from `STORE_PAYMENTS_ENABLED_PROVIDERS`

@@ -1,10 +1,16 @@
 defmodule Store.Workers.ProcessSubscriptionRenewalWorker do
   @moduledoc false
 
+  # Cancelled occurrences require an explicit retry after reviewed provider
+  # fencing support exists; recurring sweeps must not recreate unsupported work.
   use Oban.Worker,
     queue: :subscriptions,
     max_attempts: 5,
-    unique: [period: :infinity, fields: [:worker, :args]]
+    unique: [
+      period: :infinity,
+      fields: [:worker, :args],
+      states: [:suspended, :available, :scheduled, :executing, :retryable, :completed, :cancelled]
+    ]
 
   alias Store.Subscriptions.Facade, as: SubscriptionsFacade
 
@@ -18,9 +24,22 @@ defmodule Store.Workers.ProcessSubscriptionRenewalWorker do
       end
 
     case SubscriptionsFacade.process_due_subscription_renewal_for_system(subscription_id, opts) do
-      {:ok, :processed} -> :ok
-      {:ok, :noop} -> :ok
-      {:error, reason} -> {:error, reason}
+      {:ok, :processed} ->
+        :ok
+
+      {:ok, :noop} ->
+        :ok
+
+      {:error,
+       %{
+         code: "RENEWAL_DISPATCH_UNAVAILABLE",
+         meta: %{reason: :provider_revocation_fencing_unsupported} = meta
+       } = reason}
+      when not is_map_key(meta, :cleanup_failure) and not is_map_key(meta, :preflight_failure) ->
+        {:cancel, reason}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
