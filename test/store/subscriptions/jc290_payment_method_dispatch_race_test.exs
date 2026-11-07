@@ -10,6 +10,7 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
   alias Store.Repo
   alias Store.Subscriptions.Facade
   alias Store.Subscriptions.Facade.StaleWrite
+  alias Store.Subscriptions.Inputs.StartSubscriptionPaymentMethodUpdateInput
   alias Store.Subscriptions.{PaymentMethodAuthorityGate, StoredPaymentMethod, Subscription}
   alias Store.SubscriptionsFixtures
   alias Store.Support.AshNotifications
@@ -30,6 +31,116 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
     on_exit(fn -> Sandbox.stop_owner(owner) end)
     StripeAPIStub.setup_default(context)
     :ok
+  end
+
+  test "concurrent setup starts serialize and persist separate generations" do
+    fixture = create_dispatch_fixture!("setup_start_race")
+    ref = make_ref()
+    parent = self()
+    barrier_key = PaymentMethodAuthorityGate.binding_key(fixture.customer.id, :stripe)
+    handler = attach_setup_start_barrier!(ref, parent, barrier_key)
+    setup_tasks_key = {ref, :setup_tasks}
+    provider_callbacks_key = {ref, :provider_callbacks}
+
+    StripeAPIStub.stub_setup_intent(fn conn, params ->
+      local_id = params["metadata[local_intent_id]"]
+      backend_pid = Process.get({__MODULE__, ref, :setup_backend_pid})
+      send(parent, {ref, :setup_provider_post, self(), backend_pid, local_id})
+
+      receive do
+        {^ref, :release_provider, ^local_id} -> :ok
+        {^ref, :release_all_provider_posts} -> :ok
+      after
+        20_000 -> raise "JC290 setup provider barrier expired"
+      end
+
+      StripeAPIStub.json_response(conn, StripeAPIStub.setup_intent_response(params))
+    end)
+
+    first = start_setup_task(fixture, ref, :first)
+    Process.put(setup_tasks_key, [first])
+
+    try do
+      assert_receive {^ref, :setup_lock_claimed, first_pg}, 10_000
+      second = start_setup_task(fixture, ref, :second, self())
+      Process.put(setup_tasks_key, [second | Process.get(setup_tasks_key)])
+      assert_receive {^ref, :setup_backend, :second, second_pg}, 10_000
+      refute first_pg == second_pg
+
+      assert_eventually(fn ->
+        Repo.query!("SELECT $1::integer = ANY(pg_blocking_pids($2::integer))", [
+          first_pg,
+          second_pg
+        ]).rows == [[true]]
+      end)
+
+      send(first.pid, {ref, :release_setup_lock})
+
+      assert_receive {^ref, :setup_provider_post, first_provider, ^first_pg, first_local_id},
+                     10_000
+
+      Process.put(provider_callbacks_key, [first_provider])
+
+      assert [[nil]] ==
+               Repo.query!("SELECT xact_start FROM pg_stat_activity WHERE pid = $1", [
+                 first_pg
+               ]).rows
+
+      assert_receive {^ref, :setup_provider_post, second_provider, ^second_pg, second_local_id},
+                     10_000
+
+      Process.put(provider_callbacks_key, [second_provider | Process.get(provider_callbacks_key)])
+
+      assert [[nil]] ==
+               Repo.query!("SELECT xact_start FROM pg_stat_activity WHERE pid = $1", [
+                 second_pg
+               ]).rows
+
+      committed_first = fetch_setup_intent!(first_local_id)
+      committed_second = fetch_setup_intent!(second_local_id)
+
+      assert committed_second.subscription_setup_generation ==
+               committed_first.subscription_setup_generation + 1
+
+      assert current_subscription!(fixture).payment_method_setup_generation ==
+               committed_second.subscription_setup_generation
+
+      send(first_provider, {ref, :release_provider, first_local_id})
+      send(second_provider, {ref, :release_provider, second_local_id})
+      assert {:ok, first_result} = Task.await(first, 20_000)
+      assert {:ok, second_result} = Task.await(second, 20_000)
+
+      first_intent = fetch_setup_intent!(first_result.payment_intent_id)
+      second_intent = fetch_setup_intent!(second_result.payment_intent_id)
+      first_generation = Map.get(first_intent, :subscription_setup_generation)
+      second_generation = Map.get(second_intent, :subscription_setup_generation)
+
+      assert first_intent.id != second_intent.id
+      assert first_intent.payment_intent_key != second_intent.payment_intent_key
+      assert is_integer(first_generation) and first_generation > 0
+      assert second_generation == first_generation + 1
+
+      assert first_intent.payment_intent_key ==
+               "pm-update:v2:#{fixture.subscription.id}:#{first_generation}"
+
+      assert second_intent.payment_intent_key ==
+               "pm-update:v2:#{fixture.subscription.id}:#{second_generation}"
+    after
+      :telemetry.detach(handler)
+      release_pending_setup_provider_posts(ref)
+
+      for task <- Process.delete(setup_tasks_key) || [] do
+        send(task.pid, {ref, :release_setup_lock})
+        send(task.pid, {ref, :release_all_provider_posts})
+        Task.shutdown(task, :brutal_kill)
+      end
+
+      for callback <- Process.delete(provider_callbacks_key) || [] do
+        send(callback, {ref, :release_all_provider_posts})
+      end
+
+      cleanup_dispatch_fixture!(fixture)
+    end
   end
 
   test "a dispatch blocks replacement through POST and applies success after replacement" do
@@ -889,6 +1000,79 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
     handler
   end
 
+  defp attach_setup_start_barrier!(ref, parent, lock_key) do
+    handler = {__MODULE__, ref, :setup_start}
+    process_key = {__MODULE__, ref, :setup_lock_seen}
+    owner_key = {__MODULE__, ref, :setup_lock_barrier_owner}
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:store, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          query = metadata.query || ""
+
+          if String.contains?(query, "pg_advisory_xact_lock") and
+               Enum.any?(metadata.params || [], &(&1 == lock_key)) and
+               Process.get(owner_key) == true and
+               Process.get(process_key) != true do
+            Process.put(process_key, true)
+            send(parent, {ref, :setup_lock_claimed, backend_pid!()})
+
+            receive do
+              {^ref, :release_setup_lock} -> :ok
+            after
+              15_000 -> raise "JC290 setup-start barrier expired"
+            end
+          end
+        end,
+        nil
+      )
+
+    handler
+  end
+
+  defp start_setup_task(fixture, ref, label, parent \\ self()) do
+    Task.async(fn ->
+      Repo.checkout(
+        fn -> run_setup_start(fixture, ref, label, parent) end,
+        timeout: 30_000
+      )
+    end)
+  end
+
+  defp run_setup_start(fixture, ref, label, parent) do
+    backend_pid = backend_pid!()
+    Process.put({__MODULE__, ref, :setup_lock_barrier_owner}, label == :first)
+    Process.put({__MODULE__, ref, :setup_backend_pid}, backend_pid)
+    if label == :second, do: send(parent, {ref, :setup_backend, label, backend_pid})
+
+    input = %StartSubscriptionPaymentMethodUpdateInput{subscription_id: fixture.subscription.id}
+
+    Facade.start_subscription_payment_method_update_for_user(
+      fixture.customer,
+      fixture.subscription.id,
+      input
+    )
+  end
+
+  defp release_pending_setup_provider_posts(ref) do
+    receive do
+      {^ref, :setup_provider_post, callback, _backend_pid, _local_id} ->
+        send(callback, {ref, :release_all_provider_posts})
+        release_pending_setup_provider_posts(ref)
+    after
+      0 ->
+        :ok
+    end
+  end
+
+  defp fetch_setup_intent!(id) do
+    Store.Payments.PaymentIntent
+    |> Ash.Query.filter(expr(id == ^id))
+    |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+  end
+
   defp await_dispatch_event(fixture, ref, parent, event, metadata) do
     if metadata.subscription_id == fixture.subscription.id do
       phase =
@@ -1483,6 +1667,15 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
              ])
 
              Repo.query!("DELETE FROM subscription_items WHERE subscription_id = $1", [
+               subscription_id
+             ])
+
+             Repo.query!(
+               "DELETE FROM payment_attempts WHERE payment_intent_id IN (SELECT id FROM payment_intents WHERE subscription_id = $1)",
+               [subscription_id]
+             )
+
+             Repo.query!("DELETE FROM payment_intents WHERE subscription_id = $1", [
                subscription_id
              ])
 

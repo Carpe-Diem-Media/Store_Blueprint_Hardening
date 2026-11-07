@@ -25,6 +25,8 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
   alias Store.Shipping.Facade, as: ShippingFacade
   alias Store.Shipping.Inputs.QuoteRequest
   alias Store.Shipping.{ShippingMethod, ShippingRateRule, ShippingZone}
+  alias Store.Subscriptions.Facade, as: SubscriptionsFacade
+  alias Store.Subscriptions.Inputs.StartSubscriptionPaymentMethodUpdateInput
   alias Store.Subscriptions.{StoredPaymentMethod, Subscription}
   alias Store.SubscriptionsFixtures
   alias Store.Support.Errors.Error
@@ -686,27 +688,16 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
     assert past_due_subscription.status == :past_due
     assert past_due_subscription.dunning_attempt_count == 1
 
-    payment_intent =
-      PaymentIntent
-      |> Ash.Changeset.for_create(
-        :create,
-        %{
-          provider: :stripe,
-          purpose: :subscription_payment_method_update,
-          subscription_id: past_due_subscription.id,
-          provider_customer_ref: "cus_setup_retry_001",
-          amount_received_minor: 0,
-          currency: "USD",
-          payment_intent_key: "setup-webhook:#{past_due_subscription.id}"
-        },
-        context: %{system?: true}
-      )
-      |> Ash.create!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-      |> then(fn created ->
-        created
-        |> Ash.Changeset.for_update(:submit, %{}, context: %{system?: true})
-        |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-      end)
+    assert {:ok, setup_result} =
+             SubscriptionsFacade.start_subscription_payment_method_update_for_user(
+               customer,
+               past_due_subscription.id,
+               %StartSubscriptionPaymentMethodUpdateInput{
+                 subscription_id: past_due_subscription.id
+               }
+             )
+
+    payment_intent = fetch_payment_intent!(setup_result.payment_intent_id)
 
     raw_body =
       Jason.encode!(%{
@@ -715,7 +706,7 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
         "type" => "setup_intent.succeeded",
         "data" => %{
           "object" => %{
-            "id" => "seti_provider_success_001",
+            "id" => payment_intent.provider_payment_id,
             "currency" => "usd",
             "customer" => "cus_setup_retry_001",
             "payment_method" => "pm_setup_retry_001",
@@ -749,7 +740,7 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
 
     updated_intent = fetch_payment_intent!(payment_intent.id)
     assert updated_intent.state == :succeeded
-    assert updated_intent.provider_payment_id == "seti_provider_success_001"
+    assert updated_intent.provider_payment_id == payment_intent.provider_payment_id
     assert updated_intent.provider_payment_method_ref == "pm_setup_retry_001"
 
     updated_subscription = fetch_subscription!(past_due_subscription.id)
@@ -759,9 +750,61 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
     assert updated_subscription.billing_status_reason == nil
     assert DateTime.compare(updated_subscription.next_retry_at, DateTime.utc_now()) in [:lt, :eq]
 
-    assert_enqueued(
+    retry_args = %{"subscription_id" => past_due_subscription.id}
+
+    retry_jobs = fn ->
+      all_enqueued(worker: ProcessSubscriptionRenewalWorker)
+      |> Enum.filter(&(&1.args["subscription_id"] == past_due_subscription.id))
+    end
+
+    assert [retry_job] = retry_jobs.()
+    applied_version = updated_subscription.aggregate_version
+    binding = updated_subscription.provider_billing_ref
+
+    assert 1 ==
+             Store.DirectRepo.query!("DELETE FROM oban_jobs WHERE id = $1", [retry_job.id]).num_rows
+
+    assert retry_jobs.() == []
+
+    assert :ok =
+             SubscriptionsFacade.handle_payment_method_update_succeeded_for_system(
+               payment_intent.id
+             )
+
+    assert fetch_subscription!(past_due_subscription.id).aggregate_version == applied_version
+    assert fetch_subscription!(past_due_subscription.id).provider_billing_ref == binding
+    assert [replacement_retry_job] = retry_jobs.()
+    refute replacement_retry_job.id == retry_job.id
+
+    assert {:ok, _newer_setup} =
+             SubscriptionsFacade.start_subscription_payment_method_update_for_user(
+               customer,
+               past_due_subscription.id,
+               %StartSubscriptionPaymentMethodUpdateInput{
+                 subscription_id: past_due_subscription.id
+               }
+             )
+
+    after_new_start = fetch_subscription!(past_due_subscription.id).aggregate_version
+
+    assert 1 ==
+             Store.DirectRepo.query!("DELETE FROM oban_jobs WHERE id = $1", [
+               replacement_retry_job.id
+             ]).num_rows
+
+    assert retry_jobs.() == []
+
+    assert :ok =
+             SubscriptionsFacade.handle_payment_method_update_succeeded_for_system(
+               payment_intent.id
+             )
+
+    assert fetch_subscription!(past_due_subscription.id).aggregate_version == after_new_start
+    assert retry_jobs.() == []
+
+    refute_enqueued(
       worker: ProcessSubscriptionRenewalWorker,
-      args: %{"subscription_id" => past_due_subscription.id}
+      args: retry_args
     )
 
     assert 1 ==

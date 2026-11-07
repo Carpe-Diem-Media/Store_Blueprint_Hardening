@@ -748,6 +748,14 @@ defmodule Store.Subscriptions.Facade do
      )}
   end
 
+  @doc """
+  Starts a payment method setup for the subscription's owner.
+
+  Each accepted start supersedes older setups before provider creation. Provider
+  failure keeps that newer authority committed and leaves the current binding.
+  Calls inside an existing Repo transaction return `VALIDATION_ERROR` before writes
+  or provider requests.
+  """
   @spec start_subscription_payment_method_update_for_user(
           map(),
           Ecto.UUID.t(),
@@ -774,6 +782,10 @@ defmodule Store.Subscriptions.Facade do
      )}
   end
 
+  @doc """
+  Starts an authorized admin setup with the same supersession and transaction
+  contract as `start_subscription_payment_method_update_for_user/3`.
+  """
   @spec start_subscription_payment_method_update_for_admin(
           map(),
           Ecto.UUID.t(),
@@ -800,6 +812,14 @@ defmodule Store.Subscriptions.Facade do
      )}
   end
 
+  @doc """
+  Applies a succeeded setup's current binding once.
+
+  Binding writes and the application marker commit together. Historical and
+  superseded setups keep their success evidence and return without changing the
+  binding. Applied replay may recover retry enqueue only while its generation and
+  exact binding remain current.
+  """
   @spec handle_payment_method_update_succeeded_for_system(Ecto.UUID.t()) ::
           :ok | {:error, Error.t() | term()}
   def handle_payment_method_update_succeeded_for_system(payment_intent_id)
@@ -809,6 +829,7 @@ defmodule Store.Subscriptions.Facade do
          :ok <- ensure_setup_payment_intent(payment_intent),
          {:ok, %Subscription{} = subscription} <-
            fetch_subscription_for_renewal(payment_intent.subscription_id),
+         :ok <- ensure_setup_payment_intent_succeeded(payment_intent),
          {:ok, result} <- persist_updated_payment_method(subscription, payment_intent) do
       maybe_enqueue_immediate_collection_retry(result.subscription, result.retry_now?)
     end
@@ -1709,15 +1730,25 @@ defmodule Store.Subscriptions.Facade do
   defp retry_now?(%Subscription{}), do: false
 
   defp start_payment_method_update(%Subscription{} = subscription) do
-    with :ok <- ensure_payment_method_update_supported(subscription),
-         payment_intent_key <- payment_method_update_intent_key(subscription.id),
-         {:ok, payment_intent} <-
-           create_subscription_payment_method_update_intent(subscription, payment_intent_key),
+    if Repo.in_transaction?() do
+      {:error,
+       Error.new(
+         "VALIDATION_ERROR",
+         "payment method setup must start outside an existing database transaction"
+       )}
+    else
+      start_payment_method_update_after_transaction_check(subscription)
+    end
+  end
+
+  defp start_payment_method_update_after_transaction_check(%Subscription{} = subscription) do
+    with {:ok, %{subscription: current, payment_intent: payment_intent}} <-
+           create_subscription_setup_local_transaction(subscription),
          {:ok, provider_payload} <-
            create_subscription_payment_method_update_provider_intent(
-             subscription,
+             current,
              payment_intent,
-             payment_intent_key
+             payment_intent.payment_intent_key
            ),
          {:ok, payment_intent} <-
            persist_setup_intent_provider_reference(payment_intent, provider_payload),
@@ -1732,24 +1763,107 @@ defmodule Store.Subscriptions.Facade do
     end
   end
 
-  defp create_subscription_payment_method_update_intent(subscription, payment_intent_key) do
+  defp create_subscription_setup_local_transaction(%Subscription{} = subscription) do
+    result =
+      Repo.transaction(fn ->
+        with :ok <-
+               PaymentMethodAuthorityGate.lock_binding_for_transaction(
+                 subscription.user_id,
+                 subscription.provider
+               ),
+             {:ok, current} <- fetch_subscription_for_renewal(subscription.id),
+             :ok <- ensure_payment_method_update_supported(current),
+             {:ok, advanced, generation_notifications} <-
+               advance_payment_method_setup_generation(current),
+             payment_intent_key <-
+               payment_method_update_intent_key(
+                 advanced.id,
+                 advanced.payment_method_setup_generation
+               ),
+             {:ok, payment_intent, intent_notifications} <-
+               create_subscription_payment_method_update_intent(
+                 advanced,
+                 advanced.payment_method_setup_generation,
+                 payment_intent_key
+               ) do
+          {:ok,
+           %{
+             subscription: advanced,
+             payment_intent: payment_intent,
+             notifications: generation_notifications ++ intent_notifications
+           }}
+        else
+          {:error, reason} when reason in [:lock_unavailable, :transaction_required] ->
+            Repo.rollback(
+              Error.new("STALE_RECORD", "payment method authority gate is unavailable")
+            )
+
+          {:error, reason} ->
+            Repo.rollback(Normalize.normalize(reason))
+        end
+      end)
+      |> normalize_transaction_notifications()
+
+    case result do
+      {:ok, setup, notifications} ->
+        :ok =
+          AshNotifications.notify_post_commit(notifications,
+            context: %{
+              flow: :start_subscription_payment_method_update,
+              subscription_id: setup.subscription.id,
+              payment_intent_id: setup.payment_intent.id
+            }
+          )
+
+        {:ok, setup}
+
+      {:error, reason} ->
+        {:error, Normalize.normalize(reason)}
+    end
+  end
+
+  defp advance_payment_method_setup_generation(%Subscription{} = subscription) do
+    subscription
+    |> Ash.Changeset.for_update(:advance_payment_method_setup_generation, %{},
+      context: %{system?: true}
+    )
+    |> Ash.update(
+      domain: Subscriptions,
+      authorize?: false,
+      context: %{system?: true},
+      return_notifications?: true
+    )
+    |> normalize_subscription_update_with_notifications(subscription)
+  end
+
+  defp create_subscription_payment_method_update_intent(
+         subscription,
+         setup_generation,
+         payment_intent_key
+       ) do
     PaymentIntent
     |> Ash.Changeset.for_create(
-      :create,
+      :create_subscription_setup,
       %{
         provider: subscription.provider,
-        purpose: :subscription_payment_method_update,
         subscription_id: subscription.id,
         amount_received_minor: 0,
         currency: subscription.renewal_currency || "USD",
         provider_customer_ref: subscription.provider_customer_ref,
-        payment_intent_key: payment_intent_key
+        payment_intent_key: payment_intent_key,
+        subscription_setup_generation: setup_generation
       },
       context: %{system?: true}
     )
-    |> Ash.create(domain: Store.Payments, authorize?: false, context: %{system?: true})
+    |> Ash.create(
+      domain: Store.Payments,
+      authorize?: false,
+      context: %{system?: true},
+      return_notifications?: true
+    )
+    |> unwrap_create_with_notifications()
     |> case do
-      {:ok, payment_intent} -> {:ok, payment_intent}
+      {:ok, payment_intent, notifications} -> {:ok, payment_intent, notifications}
       {:error, reason} -> {:error, Normalize.normalize(reason)}
     end
   end
@@ -1913,8 +2027,8 @@ defmodule Store.Subscriptions.Facade do
   defp pending_or_nil(value) when is_binary(value), do: value
   defp pending_or_nil(_value), do: nil
 
-  defp payment_method_update_intent_key(subscription_id) do
-    "pm-update:#{subscription_id}:#{System.unique_integer([:positive])}"
+  defp payment_method_update_intent_key(subscription_id, generation) do
+    "pm-update:v2:#{subscription_id}:#{generation}"
   end
 
   defp stripe_publishable_key do
@@ -1978,7 +2092,15 @@ defmodule Store.Subscriptions.Facade do
            subscription.provider
          ) do
       :ok ->
-        persist_updated_payment_method_tx(subscription, payment_intent)
+        with {:ok, current_subscription} <- fetch_subscription_for_renewal(subscription.id),
+             {:ok, current_payment_intent} <- fetch_payment_intent_for_system(payment_intent.id),
+             :ok <- ensure_setup_payment_intent(current_payment_intent),
+             :ok <- ensure_setup_payment_intent_succeeded(current_payment_intent),
+             :ok <- ensure_setup_source_match(current_subscription, current_payment_intent) do
+          persist_updated_payment_method_tx(current_subscription, current_payment_intent)
+        else
+          {:error, reason} -> Repo.rollback(Normalize.normalize(reason))
+        end
 
       {:error, _reason} ->
         Repo.rollback(Error.new("STALE_RECORD", "payment method authority gate is unavailable"))
@@ -1986,9 +2108,28 @@ defmodule Store.Subscriptions.Facade do
   end
 
   defp persist_updated_payment_method_tx(subscription, payment_intent) do
+    captured_generation = payment_intent.subscription_setup_generation
+
+    cond do
+      is_nil(captured_generation) ->
+        {:ok, no_setup_binding_result(subscription)}
+
+      not is_nil(payment_intent.setup_binding_applied_at) ->
+        {:ok, setup_replay_result(subscription, payment_intent)}
+
+      captured_generation != subscription.payment_method_setup_generation ->
+        {:ok, no_setup_binding_result(subscription)}
+
+      true ->
+        apply_current_setup_binding(subscription, payment_intent)
+    end
+  end
+
+  defp apply_current_setup_binding(subscription, payment_intent) do
     retry_repair_authorized? = retry_repair_authorized?(subscription, :payment_method)
 
-    with {:ok, stored_payment_method, stored_payment_method_notifications} <-
+    with :ok <- ensure_setup_customer_match(subscription, payment_intent),
+         {:ok, stored_payment_method, stored_payment_method_notifications} <-
            maybe_upsert_stored_payment_method(subscription.user_id, payment_intent),
          :ok <-
            ensure_stored_payment_method_active_for_payment_method_update(stored_payment_method),
@@ -1998,17 +2139,96 @@ defmodule Store.Subscriptions.Facade do
              payment_intent,
              stored_payment_method,
              retry_repair_authorized?
-           ) do
+           ),
+         {:ok, _applied_intent, marker_notifications} <-
+           mark_setup_binding_applied(payment_intent) do
       {:ok,
        %{
          subscription: updated_subscription,
          retry_now?: retry_repair_authorized?,
-         notifications: stored_payment_method_notifications ++ subscription_notifications
+         notifications:
+           stored_payment_method_notifications ++
+             subscription_notifications ++ marker_notifications
        }}
     else
       {:error, reason} ->
         Repo.rollback(Normalize.normalize(reason))
     end
+  end
+
+  defp no_setup_binding_result(subscription) do
+    %{subscription: subscription, retry_now?: false, notifications: []}
+  end
+
+  defp setup_replay_result(subscription, payment_intent) do
+    current_binding? =
+      subscription.payment_method_setup_generation ==
+        payment_intent.subscription_setup_generation + 1 and
+        subscription.provider_billing_ref == payment_intent.provider_payment_method_ref and
+        subscription.provider_customer_ref == payment_intent.provider_customer_ref
+
+    %{
+      subscription: subscription,
+      retry_now?: current_binding? and retry_repair_authorized?(subscription, :payment_method),
+      notifications: []
+    }
+  end
+
+  defp mark_setup_binding_applied(%PaymentIntent{} = payment_intent) do
+    payment_intent
+    |> Ash.Changeset.for_update(:mark_setup_binding_applied, %{}, context: %{system?: true})
+    |> Ash.update(
+      domain: Store.Payments,
+      authorize?: false,
+      context: %{system?: true},
+      return_notifications?: true
+    )
+    |> case do
+      {:ok, applied_intent, notifications} when is_list(notifications) ->
+        {:ok, applied_intent, notifications}
+
+      {:ok, applied_intent} ->
+        {:ok, applied_intent, []}
+
+      {:error, reason} ->
+        {:error, Normalize.normalize(reason)}
+    end
+  end
+
+  defp ensure_setup_payment_intent_succeeded(%PaymentIntent{state: :succeeded}), do: :ok
+
+  defp ensure_setup_payment_intent_succeeded(%PaymentIntent{}) do
+    {:error,
+     Error.new("PAYMENT_EVENT_UNVERIFIED", "setup payment intent has no verified success state")}
+  end
+
+  defp ensure_setup_source_match(
+         %Subscription{
+           id: subscription_id,
+           provider: provider
+         },
+         %PaymentIntent{
+           subscription_id: subscription_id,
+           provider: provider,
+           purpose: :subscription_payment_method_update
+         }
+       ),
+       do: :ok
+
+  defp ensure_setup_source_match(_subscription, _payment_intent) do
+    {:error,
+     Error.new("PAYMENT_EVENT_UNVERIFIED", "setup intent does not match its subscription")}
+  end
+
+  defp ensure_setup_customer_match(
+         %Subscription{provider_customer_ref: customer_ref},
+         %PaymentIntent{provider_customer_ref: customer_ref}
+       ),
+       do: :ok
+
+  defp ensure_setup_customer_match(_subscription, _payment_intent) do
+    {:error,
+     Error.new("PAYMENT_EVENT_UNVERIFIED", "setup customer does not match current subscription")}
   end
 
   defp ensure_stored_payment_method_active_for_payment_method_update(%StoredPaymentMethod{
