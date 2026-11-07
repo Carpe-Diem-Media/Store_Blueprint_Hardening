@@ -15,6 +15,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   alias Store.Subscriptions.Inputs.{EstablishAccessEffectInput, QueueSubscriptionPlanChangeInput}
   alias Store.Subscriptions.Inputs.ReconcileSubscriptionAccessInput
   alias Store.Subscriptions.Queries.AppliedAccessVerificationQuery
+  alias Store.Subscriptions.Queries.SubscriptionAccessInventoryQuery
   alias Store.SubscriptionsFixtures
   alias Store.Support.Errors.Error
   alias Store.Support.Errors.Normalize
@@ -669,6 +670,135 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert second.effect.disposition == :non_effective
     assert second.source.user_id == current.subscription.user_id
     assert %DateTime{} = second.effect.inserted_at
+  end
+
+  test "authority inventory validates fixed UUID bounds" do
+    [first, last] = BinaryUuidSort.sort_uuids([Ecto.UUID.generate(), Ecto.UUID.generate()])
+
+    assert {:ok, _} =
+             SubscriptionAccessInventoryQuery.new(%{through_id: last, after_id: first, limit: 1})
+
+    for attrs <- [
+          %{through_id: "bad"},
+          %{through_id: first, after_id: last},
+          %{through_id: last, limit: 501},
+          %{through_id: last, status: :active}
+        ] do
+      assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+               SubscriptionAccessInventoryQuery.new(attrs)
+    end
+  end
+
+  test "authority inventory action rejects ordinary callers before SQL" do
+    input =
+      Ash.ActionInput.for_action(
+        Store.Subscriptions.Subscription,
+        :read_access_inventory_window_for_system,
+        %{through_id: Ecto.UUID.generate(), limit: 1},
+        domain: Store.Subscriptions
+      )
+
+    assert {:ok, stats} =
+             RepoStats.capture(fn ->
+               assert {:error, reason} = Ash.run_action(input, authorize?: true)
+               assert %Error{code: "FORBIDDEN"} = Normalize.normalize(reason)
+               :ok
+             end)
+
+    assert stats.query_count == 0
+  end
+
+  test "authority inventory captures the database's native highest UUID" do
+    _fixture = create_committed_effective_effect_fixture!("jc248_inventory_frontier")
+
+    %{rows: [[expected]]} =
+      Repo.query!("SELECT id::text FROM subscriptions ORDER BY id DESC LIMIT 1")
+
+    assert {:ok, ^expected} = Facade.subscription_access_inventory_upper_bound_for_system()
+  end
+
+  test "authority inventory consumes healthy raw rows and exposes missing authority without writes" do
+    fixtures =
+      for index <- 1..3,
+          do: create_committed_effective_effect_fixture!("jc248_inventory_#{index}")
+
+    ordered = Enum.sort_by(fixtures, &Ecto.UUID.dump!(&1.subscription.id))
+    [healthy, missing, later] = ordered
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!("DELETE FROM access_effects WHERE id = $1", [Ecto.UUID.dump!(missing.effect.id)])
+    end)
+
+    before = source_identity_snapshot!(missing.subscription.id)
+    <<numeric_id::unsigned-big-integer-size(128)>> = Ecto.UUID.dump!(healthy.subscription.id)
+    predecessor = Ecto.UUID.load!(<<numeric_id - 1::unsigned-big-integer-size(128)>>)
+
+    assert {:ok, first} =
+             SubscriptionAccessInventoryQuery.new(%{
+               through_id: missing.subscription.id,
+               after_id: predecessor,
+               limit: 1
+             })
+
+    {inventory_sql, inventory_params} =
+      EctoSQL.to_sql(:all, Repo, SubscriptionAccessInventoryQuery.to_ecto(first))
+
+    [_outer_select, window_and_rest] = String.split(inventory_sql, "FROM (", parts: 2)
+    [raw_window_sql | _outer_order] = String.split(window_and_rest, ") AS s0", parts: 2)
+
+    assert raw_window_sql =~ "LIMIT"
+    refute raw_window_sql =~ "exists("
+    assert inventory_sql =~ "exists("
+
+    %{rows: [[inventory_plan]]} =
+      Repo.query!(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " <> inventory_sql,
+        inventory_params
+      )
+
+    IO.puts(
+      "JC248_AUTHORITY_INVENTORY_QUERY_PLAN " <>
+        Jason.encode!(%{
+          operation: "subscription_access_inventory_window",
+          raw_window_limit: 1,
+          sql: inventory_sql,
+          plan: inventory_plan,
+          limits: "three committed fixture rows; small-volume planner observation only"
+        })
+    )
+
+    {{:ok, [%{id: healthy_id, has_access_effect?: true}] = page}, stats} =
+      RepoStats.capture(fn ->
+        Facade.list_subscription_access_inventory_window_for_system(first)
+      end)
+
+    assert healthy_id == healthy.subscription.id
+    assert stats.query_count == 1
+
+    assert {:ok, after_healthy} =
+             SubscriptionAccessInventoryQuery.new(%{
+               through_id: missing.subscription.id,
+               after_id: healthy.subscription.id,
+               limit: 1
+             })
+
+    assert {:ok, [%{id: missing_id, has_access_effect?: false}]} =
+             Facade.list_subscription_access_inventory_window_for_system(after_healthy)
+
+    assert missing_id == missing.subscription.id
+
+    assert {:ok, done} =
+             SubscriptionAccessInventoryQuery.new(%{
+               through_id: missing.subscription.id,
+               after_id: missing.subscription.id,
+               limit: 1
+             })
+
+    assert {:ok, []} = Facade.list_subscription_access_inventory_window_for_system(done)
+    assert source_identity_snapshot!(missing.subscription.id) == before
+    assert grants_for_source!(missing.subscription.id) == []
+    assert {:ok, nil} = Facade.get_current_access_effect_for_system(missing.subscription)
+    refute later.subscription.id in Enum.map(page, & &1.id)
   end
 
   test "source grant verification reads are batched and retain empty source keys" do

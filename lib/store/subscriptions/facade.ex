@@ -48,6 +48,7 @@ defmodule Store.Subscriptions.Facade do
   alias Store.Subscriptions.Queries.{
     AdminSubscriptionIndexQuery,
     AppliedAccessVerificationQuery,
+    SubscriptionAccessInventoryQuery,
     UserSubscriptionIndexQuery
   }
 
@@ -95,6 +96,51 @@ defmodule Store.Subscriptions.Facade do
                                    "SHIPPING_COST_SURGE"
                                  ])
   @max_contract_change_stale_retries 2
+
+  @doc "Reads a fixed Subscription key window and reports AccessEffect existence without mutation."
+  @spec list_subscription_access_inventory_window_for_system(SubscriptionAccessInventoryQuery.t()) ::
+          {:ok, [map()]} | {:error, Error.t() | term()}
+  def list_subscription_access_inventory_window_for_system(
+        %SubscriptionAccessInventoryQuery{} = query
+      ) do
+    with {:ok, canonical} <- SubscriptionAccessInventoryQuery.new(Map.from_struct(query)) do
+      input =
+        Ash.ActionInput.for_action(
+          Subscription,
+          :read_access_inventory_window_for_system,
+          Map.from_struct(canonical),
+          domain: Subscriptions,
+          context: %{system?: true}
+        )
+
+      case Ash.run_action(input, domain: Subscriptions, authorize?: true) do
+        {:ok, rows} -> {:ok, rows}
+        {:error, reason} -> {:error, Normalize.normalize(reason)}
+      end
+    end
+  end
+
+  def list_subscription_access_inventory_window_for_system(_query) do
+    {:error, Error.new("VALIDATION_ERROR", "typed authority inventory query is required")}
+  end
+
+  @doc "Captures the current highest Subscription UUID as an operational inventory bound."
+  @spec subscription_access_inventory_upper_bound_for_system() ::
+          {:ok, Ecto.UUID.t() | nil} | {:error, Error.t() | term()}
+  def subscription_access_inventory_upper_bound_for_system do
+    query =
+      Subscription |> Ash.Query.sort(id: :desc) |> Ash.Query.limit(1) |> Ash.Query.select([:id])
+
+    case Ash.read_one(query,
+           domain: Subscriptions,
+           authorize?: false,
+           context: %{system?: true}
+         ) do
+      {:ok, nil} -> {:ok, nil}
+      {:ok, %Subscription{id: id}} -> {:ok, id}
+      {:error, reason} -> {:error, Normalize.normalize(reason)}
+    end
+  end
 
   @spec establish_access_effect_for_system(EstablishAccessEffectInput.t()) ::
           {:ok, AccessEffect.t()} | {:error, Error.t() | term()}
