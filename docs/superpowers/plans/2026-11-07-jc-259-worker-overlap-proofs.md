@@ -86,10 +86,11 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
       assert_request_identity!(fixture, before_release, params, headers)
 
       send(first.pid, {ref, :release_claim})
-      assert {:ok, :processed} = Task.await(first, 15_000)
+      assert {:error, %{code: "PAYMENT_OUTCOME_UNRESOLVED", meta: %{existing_collection_replay?: true}}} = Task.await(first, 15_000)
       after_release = identity!(fixture)
       assert after_release == before_release
       assert :atomics.get(posts, 1) == 1
+      assert [["active", 0]] == Repo.query!("SELECT status, dunning_attempt_count FROM subscriptions WHERE id=$1", [Ecto.UUID.dump!(fixture.subscription.id)]).rows
       refute_receive {^ref, :post, _, _}, 0
     after
       send(first.pid, {ref, :release_claim})
@@ -459,7 +460,7 @@ end
 
 ## Root self-review
 
-The first proof pauses A after its actual one-row standalone claim SQL and asserts an independent observer sees the new timestamp while the attempt is pending. B uses a distinct physical connection and must claim with A's exact new timestamp. This demonstrates a fresh reader can win without inferring financial duplication. Exact request metadata and the POST counter provide the separate financial operation observation. Only the pending branch is covered.
+The first proof pauses A after its actual one-row standalone claim SQL and asserts an independent observer sees the new timestamp while the attempt is pending. B uses a distinct physical connection and must claim with A's exact new timestamp. This demonstrates a fresh reader can win without inferring financial duplication. Exact request metadata and the POST counter provide the separate financial operation observation. Only the pending branch is covered. The first runtime run disproved the initial expectation that A would return processed. It returned PAYMENT_OUTCOME_UNRESOLVED with existing_collection_replay? true. The current facade explicitly propagates this exact replay error while preserving the unresolved collection, so the plan now asserts that concrete result and unchanged active Subscription with zero dunning. It does not accept a broad set of outcomes or change production behavior.
 
 The second proof kills the actual worker process at the existing event after Order, processing attempt, collection and deterministic PaymentIntent creation. The event name is historical; the test asserts actual persisted state rather than inferring order from its name. It covers the interval before collection PI attachment and before provider dispatch, not death after provider acceptance or evidence commit. It observes resume with the same IDs and one local POST. The provider returns processing, so no paid reconciliation or commercial success is certified.
 
