@@ -12,7 +12,7 @@
 
 Modify only `test/store/subscriptions/access_effect_effective_execution_test.exs` and `test/store/subscriptions/access_effect_non_effective_execution_test.exs`. Reuse their existing helpers. Do not refactor unrelated tests or add a production testing hook. If a regression exposes a defect, report its failed assertion and proposed correction to root before changing production code.
 
-- [ ] Add this effective pair case. Two sources belong to different valid users. Corrupt the owned source's active target row to the other owner, kind and scope, then add another obsolete active row and valid revoked history. The independent source remains valid throughout. Snapshot the entire APPLIED effect and all historical attributes before repair.
+- [x] Add this effective pair case. Two sources belong to different valid users. Corrupt the owned source's active target row to the other owner, kind and scope, then add another obsolete active row and valid revoked history. The independent source remains valid throughout. Snapshot the entire APPLIED effect and all historical attributes before repair.
 
 ```elixir
 test "APPLIED repair restores the whole source and preserves other users and history" do
@@ -93,7 +93,7 @@ test "APPLIED repair restores the whole source and preserves other users and his
 end
 ```
 
-- [ ] Add this effective empty-target case to the same module. An empty effective target succeeds by leaving no active row for this source, even when another source remains active.
+- [x] Add this effective empty-target case to the same module. An empty effective target succeeds by leaving no active row for this source, even when another source remains active.
 
 ```elixir
 test "APPLIED empty effective target removes stale rows only for its own source" do
@@ -135,7 +135,7 @@ test "APPLIED empty effective target removes stale rows only for its own source"
 end
 ```
 
-- [ ] Add this non-effective case in the non-effective module. Its existing helper owns and cleans the independent Subscription. Existing revoked and expired evidence must retain all attributes.
+- [x] Add this non-effective case in the non-effective module. Its existing helper owns and cleans the independent Subscription. Existing revoked and expired evidence must retain all attributes.
 
 ```elixir
 test "APPLIED non-effective repair preserves historical evidence and another source" do
@@ -189,11 +189,13 @@ test "APPLIED non-effective repair preserves historical evidence and another sou
 end
 ```
 
-- [ ] Run the two execution modules before changing any production behavior. These prove existing repair invariants and may pass immediately. Do not manufacture a RED result. A real failure requires systematic debugging and a focused root decision.
-- [ ] Run format checks, scoped positional strict Credo, compile warnings-as-errors and migration alignment. Self-review and commit only the two test modules. Report exact head, observed test counts and any unresolved limitation. Independent spec review precedes quality review.
+- [x] Run the two execution modules before changing any production behavior. These prove existing repair invariants and may pass immediately. Do not manufacture a RED result. A real failure requires systematic debugging and a focused root decision.
+- [x] Run format checks, scoped positional strict Credo, compile warnings-as-errors and migration alignment. Self-review and commit only the two test modules. Report exact head, observed test counts and any unresolved limitation. Independent spec review precedes quality review.
 
 Every Mix command uses the sequential command prefix:
 
 `MIX_ENV=test STORE_TEST_DB_SUFFIX=_t3_132f19be_hardening STORE_BENCH_POOL_SIZE=4 STORE_BENCH_WRITER_POOL_SIZE=4 ERL_FLAGS='+S 4:4' mise exec -- devcore-project run test -- mix`
 
 Root self-review checked helper signatures, source ownership, full APPLIED comparisons, historical metadata preservation and cleanup. A separate measurement task supplies bounded resource and natural query-plan evidence before final repository checks.
+
+Implementation `8f03342b0e1ae4ac4952942f6e57dc0e92ecfef9` passed independent specification and quality reviews against its verified parent `ba2ff322a6f8186fde12a46e903d303fe75ac17d`. Root inspected the full 181-line diff and observed the saved final run with 74 tests and zero failures. Format, scoped strict Credo, warnings-as-errors compile, migration alignment and diff checks passed. No production defect or production change arose from this proof task.
