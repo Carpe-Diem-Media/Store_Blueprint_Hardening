@@ -882,6 +882,7 @@ defmodule Store.Subscriptions.Subscription do
         :retry_suppressed_at
       ])
 
+      change(Store.Subscriptions.Changes.AcquireSubscriptionBindingAuthority)
       change(Store.Subscriptions.Changes.OptimisticAggregateLock)
     end
   end

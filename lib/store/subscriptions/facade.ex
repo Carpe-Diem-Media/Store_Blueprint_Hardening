@@ -54,6 +54,7 @@ defmodule Store.Subscriptions.Facade do
     AccessEffectCurrentnessFence,
     AccessEffectTargetOrder,
     ContractChange,
+    PaymentMethodAuthorityGate,
     PlanRevision,
     RenewalAttempt,
     RenewalCollectionAttempt,
@@ -1950,7 +1951,18 @@ defmodule Store.Subscriptions.Facade do
 
   defp persist_updated_payment_method(subscription, payment_intent) do
     case Repo.transaction(fn ->
-           persist_updated_payment_method_tx(subscription, payment_intent)
+           case PaymentMethodAuthorityGate.lock_binding_for_transaction(
+                  subscription.user_id,
+                  subscription.provider
+                ) do
+             :ok ->
+               persist_updated_payment_method_tx(subscription, payment_intent)
+
+             {:error, _reason} ->
+               Repo.rollback(
+                 Error.new("STALE_RECORD", "payment method authority gate is unavailable")
+               )
+           end
          end)
          |> normalize_transaction_notifications() do
       {:ok, result, notifications} ->
@@ -6767,6 +6779,20 @@ defmodule Store.Subscriptions.Facade do
 
         case RenewalCollectionAttempts.attach_and_claim_dispatch_for_system(input) do
           {:ok, claim} ->
+            if claim.dispatch_claimed? do
+              :telemetry.execute(
+                [:store, :subscriptions, :renewal_charge_dispatch_claimed],
+                %{},
+                %{
+                  source: :fresh_dispatch,
+                  subscription_id: subscription.id,
+                  renewal_attempt_id: bound_attempt.id,
+                  collection_attempt_id: claim.collection_attempt.id,
+                  payment_intent_id: claim.payment_intent.id
+                }
+              )
+            end
+
             submit_claimed_renewal_collection(subscription, plan, bound_attempt, claim, now)
 
           {:error, %Error{code: "RENEWAL_AUTHORITY_WITHDRAWN"}} ->

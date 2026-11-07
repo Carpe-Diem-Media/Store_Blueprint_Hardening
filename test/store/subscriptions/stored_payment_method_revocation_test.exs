@@ -177,6 +177,55 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
   end
 
   describe "upsert bypass protection" do
+    test "payment method authority callbacks fail closed outside a transaction", %{user: user} do
+      create_attrs =
+        %{
+          user_id: user.id,
+          status: :active,
+          fingerprint: "fp_sbh_80_01"
+        }
+        |> Map.merge(@provider_refs)
+
+      create_changeset =
+        StoredPaymentMethod
+        |> Ash.Changeset.for_create(:create_or_reuse, create_attrs, context: %{system?: true})
+        |> Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority.change([], %{})
+
+      assert {%Ash.Changeset{valid?: false}, _instructions} =
+               Ash.Changeset.run_before_actions(create_changeset)
+
+      assert identity_count!() == 0
+
+      spm = create_spm!(user, %{status: :active})
+
+      for action <- [:mark_active, :mark_inactive, :mark_revoked] do
+        update_changeset =
+          spm
+          |> Ash.Changeset.for_update(action, %{}, context: %{system?: true})
+          |> Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority.change([], %{})
+
+        assert {%Ash.Changeset{valid?: false}, _instructions} =
+                 Ash.Changeset.run_before_actions(update_changeset)
+
+        assert reload_spm!(spm.id).status == :active
+      end
+    end
+
+    for status <- [:active, :inactive, :revoked] do
+      test "create_or_reuse rejects a foreign owner for #{status}", %{user: user} do
+        original = create_spm!(user, %{status: unquote(status)})
+        foreign_user = TestFixtures.register_user!(email: TestFixtures.unique_email("sbh_80_02"))
+
+        assert {:error, %Ash.Error.Invalid{}} = upsert_spm(foreign_user, unquote(status))
+
+        reloaded = reload_spm!(original.id)
+        assert reloaded.user_id == user.id
+        assert reloaded.status == unquote(status)
+        assert reloaded.fingerprint == original.fingerprint
+        assert identity_count!() == 1
+      end
+    end
+
     test "create_or_reuse cannot resurrect REVOKED row to ACTIVE", %{user: user} do
       spm =
         create_spm!(user, %{status: :active})
