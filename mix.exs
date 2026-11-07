@@ -61,6 +61,7 @@ defmodule Store.MixProject do
       {:ash_phoenix, ">= 2.3.25 and < 3.0.0-0"},
       {:ash_json_api, "~> 1.5"},
       {:ash_state_machine, "~> 0.2.12"},
+      {:tz, "~> 0.28"},
       {:open_api_spex, "~> 3.20"},
       {:ash_authentication, ">= 5.0.0-rc.15 and < 6.0.0-0"},
       {:ash_authentication_phoenix, ">= 3.0.0-rc.11 and < 4.0.0-0"},

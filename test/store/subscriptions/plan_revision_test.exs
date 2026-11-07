@@ -42,6 +42,68 @@ defmodule Store.Subscriptions.PlanRevisionTest do
     assert revision.retry_schedule_hours == [0, 24, 72]
   end
 
+  test "create_draft uses the commercial timezone default when omitted", %{plan: plan} do
+    revision = create_draft!(plan, Map.delete(@commercial_attrs, :billing_timezone))
+
+    assert revision.billing_timezone == "Africa/Johannesburg"
+  end
+
+  test "draft creation and updates reject invalid timezones and accept trimmed supported zones",
+       %{
+         plan: plan
+       } do
+    for timezone <- [nil, "", "Not/A_Real_Zone"] do
+      attrs = Map.put(@commercial_attrs, :billing_timezone, timezone)
+      assert {:error, error} = create_draft(plan, attrs)
+      assert billing_timezone_error?(error)
+    end
+
+    revision = create_draft!(plan, @commercial_attrs)
+
+    for timezone <- [nil, "", "Not/A_Real_Zone"] do
+      assert_raise Ash.Error.Invalid, fn ->
+        update_draft!(revision, %{billing_timezone: timezone})
+      end
+    end
+
+    updated = update_draft!(revision, %{billing_timezone: "  Africa/Johannesburg  "})
+    assert updated.billing_timezone == "Africa/Johannesburg"
+  end
+
+  test "publish rejects a historical draft with an invalid timezone", %{plan: plan} do
+    revision = create_draft!(plan, @commercial_attrs)
+
+    Store.Repo.query!(
+      "UPDATE plan_revisions SET billing_timezone = $1 WHERE id = $2",
+      ["Not/A_Real_Zone", Ecto.UUID.dump!(revision.id)]
+    )
+
+    assert {:error, error} = publish(reload_revision!(revision.id))
+    assert billing_timezone_error?(error)
+
+    assert %{status: :draft, version: 1, billing_timezone: "Not/A_Real_Zone"} =
+             reload_revision!(revision.id)
+  end
+
+  test "publish rejects a zone unsupported by the current timezone database", %{plan: plan} do
+    revision = create_draft!(plan, %{@commercial_attrs | billing_timezone: "Africa/Johannesburg"})
+    previous_database = Application.get_env(:elixir, :time_zone_database)
+
+    try do
+      Application.put_env(:elixir, :time_zone_database, Calendar.UTCOnlyTimeZoneDatabase)
+
+      assert {:error, error} = publish(reload_revision!(revision.id))
+      assert billing_timezone_error?(error)
+      assert %{status: :draft, version: 1} = reload_revision!(revision.id)
+    after
+      if is_nil(previous_database) do
+        Application.delete_env(:elixir, :time_zone_database)
+      else
+        Application.put_env(:elixir, :time_zone_database, previous_database)
+      end
+    end
+  end
+
   test "status cannot be supplied to create an effective or retired revision", %{plan: plan} do
     for status <- [:effective, :retired] do
       assert {:error, error} =
@@ -702,6 +764,13 @@ defmodule Store.Subscriptions.PlanRevisionTest do
   defp invalid_errors({:error, %Ash.Error.Invalid{errors: errors}}), do: errors
   defp invalid_errors(%Ash.Error.Invalid{errors: errors}), do: errors
   defp invalid_errors(_), do: []
+
+  defp billing_timezone_error?(error) do
+    Enum.any?(invalid_errors(error), fn validation_error ->
+      Map.has_key?(Map.from_struct(validation_error), :field) and
+        validation_error.field == :billing_timezone
+    end)
+  end
 
   defp not_found_error?(%Ash.Error.Query.NotFound{}), do: true
 
