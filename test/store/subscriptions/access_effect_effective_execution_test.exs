@@ -1746,6 +1746,132 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert fetch_effect!(fixture.effect.id) == effect_snapshot
   end
 
+  test "APPLIED repair restores the whole source and preserves other users and history" do
+    fixture = create_committed_effective_effect_fixture!("jc248_exact_pair")
+    independent = create_committed_effective_effect_fixture!("jc248_exact_independent")
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(independent.effect.id)
+
+      [original] = grants_for_source!(fixture.subscription.id)
+
+      Repo.query!(
+        "UPDATE entitlement_grants SET user_id = $2, kind = 'discount_tier', scope_key = $3 WHERE id = $1",
+        [
+          Ecto.UUID.dump!(original.id),
+          Ecto.UUID.dump!(independent.subscription.user_id),
+          "#{fixture.effect.id}:wrong-target"
+        ]
+      )
+
+      create_grant!(fixture, "#{fixture.effect.id}:obsolete-active", fixture.effect.valid_from_at)
+      insert_revoked_history!(fixture, 1, DateTime.utc_now())
+    end)
+
+    effect_before = fetch_effect!(fixture.effect.id)
+    source_before = grants_for_source!(fixture.subscription.id)
+    inactive_before = Enum.reject(source_before, &(&1.status == :active))
+    obsolete_ids = source_before |> Enum.filter(&(&1.status == :active)) |> Enum.map(& &1.id)
+    independent_before = grants_for_source!(independent.subscription.id)
+    assert length(obsolete_ids) == 2
+    assert length(inactive_before) == 1
+
+    user_ids = [fixture.subscription.user_id, independent.subscription.user_id]
+
+    Enum.each(user_ids, fn user_id ->
+      :ok = Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(user_id))
+      assert {:ok, true} = Cachex.put(Cache, Cache.cache_key(user_id), :jc248_stale_owner)
+    end)
+
+    try do
+      assert {:ok, :repaired} =
+               Sandbox.unboxed_run(Repo, fn ->
+                 Facade.repair_applied_access_effect_for_system(fixture.effect.id)
+               end)
+
+      source_after = grants_for_source!(fixture.subscription.id)
+      assert [target] = Enum.filter(source_after, &(&1.status == :active))
+      assert target.user_id == fixture.subscription.user_id
+      assert target.kind == fixture.effect.entitlement_kind
+      assert target.scope_key == fixture.effect.entitlement_scope_key
+      assert target.valid_from_at == fixture.effect.valid_from_at
+      assert target.valid_to_at == fixture.effect.valid_until_at
+      assert target.revoked_at == nil
+      assert target.revoked_reason == nil
+
+      Enum.each(obsolete_ids, fn id ->
+        assert %{status: :revoked, revoked_reason: "subscription_source_reconciliation"} =
+                 Enum.find(source_after, &(&1.id == id))
+      end)
+
+      Enum.each(inactive_before, fn historical ->
+        assert Enum.find(source_after, &(&1.id == historical.id)) == historical
+      end)
+
+      assert fetch_effect!(fixture.effect.id) == effect_before
+      assert grants_for_source!(independent.subscription.id) == independent_before
+
+      Enum.each(user_ids, fn user_id ->
+        assert {:ok, nil} = Cachex.get(Cache, Cache.cache_key(user_id))
+
+        assert_receive {:entitlements_invalidated, ^user_id, "subscription_source_reconciliation",
+                        _at}
+      end)
+    after
+      Enum.each(user_ids, fn user_id ->
+        Phoenix.PubSub.unsubscribe(Store.PubSub, Cache.topic(user_id))
+        Cachex.del(Cache, Cache.cache_key(user_id))
+      end)
+    end
+  end
+
+  test "APPLIED empty effective target removes stale rows only for its own source" do
+    fixture = create_committed_effective_effect_fixture!("jc248_exact_empty", target: :empty)
+    independent = create_committed_effective_effect_fixture!("jc248_empty_independent")
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(independent.effect.id)
+
+      for suffix <- ["a", "b"] do
+        create_grant!(
+          fixture,
+          "#{fixture.effect.id}:stale:#{suffix}",
+          fixture.subscription.current_period_start_at
+        )
+      end
+    end)
+
+    effect_before = fetch_effect!(fixture.effect.id)
+    independent_before = grants_for_source!(independent.subscription.id)
+
+    assert {:ok, :repaired} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect.id)
+             end)
+
+    assert grants = grants_for_source!(fixture.subscription.id)
+    assert length(grants) == 2
+    assert Enum.all?(grants, &(&1.status == :revoked))
+    assert grants_for_source!(independent.subscription.id) == independent_before
+    assert fetch_effect!(fixture.effect.id) == effect_before
+
+    assert {:ok, :already_converged} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect.id)
+             end)
+
+    assert grants_for_source!(fixture.subscription.id) == grants
+    assert fetch_effect!(fixture.effect.id) == effect_before
+  end
+
   @tag :jc360_task07
   @tag :jc360_task08
   test "a committed REQUIRED initial source effect recovers by exact ID without duplicate rows" do

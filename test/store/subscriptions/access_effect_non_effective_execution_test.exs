@@ -137,6 +137,61 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
     assert fetch_effect!(fixture.effect_id) == effect_snapshot
   end
 
+  test "APPLIED non-effective repair preserves historical evidence and another source" do
+    fixture = create_committed_suspended_effect_fixture!("jc248_exact_non_effective")
+    independent = create_other_subscription_fixture!(fixture)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.execute_suspension_access_effect_for_system(fixture.effect_id)
+             end)
+
+    effect_before = fetch_effect!(fixture.effect_id)
+
+    for suffix <- ["a", "b"] do
+      create_grant!(fixture, "#{fixture.effect_id}:stale:#{suffix}", :active,
+        valid_from_at: DateTime.add(now, -60, :second),
+        valid_to_at: DateTime.add(now, 3_600, :second)
+      )
+    end
+
+    create_grant!(fixture, "#{fixture.effect_id}:expired-history", :expired,
+      valid_from_at: DateTime.add(now, -7_200, :second),
+      valid_to_at: DateTime.add(now, -3_600, :second)
+    )
+
+    independent_grant =
+      create_grant!(fixture, "#{fixture.effect_id}:other-source", :active,
+        source_id: independent.id,
+        valid_from_at: DateTime.add(now, -60, :second),
+        valid_to_at: DateTime.add(now, 3_600, :second)
+      )
+
+    history_before =
+      fixture.subscription_id
+      |> grants_for_source!()
+      |> Enum.reject(&(&1.status == :active))
+
+    independent_before = fetch_grant!(independent_grant.id)
+
+    assert {:ok, :repaired} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect_id)
+             end)
+
+    source_after = grants_for_source!(fixture.subscription_id)
+    refute Enum.any?(source_after, &(&1.status == :active))
+
+    Enum.each(history_before, fn historical ->
+      assert entitlement_grant_attributes(Enum.find(source_after, &(&1.id == historical.id))) ==
+               entitlement_grant_attributes(historical)
+    end)
+
+    assert fetch_grant!(independent_grant.id) == independent_before
+    assert fetch_effect!(fixture.effect_id) == effect_before
+  end
+
   test "the public NON_EFFECTIVE executor rejects a caller-owned transaction before writes on commit" do
     fixture = create_committed_suspended_effect_fixture!("jc246_nested_commit")
     Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(fixture.user_id))
