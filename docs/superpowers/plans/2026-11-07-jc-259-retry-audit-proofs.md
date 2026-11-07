@@ -225,7 +225,7 @@ defmodule Store.Workers.JC259RenewalRetryAuditTest do
   end
 
   defp collection_count(id) do
-    [[count]] = Repo.query!("SELECT count(*) FROM renewal_collection_attempts WHERE subscription_id=$1", [Ecto.UUID.dump!(id)]).rows
+    [[count]] = Repo.query!("SELECT count(*) FROM renewal_collection_attempts c JOIN renewal_attempts a ON a.id=c.renewal_attempt_id WHERE a.subscription_id=$1", [Ecto.UUID.dump!(id)]).rows
     count
   end
 
