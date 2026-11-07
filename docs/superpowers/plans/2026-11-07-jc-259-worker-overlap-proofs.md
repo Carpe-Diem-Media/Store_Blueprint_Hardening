@@ -26,9 +26,10 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Store.Repo
-  alias Store.Subscriptions.{Facade, Subscription}
+  alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
   alias Store.TestSupport.StripeAPIStub
+  alias Store.Workers.ProcessSubscriptionRenewalWorker
 
   setup_all do
     assert_test_database!()
@@ -71,7 +72,7 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
       send(second.pid, {ref, :go})
       assert_receive {^ref, :claim, :second, ^attempt_id, second_stamp, ^first_stamp, false}, 10_000
       assert second_stamp != first_stamp
-      assert {:ok, :processed} = Task.await(second, 15_000)
+      assert :ok = Task.await(second, 15_000)
       before_release = identity!(fixture)
       assert before_release.attempt_id == attempt_id
       assert before_release.attempt_count == 1
@@ -146,8 +147,8 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
       assert pid == worker.pid
       :telemetry.detach(handler)
 
-      assert {:ok, :processed} =
-               Facade.process_due_subscription_renewal_for_system(fixture.subscription.id, now: fixture.now)
+      assert :ok =
+               ProcessSubscriptionRenewalWorker.perform(%Oban.Job{args: %{"subscription_id" => fixture.subscription.id}})
       recovered = identity!(fixture)
       keys = [:attempt_id, :order_id, :collection_id, :payment_intent_id, :request_reference,
               :attempt_count, :collection_count, :payment_intent_count, :collection_ordinal]
@@ -177,7 +178,7 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
         send(parent, {ref, :ready, role, pg})
         receive do
           {^ref, :go} ->
-            Facade.process_due_subscription_renewal_for_system(fixture.subscription.id, now: fixture.now)
+            ProcessSubscriptionRenewalWorker.perform(%Oban.Job{args: %{"subscription_id" => fixture.subscription.id}})
         after
           15_000 -> {:error, :start_barrier_expired}
         end
@@ -465,3 +466,5 @@ The first proof pauses A after its actual one-row standalone claim SQL and asser
 The second proof kills the actual worker process at the existing event after Order, processing attempt, collection and deterministic PaymentIntent creation. The event name is historical; the test asserts actual persisted state rather than inferring order from its name. It covers the interval before collection PI attachment and before provider dispatch, not death after provider acceptance or evidence commit. It observes resume with the same IDs and one local POST. The provider returns processing, so no paid reconciliation or commercial success is certified.
 
 Both tests use committed fixture rows on Repo and sandboxed Oban rows on DirectRepo, following the existing required race suite. Tasks and barriers terminate before exact fixture cleanup. The copied cleanup disables the collection deletion guard only in the cleanup transaction after competing tasks stop and restores it in `after`. The database guard prevents use outside the configured TEST database. Production deployment topology, provider-side behavior and resource capacity remain unmeasured.
+
+The task processes call the actual ProcessSubscriptionRenewalWorker perform callback. Its existing wall clock is sufficient because the fixture is already due. Its processed result maps to :ok, while the unresolved replay error is preserved. No Oban producer or acknowledgement is involved in these two overlap/crash tests; Task 1 owns acknowledgement evidence.
