@@ -99,3 +99,11 @@ Final focused execution passed 21 tests with zero failures and no test warnings.
 Two bounded diagnostic query samples observed 36 current-process primary queries for first nonphysical preparation, nine for repeated rejection and 38 for exact processing observation. The probe used a GET stub, retained unresolved financial state and does not establish capacity or whole-system query counts.
 
 The four required connection modules ran 17 tests with two failures in older SourceFenceContention fixtures that expect fresh Stripe POSTs to manufacture dunning state. Those fixtures, other affected lifecycle suites, the complete final check and exact-head CI remain pending. This is an unpublished core checkpoint, not a completed PR or merge recommendation. PR #216 remains a draft on hold.
+
+## Lifecycle migration checkpoints
+
+Commit `3048e2d` preserves observation errors without business dunning. Its regressions and the first migrated suites passed 76 focused tests, static checks and types. The separate recovery-error plan records the reproduced pre-existing acceptance gap and scoped reviews.
+
+Commit `a3a1d34` migrates the facade and monotonicity tests. Fresh dispatch assertions now require rejection. Recovery fixtures seed explicit legacy possible contact and apply exact provider observations using the actual order total and currency. Physical live-shipping and stock-consumption checks remain. The concurrent stale writer captures a processing attempt before canonical success and paid reconciliation commit, then resumes and must fail as stale. Both spec and quality reviews passed for these two files.
+
+These checkpoints remain unpublished. Broader dunning, cancellation, contract, access and worker migrations still require validation before whole-PR review and CI.
