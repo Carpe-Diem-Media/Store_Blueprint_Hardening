@@ -13,6 +13,8 @@ defmodule Store.Subscriptions.Facade do
   alias Store.Comms
   alias Store.Entitlements.Facade, as: EntitlementsFacade
   alias Store.Entitlements.Inputs.SubscriptionSourceConvergenceInput
+  alias Store.Entitlements.Queries.SubscriptionSourceVerificationQuery
+  alias Store.Entitlements.SourceConvergence
   alias Store.Orders
   alias Store.Orders.Order
   alias Store.Orders.OrderLineItem
@@ -191,6 +193,148 @@ defmodule Store.Subscriptions.Facade do
   def list_applied_access_verification_window_for_system(_query) do
     {:error, Error.new("VALIDATION_ERROR", "typed APPLIED verification query is required")}
   end
+
+  @typedoc "Result of comparing one bounded APPLIED window with persisted active grants."
+  @type access_verification_result :: %{
+          raw_count: non_neg_integer(),
+          current_count: non_neg_integer(),
+          stale_count: non_neg_integer(),
+          healthy_count: non_neg_integer(),
+          repairs: [%{subscription_id: Ecto.UUID.t(), expected_access_effect_id: Ecto.UUID.t()}],
+          conflicts: [
+            %{
+              subscription_id: Ecto.UUID.t(),
+              access_effect_id: Ecto.UUID.t(),
+              reason: :invalid_authority
+            }
+          ],
+          as_of: DateTime.t(),
+          cursor: %{timestamp: DateTime.t(), id: Ecto.UUID.t()} | nil
+        }
+
+  @doc "Checks one bounded APPLIED window against persisted active subscription grants."
+  @spec verify_subscription_access_window_for_system(AppliedAccessVerificationQuery.t()) ::
+          {:ok, access_verification_result()} | {:error, Error.t() | term()}
+  def verify_subscription_access_window_for_system(%AppliedAccessVerificationQuery{} = query) do
+    with {:ok, canonical} <- AppliedAccessVerificationQuery.new(Map.from_struct(query)),
+         {:ok, rows} <- list_applied_access_verification_window_for_system(canonical),
+         current_rows <- Enum.filter(rows, & &1.current?),
+         ids <- Enum.map(current_rows, & &1.source.subscription_id),
+         {:ok, grants_query} <- SubscriptionSourceVerificationQuery.new(%{source_ids: ids}),
+         {:ok, grants} <-
+           EntitlementsFacade.list_active_subscription_source_grants_for_system(grants_query) do
+      initial = %{
+        raw_count: length(rows),
+        current_count: 0,
+        stale_count: 0,
+        healthy_count: 0,
+        repairs: [],
+        conflicts: []
+      }
+
+      result = Enum.reduce(rows, initial, &verify_access_window_row(&1, &2, grants))
+
+      {:ok,
+       Map.merge(result, %{
+         as_of: canonical.as_of,
+         repairs: Enum.reverse(result.repairs),
+         conflicts: Enum.reverse(result.conflicts),
+         cursor: access_verification_cursor(rows, canonical.limit)
+       })}
+    end
+  end
+
+  def verify_subscription_access_window_for_system(_query) do
+    {:error, Error.new("VALIDATION_ERROR", "typed APPLIED verification query is required")}
+  end
+
+  defp verify_access_window_row(%{current?: false}, result, _grants),
+    do: Map.update!(result, :stale_count, &(&1 + 1))
+
+  defp verify_access_window_row(row, result, grants) do
+    result = Map.update!(result, :current_count, &(&1 + 1))
+
+    case verified_snapshot_input(row) do
+      {:ok, input} ->
+        active_rows = Map.fetch!(grants, row.source.subscription_id)
+
+        target_id =
+          case active_rows do
+            [grant] -> grant.id
+            _ -> nil
+          end
+
+        case SourceConvergence.validate_final_active_set(input, target_id, active_rows) do
+          :ok ->
+            Map.update!(result, :healthy_count, &(&1 + 1))
+
+          {:error, _reason} ->
+            Map.update!(
+              result,
+              :repairs,
+              &[
+                %{
+                  subscription_id: row.source.subscription_id,
+                  expected_access_effect_id: row.effect.id
+                }
+                | &1
+              ]
+            )
+        end
+
+      {:error, _reason} ->
+        Map.update!(
+          result,
+          :conflicts,
+          &[
+            %{
+              subscription_id: row.source.subscription_id,
+              access_effect_id: row.effect.id,
+              reason: :invalid_authority
+            }
+            | &1
+          ]
+        )
+    end
+  end
+
+  defp verified_snapshot_input(%{
+         effect: effect,
+         source: source,
+         revision: revision,
+         contract_reference: reference
+       }) do
+    provenance = %{
+      source_order_line_item_id: source.source_order_line_item_id,
+      plan_revision_id: source.current_plan_revision_id,
+      revision_entitlement_kind:
+        revision.entitlement_kind && Atom.to_string(revision.entitlement_kind),
+      revision_entitlement_scope_key: revision.entitlement_scope_key
+    }
+
+    with true <- effect.status == :applied,
+         true <- effect.subscription_id == source.subscription_id,
+         true <-
+           is_integer(effect.source_version) and effect.source_version > 0 and
+             effect.source_version <= source.aggregate_version,
+         true <- revision.id == effect.plan_revision_id,
+         true <-
+           AccessEffect.persisted_fingerprint_status(effect) in [:v2_match, :v1_legacy_match],
+         :ok <- validate_persisted_access_effect_provenance(effect, provenance, reference),
+         {:ok, input} <-
+           applied_source_reconciliation_input(effect, source.subscription_id, source.user_id) do
+      {:ok, input}
+    else
+      _ -> {:error, :invalid_authority}
+    end
+  end
+
+  defp access_verification_cursor(rows, limit) when length(rows) == limit do
+    %{effect: effect} = List.last(rows)
+    %{timestamp: effect.inserted_at, id: effect.id}
+  end
+
+  defp access_verification_cursor(_rows, _limit), do: nil
 
   @spec validate_complete_bound_renewal_attempt_for_system(RenewalAttempt.t()) ::
           :ok | {:error, Error.t() | term()}

@@ -1,5 +1,6 @@
 defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   use Store.DataCase, async: false
+  use Oban.Testing, repo: Store.DirectRepo
 
   import Ash.Expr
   require Ash.Query
@@ -21,7 +22,9 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   alias Store.Support.Errors.Normalize
   alias Store.Support.ID.BinaryUuidSort
   alias Store.Support.Telemetry.RepoStats
+  alias Store.Workers.InventorySubscriptionAccessAuthorityWorker
   alias Store.Workers.ReconcileSubscriptionAccessWorker
+  alias Store.Workers.VerifySubscriptionAccessWorker
 
   test "source reconciliation input accepts only typed UUID identities" do
     assert {:error, %Error{code: "VALIDATION_ERROR"}} =
@@ -41,6 +44,600 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
 
     assert {:error, %Error{code: "VALIDATION_ERROR"}} =
              ReconcileSubscriptionAccessInput.new(%{"subscription_id" => Ecto.UUID.generate()})
+  end
+
+  test "JC248 verification returns bounded exact grant drift" do
+    fixture = create_committed_effective_effect_fixture!("jc248_sweep_api")
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+      Repo.query!(
+        "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+        [Ecto.UUID.dump!(fixture.subscription.id)]
+      )
+
+      Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.effect.id),
+        ~U[2020-01-01 00:00:00Z]
+      ])
+    end)
+
+    assert {:ok, query} =
+             AppliedAccessVerificationQuery.new(%{as_of: ~U[2020-01-02 00:00:00Z], limit: 100})
+
+    assert {{:ok, result}, stats} =
+             RepoStats.capture(fn ->
+               Facade.verify_subscription_access_window_for_system(query)
+             end)
+
+    assert stats.query_count == 2
+    assert result.current_count == 1
+    assert result.healthy_count == 0
+
+    assert result.repairs == [
+             %{
+               subscription_id: fixture.subscription.id,
+               expected_access_effect_id: fixture.effect.id
+             }
+           ]
+  end
+
+  test "JC248 verification worker queues exact drift and reports page counts" do
+    fixture = create_committed_effective_effect_fixture!("jc248_sweep_worker")
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+      Repo.query!(
+        "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+        [Ecto.UUID.dump!(fixture.subscription.id)]
+      )
+
+      Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.effect.id),
+        ~U[2020-01-01 00:00:00Z]
+      ])
+    end)
+
+    handler_id = "jc248-verification-page-#{Ecto.UUID.generate()}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :subscriptions, :access_verification, :page],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:verification_page, event, measurements, metadata})
+        end,
+        self()
+      )
+
+    try do
+      assert :ok =
+               Sandbox.unboxed_run(Repo, fn ->
+                 VerifySubscriptionAccessWorker.perform(%Oban.Job{
+                   args: %{"as_of" => "2020-01-02T00:00:00Z", "limit" => 100}
+                 })
+               end)
+
+      assert_enqueued(
+        worker: ReconcileSubscriptionAccessWorker,
+        args: %{
+          "subscription_id" => fixture.subscription.id,
+          "expected_access_effect_id" => fixture.effect.id
+        }
+      )
+
+      assert_receive {:verification_page, [:store, :subscriptions, :access_verification, :page],
+                      %{raw_count: 1, repair_count: 1}, _metadata}
+    after
+      :ok = :telemetry.detach(handler_id)
+    end
+  end
+
+  test "JC248 verification rediscovers lost source jobs after completed and discarded attempt five" do
+    fixture = create_committed_effective_effect_fixture!("jc248_sweep_rediscovery")
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+      Repo.query!(
+        "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+        [Ecto.UUID.dump!(fixture.subscription.id)]
+      )
+
+      Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.effect.id),
+        ~U[2020-01-01 00:00:00Z]
+      ])
+    end)
+
+    verification_job = %Oban.Job{args: %{"as_of" => "2020-01-02T00:00:00Z", "limit" => 100}}
+
+    for _attempt <- 1..2 do
+      assert :ok =
+               Sandbox.unboxed_run(Repo, fn ->
+                 VerifySubscriptionAccessWorker.perform(verification_job)
+               end)
+    end
+
+    assert source_reconciliation_job_ids(fixture) |> length() == 1
+
+    mark_source_reconciliation_jobs_terminal!(fixture, "completed")
+
+    assert :ok =
+             Sandbox.unboxed_run(Repo, fn ->
+               VerifySubscriptionAccessWorker.perform(verification_job)
+             end)
+
+    assert source_reconciliation_job_ids(fixture) |> length() == 2
+
+    mark_source_reconciliation_jobs_terminal!(fixture, "discarded")
+
+    assert :ok =
+             Sandbox.unboxed_run(Repo, fn ->
+               VerifySubscriptionAccessWorker.perform(verification_job)
+             end)
+
+    assert source_reconciliation_job_ids(fixture) |> length() == 3
+
+    before_effect = fetch_effect!(fixture.effect.id)
+
+    before_source =
+      Sandbox.unboxed_run(Repo, fn -> source_identity_snapshot!(fixture.subscription.id) end)
+
+    assert :ok =
+             Sandbox.unboxed_run(Repo, fn ->
+               ReconcileSubscriptionAccessWorker.perform(%Oban.Job{
+                 args: %{
+                   "subscription_id" => fixture.subscription.id,
+                   "expected_access_effect_id" => fixture.effect.id
+                 }
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect.id) == before_effect
+
+    after_source =
+      Sandbox.unboxed_run(Repo, fn -> source_identity_snapshot!(fixture.subscription.id) end)
+
+    assert Map.drop(after_source, [:grants]) == Map.drop(before_source, [:grants])
+    assert before_source.grants == []
+
+    assert [%EntitlementGrant{} = grant] = grants_for_source!(fixture.subscription.id)
+    assert grant.id not in before_source.grants
+    assert grant.user_id == fixture.subscription.user_id
+    assert grant.kind == before_effect.entitlement_kind
+    assert grant.scope_key == before_effect.entitlement_scope_key
+    assert grant.source_kind == :subscription
+    assert grant.source_id == fixture.subscription.id
+    assert grant.status == :active
+    assert grant.valid_from_at == before_effect.valid_from_at
+    assert grant.valid_to_at == before_effect.valid_until_at
+    assert grant.revoked_at == nil
+    assert grant.revoked_reason == nil
+  end
+
+  test "JC248 verification reports fingerprint-valid provenance conflicts without repair" do
+    fixture = create_committed_effective_effect_fixture!("jc248_sweep_conflict")
+    other = create_committed_effective_effect_fixture!("jc248_sweep_conflict_other")
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+      Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.subscription.id),
+        Ecto.UUID.dump!(other.revision.id)
+      ])
+
+      Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.effect.id),
+        ~U[2020-01-01 00:00:00Z]
+      ])
+    end)
+
+    before = grants_for_source!(fixture.subscription.id)
+
+    assert AccessEffect.persisted_fingerprint_status(fetch_effect!(fixture.effect.id)) in [
+             :v2_match,
+             :v1_legacy_match
+           ]
+
+    assert {:ok, query} =
+             AppliedAccessVerificationQuery.new(%{as_of: ~U[2020-01-02 00:00:00Z], limit: 100})
+
+    assert {:ok, result} = Facade.verify_subscription_access_window_for_system(query)
+
+    assert result.conflicts == [
+             %{
+               subscription_id: fixture.subscription.id,
+               access_effect_id: fixture.effect.id,
+               reason: :invalid_authority
+             }
+           ]
+
+    assert result.repairs == []
+    assert grants_for_source!(fixture.subscription.id) == before
+    assert fetch_effect!(fixture.effect.id).status == :applied
+
+    handler_id = "jc248-verification-conflict-#{Ecto.UUID.generate()}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :subscriptions, :access_verification, :conflict],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:verification_conflict, event, measurements, metadata})
+        end,
+        self()
+      )
+
+    try do
+      assert :ok =
+               Sandbox.unboxed_run(Repo, fn ->
+                 VerifySubscriptionAccessWorker.perform(%Oban.Job{
+                   args: %{"as_of" => "2020-01-02T00:00:00Z", "limit" => 100}
+                 })
+               end)
+
+      assert_receive {:verification_conflict,
+                      [:store, :subscriptions, :access_verification, :conflict], %{count: 1},
+                      %{subscription_id: conflict_id, reason: :invalid_authority}}
+
+      assert conflict_id == fixture.subscription.id
+    after
+      :ok = :telemetry.detach(handler_id)
+
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+          Ecto.UUID.dump!(fixture.subscription.id),
+          Ecto.UUID.dump!(fixture.revision.id)
+        ])
+      end)
+    end
+  end
+
+  test "JC248 verification keeps two reads at sixteen sources with revoked history" do
+    fixtures =
+      Enum.map(1..16, fn index ->
+        create_committed_effective_effect_fixture!("jc248_sweep_fanout_#{index}")
+      end)
+
+    inserted_at = ~U[2090-01-01 00:00:00Z]
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Enum.each(fixtures, fn fixture ->
+        assert {:ok, :applied} =
+                 Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+        insert_revoked_history!(fixture, 32, inserted_at)
+
+        Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+          Ecto.UUID.dump!(fixture.effect.id),
+          inserted_at
+        ])
+      end)
+    end)
+
+    first_uuid = "00000000-0000-0000-0000-000000000000"
+
+    assert {:ok, query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: ~U[2090-01-02 00:00:00Z],
+               after_inserted_at: inserted_at,
+               after_id: first_uuid,
+               limit: 16
+             })
+
+    assert {{:ok, result}, stats} =
+             RepoStats.capture(fn ->
+               Facade.verify_subscription_access_window_for_system(query)
+             end)
+
+    assert stats.query_count == 2
+    assert result.raw_count == 16
+    assert result.current_count == 16
+    assert result.healthy_count == 16
+    assert result.repairs == []
+    assert result.conflicts == []
+  end
+
+  test "JC248 verification cursor advances through stale raw rows" do
+    stale = create_committed_effective_effect_fixture!("jc248_sweep_stale")
+    current = create_committed_effective_effect_fixture!("jc248_sweep_current")
+    stale_at = ~U[2091-01-01 00:00:00Z]
+    current_at = ~U[2092-01-01 00:00:00Z]
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert {:ok, :applied} = Facade.execute_effective_access_effect_for_system(stale.effect.id)
+      _newer = create_newer_untransitioned_effect!(stale)
+
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(current.effect.id)
+
+      Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(stale.effect.id),
+        stale_at
+      ])
+
+      Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(current.effect.id),
+        current_at
+      ])
+
+      Repo.query!(
+        "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+        [Ecto.UUID.dump!(current.subscription.id)]
+      )
+    end)
+
+    assert {:ok, first} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: ~U[2093-01-01 00:00:00Z],
+               after_inserted_at: ~U[2090-01-01 00:00:00Z],
+               after_id: "00000000-0000-0000-0000-000000000000",
+               limit: 1
+             })
+
+    assert {:ok, first_result} = Facade.verify_subscription_access_window_for_system(first)
+    assert first_result.stale_count == 1
+    assert DateTime.compare(first_result.cursor.timestamp, stale_at) == :eq
+    assert first_result.cursor.id == stale.effect.id
+
+    assert {:ok, second} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: first.as_of,
+               after_inserted_at: first_result.cursor.timestamp,
+               after_id: first_result.cursor.id,
+               limit: 1
+             })
+
+    assert {:ok, second_result} = Facade.verify_subscription_access_window_for_system(second)
+    assert second_result.current_count == 1
+
+    assert second_result.repairs == [
+             %{
+               subscription_id: current.subscription.id,
+               expected_access_effect_id: current.effect.id
+             }
+           ]
+
+    first_args = %{
+      "as_of" => "2093-01-01T00:00:00Z",
+      "after_inserted_at" => "2090-01-01T00:00:00Z",
+      "after_id" => "00000000-0000-0000-0000-000000000000",
+      "limit" => 1
+    }
+
+    assert :ok =
+             Sandbox.unboxed_run(Repo, fn ->
+               VerifySubscriptionAccessWorker.perform(%Oban.Job{args: first_args})
+             end)
+
+    continuation_args = %{
+      "as_of" => DateTime.to_iso8601(first_result.as_of),
+      "after_inserted_at" => DateTime.to_iso8601(first_result.cursor.timestamp),
+      "after_id" => stale.effect.id,
+      "limit" => 1
+    }
+
+    assert_enqueued(worker: VerifySubscriptionAccessWorker, args: continuation_args)
+
+    assert %{num_rows: 1} =
+             Store.DirectRepo.query!(
+               "DELETE FROM oban_jobs WHERE worker = $1 AND args = $2::jsonb",
+               [
+                 "Store.Workers.VerifySubscriptionAccessWorker",
+                 continuation_args
+               ]
+             )
+
+    assert :ok =
+             Sandbox.unboxed_run(Repo, fn ->
+               VerifySubscriptionAccessWorker.perform(%Oban.Job{args: first_args})
+             end)
+
+    assert_enqueued(worker: VerifySubscriptionAccessWorker, args: continuation_args)
+
+    assert :ok =
+             Sandbox.unboxed_run(Repo, fn ->
+               VerifySubscriptionAccessWorker.perform(%Oban.Job{args: continuation_args})
+             end)
+
+    assert_enqueued(
+      worker: ReconcileSubscriptionAccessWorker,
+      args: %{
+        "subscription_id" => current.subscription.id,
+        "expected_access_effect_id" => current.effect.id
+      }
+    )
+  end
+
+  test "JC248 inventory reports missing authority without enqueueing source work" do
+    healthy = create_committed_effective_effect_fixture!("jc248_inventory_healthy")
+    fixture = create_committed_effective_effect_fixture!("jc248_inventory_missing")
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+        [Ecto.UUID.dump!(fixture.subscription.id)]
+      )
+
+      Repo.query!("DELETE FROM access_effects WHERE id = $1", [Ecto.UUID.dump!(fixture.effect.id)])
+    end)
+
+    source_before =
+      Sandbox.unboxed_run(Repo, fn -> source_identity_snapshot!(fixture.subscription.id) end)
+
+    <<healthy_uuid_integer::unsigned-big-128>> = Ecto.UUID.dump!(healthy.subscription.id)
+    predecessor_id = Ecto.UUID.load!(<<healthy_uuid_integer - 1::unsigned-big-128>>)
+
+    handler_id = "jc248-inventory-missing-#{Ecto.UUID.generate()}"
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        [
+          [:store, :subscriptions, :access_authority_inventory, :missing],
+          [:store, :subscriptions, :access_authority_inventory, :page]
+        ],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:inventory_telemetry, event, measurements, metadata})
+        end,
+        self()
+      )
+
+    continuation_args = %{
+      "through_id" => fixture.subscription.id,
+      "after_id" => healthy.subscription.id,
+      "limit" => 1
+    }
+
+    try do
+      assert :ok =
+               Sandbox.unboxed_run(Repo, fn ->
+                 InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{
+                   args: %{
+                     "through_id" => fixture.subscription.id,
+                     "after_id" => predecessor_id,
+                     "limit" => 1
+                   }
+                 })
+               end)
+
+      assert_enqueued(worker: InventorySubscriptionAccessAuthorityWorker, args: continuation_args)
+
+      assert_receive {:inventory_telemetry,
+                      [:store, :subscriptions, :access_authority_inventory, :page],
+                      %{raw_count: 1, missing_count: 0}, _metadata}
+
+      assert :ok =
+               Sandbox.unboxed_run(Repo, fn ->
+                 InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{
+                   args: continuation_args
+                 })
+               end)
+
+      assert_receive {:inventory_telemetry,
+                      [:store, :subscriptions, :access_authority_inventory, :page],
+                      %{raw_count: 1, missing_count: 1}, _metadata}
+
+      assert_receive {:inventory_telemetry,
+                      [:store, :subscriptions, :access_authority_inventory, :missing],
+                      %{count: 1},
+                      %{subscription_id: subscription_id, classification: :unclassified}}
+
+      assert subscription_id == fixture.subscription.id
+
+      assert Sandbox.unboxed_run(Repo, fn ->
+               source_identity_snapshot!(fixture.subscription.id)
+             end) == source_before
+
+      assert grants_for_source!(fixture.subscription.id) == []
+      assert Sandbox.unboxed_run(Repo, fn -> Repo.get(AccessEffect, fixture.effect.id) end) == nil
+
+      refute_enqueued(worker: ReconcileSubscriptionAccessWorker)
+    after
+      :ok = :telemetry.detach(handler_id)
+    end
+  end
+
+  test "JC248 verification rejects invalid arguments and worker cursor parsing" do
+    assert {:ok, query} =
+             AppliedAccessVerificationQuery.new(%{as_of: ~U[2020-01-02 00:00:00Z], limit: 1})
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             Facade.verify_subscription_access_window_for_system(%{query | limit: 0})
+
+    assert {:discard, _} =
+             VerifySubscriptionAccessWorker.perform(%Oban.Job{args: %{"as_of" => nil}})
+
+    assert {:discard, _} =
+             VerifySubscriptionAccessWorker.perform(%Oban.Job{
+               args: %{
+                 "as_of" => DateTime.to_iso8601(query.as_of),
+                 "after_id" => Ecto.UUID.generate()
+               }
+             })
+
+    assert {{:discard, _}, half_cursor_stats} =
+             RepoStats.capture(fn ->
+               VerifySubscriptionAccessWorker.perform(%Oban.Job{
+                 args: %{
+                   "as_of" => DateTime.to_iso8601(query.as_of),
+                   "after_id" => Ecto.UUID.generate(),
+                   "after_inserted_at" => nil
+                 }
+               })
+             end)
+
+    assert half_cursor_stats.query_count == 0
+
+    assert {{:discard, _}, null_cursor_stats} =
+             RepoStats.capture(fn ->
+               VerifySubscriptionAccessWorker.perform(%Oban.Job{
+                 args: %{
+                   "as_of" => DateTime.to_iso8601(query.as_of),
+                   "after_id" => nil,
+                   "after_inserted_at" => nil
+                 }
+               })
+             end)
+
+    assert null_cursor_stats.query_count == 0
+
+    assert {{:discard, _}, cursor_stats} =
+             RepoStats.capture(fn ->
+               VerifySubscriptionAccessWorker.perform(%Oban.Job{
+                 args: %{
+                   "after_inserted_at" => DateTime.to_iso8601(query.as_of),
+                   "after_id" => Ecto.UUID.generate()
+                 }
+               })
+             end)
+
+    assert cursor_stats.query_count == 0
+
+    assert {:discard, _} =
+             InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{
+               args: %{"through_id" => nil}
+             })
+
+    assert {{:discard, _}, inventory_stats} =
+             RepoStats.capture(fn ->
+               InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{
+                 args: %{"after_id" => Ecto.UUID.generate()}
+               })
+             end)
+
+    assert inventory_stats.query_count == 0
+
+    assert {{:discard, _}, null_inventory_cursor_stats} =
+             RepoStats.capture(fn ->
+               InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{
+                 args: %{"through_id" => Ecto.UUID.generate(), "after_id" => nil}
+               })
+             end)
+
+    assert null_inventory_cursor_stats.query_count == 0
+
+    assert {{:discard, _}, limit_stats} =
+             RepoStats.capture(fn ->
+               InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{
+                 args: %{"limit" => 0}
+               })
+             end)
+
+    assert limit_stats.query_count == 0
+
+    assert {:discard, _} =
+             InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{
+               args: %{"through_id" => Ecto.UUID.generate(), "unknown" => true}
+             })
   end
 
   test "source reconciliation repairs current effective authority and worker reports outcomes" do
@@ -2187,6 +2784,70 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
         fixture.effect.valid_from_at,
         fixture.effect.valid_until_at,
         now,
+        scope_keys
+      ]
+    )
+  end
+
+  defp source_reconciliation_job_ids(fixture) do
+    Store.DirectRepo.query!(
+      """
+      SELECT id FROM oban_jobs
+      WHERE worker = $1 AND args->>'subscription_id' = $2
+        AND args->>'expected_access_effect_id' = $3
+      ORDER BY inserted_at, id
+      """,
+      [
+        "Store.Workers.ReconcileSubscriptionAccessWorker",
+        fixture.subscription.id,
+        fixture.effect.id
+      ]
+    ).rows
+  end
+
+  defp mark_source_reconciliation_jobs_terminal!(fixture, state) do
+    Store.DirectRepo.query!(
+      """
+      UPDATE oban_jobs
+      SET state = $4, attempt = 5
+      WHERE worker = $1 AND args->>'subscription_id' = $2
+        AND args->>'expected_access_effect_id' = $3 AND state = 'available'
+      """,
+      [
+        "Store.Workers.ReconcileSubscriptionAccessWorker",
+        fixture.subscription.id,
+        fixture.effect.id,
+        state
+      ]
+    )
+  end
+
+  defp insert_revoked_history!(fixture, count, inserted_at) do
+    ids = Enum.map(1..count, fn _ -> Ash.UUIDv7.generate() |> Ecto.UUID.dump!() end)
+
+    scope_keys =
+      Enum.map(1..count, fn index ->
+        "#{fixture.effect.entitlement_scope_key}:revoked-history:#{index}"
+      end)
+
+    Repo.query!(
+      """
+      INSERT INTO entitlement_grants (
+        id, user_id, kind, scope_key, source_kind, source_id, status,
+        valid_from_at, valid_to_at, revoked_at, revoked_reason, inserted_at, updated_at
+      )
+      SELECT historical.id, $2, 'membership_access', historical.scope_key,
+             'subscription', $3, 'revoked', $4, $5, $6, 'historical_test', $7, $7
+      FROM unnest($1::uuid[], $8::text[]) AS historical(id, scope_key)
+      """,
+      [
+        ids,
+        Ecto.UUID.dump!(fixture.subscription.user_id),
+        Ecto.UUID.dump!(fixture.subscription.id),
+        fixture.effect.valid_from_at,
+        fixture.effect.valid_until_at,
+        inserted_at,
+        inserted_at,
         scope_keys
       ]
     )
