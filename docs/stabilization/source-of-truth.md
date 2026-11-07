@@ -58,7 +58,10 @@ Based on `config/runtime.exs`:
 - Database:
   - `DATABASE_URL`, optional `ECTO_IPV6`, `POOL_SIZE`
   - `STORE_DB_POOL_MODE` supports `session` or `transaction`
-  - In `transaction` mode, repo uses `prepare: :unnamed` (PgBouncer-safe pattern)
+  - `POOL_SIZE` must be at least 3, leaving at least two primary Repo connections outside subscription workers
+  - In `transaction` mode, `Store.Repo` uses `prepare: :unnamed`
+  - Fresh off-session renewal dispatch returns `RENEWAL_DISPATCH_UNAVAILABLE` in every database mode because no installed provider implements the required revocation fence. Changing pool mode cannot enable it. Exact-ID observation and checkpoint-D application of existing collections remain available.
+  - `STORE_SUBSCRIPTIONS_QUEUE_LIMIT` optionally overrides the automatic subscriptions queue limit and must be a positive integer no greater than `POOL_SIZE - 2`
 - Payments:
   - enabled providers from `STORE_PAYMENTS_ENABLED_PROVIDERS`
   - optional UI default from `STORE_PAYMENTS_DEFAULT_PURCHASE_PROVIDER_FOR_UI`
@@ -171,10 +174,11 @@ Mechanisms present in code/config:
   - dependency present (`cachex ~> 4.1`)
 - Oban:
   - multiple queues configured (`webhooks`, `inventory`, `refunds`, `comms`, `fulfillment`, `digital`, `subscriptions`, `ops`)
+  - subscriptions defaults to 4 in ordinary config; production derives `min(4, POOL_SIZE - 2)` per node unless `STORE_SUBSCRIPTIONS_QUEUE_LIMIT` specifies another positive limit no greater than `POOL_SIZE - 2`
   - cron plugins for renewal/outbox/ops jobs
 - PgBouncer transaction mode:
   - repository has `pgbouncer/pgbouncer.ini` with `pool_mode = transaction`
-  - app runtime supports `STORE_DB_POOL_MODE=transaction` with `prepare: :unnamed`
+  - app runtime supports `STORE_DB_POOL_MODE=transaction` with `prepare: :unnamed`, while new renewal POSTs remain unavailable in that mode
 - Telemetry/logging:
   - telemetry dependencies configured
   - logger metadata includes operational/payment keys (request_id, actor_id, order_ref, provider, error_code, oban_job_id, etc.)

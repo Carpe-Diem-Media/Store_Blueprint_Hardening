@@ -154,6 +154,9 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
                     collection_attempt_id},
                    10_000
 
+    assert is_binary(renewal_attempt_id)
+    assert is_binary(collection_attempt_id)
+
     renewal_snapshot =
       Sandbox.unboxed_run(Repo, fn ->
         %{
@@ -170,7 +173,9 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
     cancel_result = Task.await(cancel_task, 10_000)
 
     send(renewal_task.pid, {:release_renewal_dispatch, dispatch_barrier})
-    assert {:ok, :processed} = Task.await(renewal_task, 10_000)
+
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
+             Task.await(renewal_task, 10_000)
 
     canceled = fixture_subscription(fixture.subscription_id)
 
@@ -184,6 +189,11 @@ defmodule Store.Subscriptions.Sbh2002RenewalImmediateCancellationTest do
 
     assert renewal_snapshot.collection_attempt.renewal_attempt_id ==
              renewal_snapshot.renewal_attempt.id
+
+    assert renewal_snapshot.renewal_attempt.id == renewal_attempt_id
+    assert renewal_snapshot.collection_attempt.id == collection_attempt_id
+    assert renewal_snapshot.collection_attempt.dispatch_state == :not_started
+    assert renewal_snapshot.collection_attempt.financial_outcome == :unresolved
 
     assert canceled.status == :canceled
     assert canceled.cancel_at_period_end == false

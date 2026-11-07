@@ -10,10 +10,9 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Store.Entitlements.EntitlementGrant
   alias Store.Entitlements.Facade, as: EntitlementsFacade
-  alias Store.Orders.Order
+  alias Store.Payments.Facade, as: PaymentsFacade
+  alias Store.Payments.Inputs.ObservePaymentIntentInput
   alias Store.Payments.Inputs.ValidateRenewalCollectionOutcomeInput
-  alias Store.Payments.PaymentIntent
-  alias Store.Payments.Types.ProviderObservation
   alias Store.Repo
   alias Store.Subscriptions.{AccessEffect, AccessEffectCurrentnessFence}
   alias Store.Subscriptions.Facade
@@ -26,6 +25,7 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
   alias Store.Subscriptions.RenewalCollectionAttempts
   alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   @start_timeout 30_000
@@ -536,23 +536,41 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
     fixture = create_committed_b_due_fixture!("recovery_first")
     establish_jc247_b_initial_effective_access!(fixture)
     original_grant = hd(grants_for_source!(fixture.subscription.id))
-    payment_phase = :atomics.new(1, [])
-    :atomics.put(payment_phase, 1, 1)
-    stub_b_payment_phase!(payment_phase)
-
+    fixture = prepare_jc247_b_failure!(fixture)
     barrier = make_ref()
     handler_id = attach_jc247_b_dunning_barrier!(self(), barrier, fixture.subscription.id)
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
     failure_task = start_jc247_b_failure_task(context, fixture)
     assert_receive {:jc247_b_dunning_paused, ^barrier, subscription_id}, @task_timeout
+    subscription_at_dunning = fetch_subscription!(subscription_id)
+
+    fixture =
+      Map.merge(fixture, %{
+        dunning_snapshot: {
+          subscription_at_dunning.aggregate_version,
+          subscription_at_dunning.current_dunning_renewal_attempt_id,
+          subscription_at_dunning.failed_payment_boundary_at,
+          subscription_at_dunning.next_retry_at
+        },
+        original_grants: grants_for_source!(subscription_id),
+        first_collection: fetch_collection!(fixture.first_reached.collection.id)
+      })
+
+    assert fixture.first_collection.financial_outcome == :verified_terminal_financial_non_success
+
+    assert_jc247_b_collection_certified!(
+      fixture.first_collection,
+      :verified_terminal_financial_non_success
+    )
+
     [original_effect, old_effect] = access_effects_for_subscription!(subscription_id)
     assert original_effect.disposition == :effective
     assert old_effect.disposition == :non_effective
     assert old_effect.status == :required
 
-    :atomics.put(payment_phase, 1, 2)
-    recovery_task = start_jc247_b_recovery_task(context, fixture, barrier)
+    retry = prepare_jc247_b_paid_retry!(fixture, subscription_id)
+    recovery_task = start_jc247_b_recovery_task(context, retry.handoff, barrier)
     assert {:ok, :reconciled} = Task.await(recovery_task, @transaction_timeout)
 
     recovered_effect = latest_access_effect!(subscription_id)
@@ -580,21 +598,69 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
     fixture = create_committed_b_due_fixture!("b_executor_first")
     _original_effect = establish_jc247_b_initial_effective_access!(fixture)
     original_grant = hd(grants_for_source!(fixture.subscription.id))
-    payment_phase = :atomics.new(1, [])
-    :atomics.put(payment_phase, 1, 1)
-    stub_b_payment_phase!(payment_phase)
-
+    fixture = prepare_jc247_b_failure!(fixture)
     barrier = make_ref()
     handler_id = attach_jc247_b_dunning_barrier!(self(), barrier, fixture.subscription.id)
     on_exit(fn -> :telemetry.detach(handler_id) end)
     failure_task = start_jc247_b_failure_task(context, fixture)
 
     assert_receive {:jc247_b_dunning_paused, ^barrier, subscription_id}, @task_timeout
+    subscription_at_dunning = fetch_subscription!(subscription_id)
+
+    fixture =
+      Map.merge(fixture, %{
+        dunning_snapshot: {
+          subscription_at_dunning.aggregate_version,
+          subscription_at_dunning.current_dunning_renewal_attempt_id,
+          subscription_at_dunning.failed_payment_boundary_at,
+          subscription_at_dunning.next_retry_at
+        },
+        original_grants: grants_for_source!(subscription_id),
+        first_collection: fetch_collection!(fixture.first_reached.collection.id)
+      })
+
     [original_effect, b_effect] = access_effects_for_subscription!(subscription_id)
     assert original_effect.disposition == :effective
     assert b_effect.disposition == :non_effective
     assert b_effect.status == :required
     attempt = fetch_attempt!(subscription_id)
+    source_before_retry = fetch_subscription!(subscription_id)
+
+    dunning_snapshot = {
+      source_before_retry.aggregate_version,
+      source_before_retry.current_dunning_renewal_attempt_id,
+      source_before_retry.failed_payment_boundary_at,
+      source_before_retry.next_retry_at
+    }
+
+    assert dunning_snapshot == fixture.dunning_snapshot
+    assert fixture.first_collection.financial_outcome == :verified_terminal_financial_non_success
+
+    assert_jc247_b_collection_certified!(
+      fixture.first_collection,
+      :verified_terminal_financial_non_success
+    )
+
+    retry = prepare_jc247_b_paid_retry!(fixture, subscription_id)
+    assert retry.attempt.id == attempt.id
+    assert retry.order.id == attempt.order_id
+    refute retry.collection.id == fixture.first_collection.id
+    refute retry.payment_intent.id == fixture.first_reached.payment_intent.id
+
+    source_after_retry = fetch_subscription!(subscription_id)
+
+    assert {
+             source_after_retry.aggregate_version,
+             source_after_retry.current_dunning_renewal_attempt_id,
+             source_after_retry.failed_payment_boundary_at,
+             source_after_retry.next_retry_at
+           } == dunning_snapshot
+
+    assert fetch_access_effect!(b_effect.id) == b_effect
+    assert b_effect.status == :required
+    assert b_effect.source_version == source_after_retry.aggregate_version
+    assert_effect_current!(b_effect)
+    assert grants_for_source!(subscription_id) == fixture.original_grants
 
     {attempt_barrier, attempt_barrier_pid} =
       start_jc247_b_recovery_order_barrier!(attempt.id, original_grant.id, barrier)
@@ -611,8 +677,7 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
         context.direct_repo_owner
       )
 
-    :atomics.put(payment_phase, 1, 2)
-    recovery_task = start_jc247_b_recovery_task(context, fixture, barrier)
+    recovery_task = start_jc247_b_recovery_task(context, retry.handoff, barrier)
     recovery_pid = receive_jc247_b_event!(barrier, :recovery_started)
 
     recovery_blockers =
@@ -1441,18 +1506,37 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
 
     subscription = fetch_subscription!(queued.id)
 
+    fixture =
+      Map.merge(fixture, %{
+        customer: customer,
+        product: product,
+        variant: variant,
+        variant_plan: current_variant_plan,
+        remove_variant_plan: remove_variant_plan,
+        plan: current_plan,
+        remove_plan: remove_plan,
+        subscription: subscription,
+        now: now,
+        run: fn ->
+          Facade.process_due_subscription_renewal_for_system(fixture.subscription.id, now: now)
+        end
+      })
+
+    fixture
+  end
+
+  defp prepare_jc247_b_failure!(fixture) do
+    StripeAPIStub.stub_unexpected!("legacy renewal preparation must not submit a charge")
+    first_reached = ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, fixture.now)
+
+    StripeAPIStub.stub_payment_observation(
+      first_reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(first_reached, "canceled")
+    )
+
     Map.merge(fixture, %{
-      customer: customer,
-      product: product,
-      variant: variant,
-      variant_plan: current_variant_plan,
-      remove_variant_plan: remove_variant_plan,
-      plan: current_plan,
-      remove_plan: remove_plan,
-      subscription: subscription,
-      run: fn ->
-        Facade.process_due_subscription_renewal_for_system(fixture.subscription.id, now: now)
-      end
+      first_reached: first_reached,
+      first_collection: fetch_collection!(first_reached.collection.id)
     })
   end
 
@@ -1628,17 +1712,6 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
     effect
   end
 
-  defp stub_b_payment_phase!(phase) do
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      status = if :atomics.get(phase, 1) == 1, do: "canceled", else: "processing"
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => status})
-      )
-    end)
-  end
-
   defp start_jc247_b_failure_task(context, fixture) do
     Task.async(fn ->
       Sandbox.allow(Store.DirectRepo, context.direct_repo_owner, self())
@@ -1646,7 +1719,7 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
     end)
   end
 
-  defp start_jc247_b_recovery_task(context, fixture, barrier) do
+  defp start_jc247_b_recovery_task(context, handoff, barrier) do
     parent = self()
 
     Task.async(fn ->
@@ -1655,7 +1728,13 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
       Repo.checkout(fn ->
         recovery_pid = backend_pid!()
         send(parent, {barrier, :recovery_started, recovery_pid})
-        recover_jc247_b_paid_episode!(fixture)
+
+        Facade.reconcile_paid_subscription_renewal_for_system(
+          handoff.order_id,
+          renewal_attempt_id: handoff.renewal_attempt_id,
+          collection_attempt_id: handoff.collection_attempt_id,
+          payment_intent_id: handoff.payment_intent_id
+        )
       end)
     end)
   end
@@ -1739,102 +1818,84 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
     handler_id
   end
 
-  defp recover_jc247_b_paid_episode!(fixture) do
-    subscription = fetch_subscription!(fixture.subscription.id)
-    attempt = fetch_attempt!(subscription.id)
+  defp prepare_jc247_b_paid_retry!(fixture, subscription_id) do
+    b_effect = latest_access_effect!(subscription_id)
+    StripeAPIStub.stub_unexpected!("legacy retry preparation must not submit a charge")
+    next_retry_at = elem(fixture.dunning_snapshot, 3)
+    assert %DateTime{} = next_retry_at
+    retry = ReachedRenewalFixtures.prepare_reached!(subscription_id, next_retry_at)
+    assert retry.attempt.id == fixture.first_reached.attempt.id
+    assert retry.order.id == fixture.first_reached.order.id
+    refute retry.collection.id == fixture.first_collection.id
+    refute retry.payment_intent.id == fixture.first_reached.payment_intent.id
+    assert retry.payment_intent.subscription_id == nil
+    assert retry.payment_intent.order_id == retry.attempt.order_id
 
-    order =
-      Ash.get!(Order, attempt.order_id,
-        domain: Store.Orders,
-        authorize?: false,
-        context: %{system?: true}
-      )
+    apply_jc247_b_paid_observation!(retry)
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id,
-               now: subscription.next_retry_at
-             )
-
-    collection = latest_collection_for_attempt!(attempt.id)
-    refute collection.financial_outcome == :verified_failure
-    mark_collection_successful!(collection)
-    assert {:ok, handoff} = RenewalCollectionAttempts.success_handoff_for_system(collection.id)
-    assert handoff.renewal_attempt_id == attempt.id
-
-    Facade.reconcile_paid_subscription_renewal_for_system(order.id,
-      renewal_attempt_id: handoff.renewal_attempt_id,
-      collection_attempt_id: handoff.collection_attempt_id,
-      payment_intent_id: handoff.payment_intent_id
+    assert_jc247_b_collection_certified!(
+      fetch_collection!(retry.collection.id),
+      :verified_success
     )
+
+    source = fetch_subscription!(subscription_id)
+
+    assert {
+             source.aggregate_version,
+             source.current_dunning_renewal_attempt_id,
+             source.failed_payment_boundary_at,
+             source.next_retry_at
+           } == fixture.dunning_snapshot
+
+    assert fetch_access_effect!(b_effect.id) == b_effect
+    assert_effect_current!(b_effect)
+    assert grants_for_source!(subscription_id) == fixture.original_grants
+
+    assert {:ok, handoff} =
+             RenewalCollectionAttempts.success_handoff_for_system(retry.collection.id)
+
+    assert handoff.renewal_attempt_id == retry.attempt.id
+
+    Map.merge(retry, %{handoff: Map.put(handoff, :order_id, retry.attempt.order_id)})
   end
 
-  defp latest_collection_for_attempt!(attempt_id) do
-    RenewalCollectionAttempt
-    |> Ash.Query.filter(expr(renewal_attempt_id == ^attempt_id))
-    |> Ash.Query.sort(inserted_at: :asc)
-    |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-    |> List.last()
-    |> case do
-      nil -> raise "no renewal collection for attempt #{attempt_id}"
-      collection -> collection
-    end
+  defp assert_effect_current!(effect) do
+    effect_id = effect.id
+
+    assert {:ok, {:ok, %{status: :current, access_effect: %{id: ^effect_id} = current}}} =
+             Repo.transaction(fn -> AccessEffectCurrentnessFence.prove(effect.id) end)
+
+    assert current.status == :required
+    assert current.source_version == effect.source_version
+    assert current.target_fingerprint == effect.target_fingerprint
   end
 
-  defp mark_collection_successful!(collection) do
-    payment_intent =
-      Ash.get!(PaymentIntent, collection.payment_intent_id,
-        domain: Store.Payments,
-        authorize?: false,
-        context: %{system?: true}
-      )
-
-    provider_reference =
-      payment_intent.provider_payment_id || payment_intent.provider_request_reference
-
-    provider_reference_kind =
-      if payment_intent.provider_payment_id, do: :payment_intent, else: :transaction_reference
-
-    observation = %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: provider_reference,
-      provider_reference_kind: provider_reference_kind,
-      provider_transaction_id: payment_intent.provider_payment_id || "pi_#{payment_intent.id}",
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :authoritative_success,
-      raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    }
-
-    assert {:ok, %{outcome: outcome}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               observation
-             )
-
-    assert outcome in [:authoritative_success, :already_applied_success]
-
-    updated =
-      RenewalCollectionAttempt
-      |> Ash.get!(collection.id,
-        domain: Store.Subscriptions,
-        authorize?: false,
-        context: %{system?: true}
-      )
-
-    assert updated.financial_outcome == :verified_success
-
+  defp assert_jc247_b_collection_certified!(collection, financial_outcome) do
     assert :ok ==
              Store.Payments.validate_collection_outcome_certification_for_system(
                %ValidateRenewalCollectionOutcomeInput{
-                 payment_attempt_id: updated.payment_attempt_id,
+                 payment_attempt_id: collection.payment_attempt_id,
                  payment_intent_id: collection.payment_intent_id,
-                 financial_outcome: :verified_success
+                 financial_outcome: financial_outcome
                }
              )
+  end
+
+  defp apply_jc247_b_paid_observation!(reached) do
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "succeeded")
+    )
+
+    assert {:ok, observed} =
+             PaymentsFacade.observe_payment_intent_for_system(%ObservePaymentIntentInput{
+               payment_intent_id: reached.payment_intent.id
+             })
+
+    assert {:ok, %{outcome: outcome}} =
+             PaymentsFacade.apply_observed_payment_outcome_for_system(observed)
+
+    assert outcome in [:authoritative_success, :already_applied_success]
   end
 
   defp fetch_subscription!(id) do
@@ -1847,6 +1908,12 @@ defmodule Store.Subscriptions.SourceFenceContentionTest do
     RenewalAttempt
     |> Ash.Query.filter(expr(subscription_id == ^subscription_id))
     |> Ash.Query.sort(inserted_at: :desc)
+    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_collection!(id) do
+    RenewalCollectionAttempt
+    |> Ash.Query.filter(expr(id == ^id))
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 

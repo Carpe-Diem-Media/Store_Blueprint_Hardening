@@ -2,7 +2,7 @@
 
 JC-256 requests a structured audit. It does not authorize production fixes, new trial rules, provider-managed enablement or live provider calls. Linear is the execution tracker. JC-219 and JC-220 are Done and their concrete prerequisites are accepted on canonical main `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`.
 
-The human requested stacked review. This branch starts at JC-248 head `e1f23d179560cffb073b750b08d1a684a2bb87c5` and its PR will target `jc-248-entitlement-reconciliation`. Each ticket remains a separate draft PR for human review and merge.
+The human requested stacked review. This branch started at JC-248 head `e1f23d179560cffb073b750b08d1a684a2bb87c5`. Its append-only parent update incorporates corrected JC-248 head `d3900b1670427696ec4c45bae37f7be6e1151903` and still targets `jc-248-entitlement-reconciliation`. Each ticket remains a separate draft PR for human review and merge.
 
 ## Audit boundaries
 
@@ -37,3 +37,9 @@ The review of `484e1bee231865f954cfab036c04aa377c39bc4b` requires accurate retry
 Keep the shared paid-order fixture unchanged after checking its consumers. Add an audit regression that requires matching nonzero finalized Order/line/payment totals and the exact PaymentApplication before activation, then verifies activation replay. First demonstrate that the existing fixture lacks this evidence. Change only the audit's positive Stripe fixture to use public cart/checkout/payment APIs, actual local evidence application and existing provider doubles. Keep the Yoco rejection and downstream renewal characterizations explicitly synthetic. Document that simulated success does not prove external collection, settlement or trial access.
 
 Use the existing isolated review checkout and DevCore suffix `_jc256_review_bc9c8bde` at the builder's confirmed safe checkpoint. Append commits to the existing PR branch without rewriting history. Re-run focused and repository checks, inspect fresh CI, and reassess downstream stack coverage. The builder retains downstream branch ownership. Return the amended head for independent review; do not merge or grant final approval.
+
+## Strict-dispatch parent integration
+
+Amendment `bccbc034a45a6f9d1cdbed2fdd908e22a838821d` remains an identifiable ancestor. Its sale/activation tests and the shared paid-order fixture are unchanged. The builder performs this later stack update in the normal checkout with a separate DevCore suffix; the amendment checkout and database remain untouched.
+
+The owner requires provider-enforced revocation fencing before fresh renewal submission. Installed adapters cannot supply it, so the corrected parent rejects fresh off-session dispatch. Renewal characterizations must first prove that rejection, retaining unsubmitted identities and unchanged periods without a provider POST. Separately labeled synthetic legacy possible-contact fixtures can recover exact-ID success through canonical observation and actual local financial evidence application. Counted period extensions still require an exact paid handoff, reconciliation and persisted period growth. These proofs establish local recovery behavior under supplied evidence, not new provider charges, external settlement or a valid initial purchase history for the legacy fixtures. Fixed-term, trial and provider-managed production remediation remains with JC-362, JC-363 and JC-364.
