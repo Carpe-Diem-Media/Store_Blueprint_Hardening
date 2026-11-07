@@ -10,9 +10,10 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   alias Store.Entitlements.EntitlementGrant
   alias Store.Entitlements.Facade, as: EntitlementsFacade
   alias Store.Orders.{Order, OrderLineItem}
+  alias Store.Payments.Facade, as: PaymentsFacade
+  alias Store.Payments.Inputs.ObservePaymentIntentInput
   alias Store.Payments.Inputs.ValidateRenewalCollectionOutcomeInput
   alias Store.Payments.PaymentIntent
-  alias Store.Payments.Types.ProviderObservation
 
   alias Store.Subscriptions.{
     AccessEffect,
@@ -30,6 +31,7 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   alias Store.Subscriptions.Inputs.QueueSubscriptionPlanChangeInput
   alias Store.SubscriptionsFixtures
   alias Store.Support.Telemetry.RepoStats
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   setup context do
@@ -403,8 +405,6 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   end
 
   test "suspended charged renewal executes its exact EFFECTIVE target before attempt success" do
-    stub_processing_provider_response!()
-
     %{subscription: subscription, attempt: attempt, order: order, collection: collection} =
       charged_bound_renewal!("jc245_suspended_direct_f1", success?: false)
 
@@ -439,8 +439,6 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   end
 
   test "projection pending is a successful suspended paid-renewal handoff" do
-    stub_processing_provider_response!()
-
     %{subscription: subscription, attempt: attempt, order: order, collection: collection} =
       charged_bound_renewal!("jc245_projection_pending_handoff", success?: false)
 
@@ -608,8 +606,6 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   end
 
   test "a suspended renewal retry identifies its historical effect after a newer target commits" do
-    stub_processing_provider_response!()
-
     %{subscription: subscription, attempt: attempt, order: order, collection: collection} =
       charged_bound_renewal!("jc245_historical_retry_after_newer_target", success?: false)
 
@@ -772,8 +768,6 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   end
 
   test "a later exact same-occurrence success recovers suspension and clears its boundary once" do
-    stub_processing_provider_response!()
-
     %{subscription: subscription, attempt: attempt, order: order, collection: collection} =
       charged_bound_renewal!("jc239_success_recovers_suspension", success?: false)
 
@@ -831,8 +825,6 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   end
 
   test "failure to establish the recovery AccessEffect rolls back paid suspension recovery" do
-    stub_processing_provider_response!()
-
     %{subscription: subscription, attempt: attempt, order: order, collection: collection} =
       charged_bound_renewal!("jc239_recovery_effect_rollback", success?: false)
 
@@ -863,37 +855,26 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   end
 
   test "the first requires_action result fixes the boundary from the bound occurrence policy" do
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      attempt_id = Ecto.UUID.dump!(Map.fetch!(params, "metadata[renewal_attempt_id]"))
-
-      assert {:ok, %{rows: [[plan_id, grace_period_days]]}} =
-               Store.Repo.query(
-                 """
-                 SELECT plan_revisions.subscription_plan_id::text,
-                        renewal_attempts.charged_contract_snapshot->>'grace_period_days'
-                 FROM renewal_attempts
-                 JOIN plan_revisions ON plan_revisions.id = renewal_attempts.plan_revision_id
-                 WHERE renewal_attempts.id = $1
-                 """,
-                 [attempt_id]
-               )
-
-      Store.Repo.query!(
-        "UPDATE subscription_plans SET grace_period_days = $1 WHERE id = $2",
-        [String.to_integer(grace_period_days) + 30, Ecto.UUID.dump!(plan_id)]
-      )
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_action"})
-      )
-    end)
-
-    %{subscription: subscription, attempt: attempt, now: now} =
+    %{subscription: subscription, attempt: attempt, revision: revision, now: now} =
       charged_bound_renewal!("jc239_auth_required_boundary", success?: false)
 
-    past_due = fetch_subscription!(subscription.id)
+    reached = reached_collection!(attempt)
     grace_period_days = attempt.charged_contract_snapshot["grace_period_days"]
+
+    Store.Repo.query!(
+      "UPDATE subscription_plans SET grace_period_days = $1 WHERE id = $2",
+      [grace_period_days + 30, Ecto.UUID.dump!(revision.subscription_plan_id)]
+    )
+
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "requires_action")
+    )
+
+    assert {:ok, :processed} =
+             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+
+    past_due = fetch_subscription!(subscription.id)
 
     assert past_due.status == :past_due
     assert past_due.current_dunning_renewal_attempt_id == attempt.id
@@ -990,19 +971,6 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   end
 
   test "replayed requires_action after a Plan change preserves the bound boundary and starts no collection" do
-    charge_count = :atomics.new(1, [])
-    {:ok, params_agent} = Agent.start_link(fn -> nil end)
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      :atomics.add(charge_count, 1, 1)
-      Agent.update(params_agent, fn _previous -> params end)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_action"})
-      )
-    end)
-
     %{
       subscription: subscription,
       attempt: attempt,
@@ -1012,6 +980,16 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
     } =
       charged_bound_renewal!("jc239_auth_required_replay", success?: false)
 
+    reached = reached_collection!(attempt)
+
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "requires_action")
+    )
+
+    assert {:ok, :processed} =
+             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+
     first = fetch_subscription!(subscription.id)
     boundary = first.failed_payment_boundary_at
     grace_days = attempt.charged_contract_snapshot["grace_period_days"]
@@ -1020,17 +998,6 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
       "UPDATE subscription_plans SET grace_period_days = $1 WHERE id = $2",
       [grace_days + 30, Ecto.UUID.dump!(revision.subscription_plan_id)]
     )
-
-    params = Agent.get(params_agent, & &1)
-
-    StripeAPIStub.stub_observation(fn conn ->
-      assert conn.method == "GET"
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_action"})
-      )
-    end)
 
     assert {:ok, :processed} =
              Facade.process_due_subscription_renewal_for_system(subscription.id,
@@ -1050,13 +1017,16 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
              DateTime.add(now, grace_days * 86_400, :second)
              |> DateTime.truncate(:microsecond)
 
-    assert :atomics.get(charge_count, 1) == 1
     assert fetch_collection!(collection.id).id == collection.id
+
+    assert [[1]] ==
+             Store.Repo.query!(
+               "SELECT count(*) FROM renewal_collection_attempts WHERE renewal_attempt_id = $1",
+               [Ecto.UUID.dump!(attempt.id)]
+             ).rows
   end
 
   test "a different attempt id cannot recover a suspended occurrence" do
-    stub_processing_provider_response!()
-
     %{subscription: subscription, attempt: attempt, order: order, collection: collection} =
       charged_bound_renewal!("jc239_different_occurrence", success?: false)
 
@@ -1079,8 +1049,6 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   end
 
   test "CANCELED and EXPIRED subscriptions cannot be recovered by later success" do
-    stub_processing_provider_response!()
-
     Enum.each([:canceled, :expired], fn terminal_status ->
       %{subscription: subscription, attempt: attempt, order: order, collection: collection} =
         charged_bound_renewal!("jc239_terminal_#{terminal_status}", success?: false)
@@ -1233,10 +1201,8 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
 
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    attempt = fetch_attempt_for_subscription!(subscription.id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
     collection = fetch_collection_for_attempt!(attempt.id)
     order = fetch_order!(attempt.order_id)
     mark_collection_successful!(collection)
@@ -1768,13 +1734,11 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
 
     contract_change = fetch_contract_change!(queued.current_contract_change_id)
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    attempt = fetch_attempt_for_subscription!(subscription.id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
     assert attempt.contract_change_id == contract_change.id
-    order = fetch_order!(attempt.order_id)
-    collection = fetch_collection_for_attempt!(attempt.id)
+    order = reached.order
+    collection = reached.collection
     if Keyword.get(opts, :success?, true), do: mark_collection_successful!(collection)
 
     %{
@@ -2109,61 +2073,52 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
   end
 
   defp mark_collection_successful!(collection) do
-    payment_intent = fetch_payment_intent!(collection.payment_intent_id)
+    attempt = fetch_attempt!(collection.renewal_attempt_id)
 
-    {reference, kind} =
-      cond do
-        is_binary(payment_intent.provider_payment_id) ->
-          {payment_intent.provider_payment_id, :payment_intent}
-
-        is_binary(payment_intent.provider_session_id) ->
-          {payment_intent.provider_session_id, :checkout_session}
-
-        true ->
-          {payment_intent.provider_request_reference, :transaction_reference}
-      end
-
-    observation = %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: reference,
-      provider_reference_kind: kind,
-      provider_transaction_id: payment_intent.provider_payment_id || "pi_#{payment_intent.id}",
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :authoritative_success,
-      raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    reached = %{
+      attempt: attempt,
+      order: fetch_order!(attempt.order_id),
+      collection: collection,
+      payment_intent: fetch_payment_intent!(collection.payment_intent_id)
     }
 
+    payment_intent = reached.payment_intent
+
+    StripeAPIStub.stub_payment_observation(
+      payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "succeeded")
+    )
+
+    assert {:ok, observed} =
+             PaymentsFacade.observe_payment_intent_for_system(%ObservePaymentIntentInput{
+               payment_intent_id: payment_intent.id
+             })
+
     assert {:ok, %{outcome: outcome}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               observation
-             )
+             PaymentsFacade.apply_observed_payment_outcome_for_system(observed)
 
     assert outcome in [:authoritative_success, :already_applied_success]
-    updated = fetch_collection!(collection.id)
+    updated = fetch_collection!(reached.collection.id)
 
     assert :ok ==
              Store.Payments.validate_collection_outcome_certification_for_system(
                %ValidateRenewalCollectionOutcomeInput{
                  payment_attempt_id: updated.payment_attempt_id,
-                 payment_intent_id: collection.payment_intent_id,
+                 payment_intent_id: reached.collection.payment_intent_id,
                  financial_outcome: :verified_success
                }
              )
   end
 
-  defp stub_processing_provider_response! do
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-      )
-    end)
+  defp reached_collection!(attempt) do
+    collection = fetch_collection_for_attempt!(attempt.id)
+
+    %{
+      attempt: attempt,
+      order: fetch_order!(attempt.order_id),
+      collection: collection,
+      payment_intent: fetch_payment_intent!(collection.payment_intent_id)
+    }
   end
 
   defp handoff_opts(handoff) do
@@ -2205,13 +2160,6 @@ defmodule Store.Subscriptions.Sbh1005ChargedContractReconciliationTest do
     EntitlementGrant
     |> Ash.Query.filter(expr(source_id == ^subscription_id and status == :active))
     |> Ash.read!(domain: Store.Entitlements, authorize?: false, context: %{system?: true})
-  end
-
-  defp fetch_attempt_for_subscription!(subscription_id) do
-    RenewalAttempt
-    |> Ash.Query.filter(expr(subscription_id == ^subscription_id))
-    |> Ash.Query.sort(inserted_at: :desc)
-    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 
   defp datetime_equal?(left, %DateTime{} = right) do

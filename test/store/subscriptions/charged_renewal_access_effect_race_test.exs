@@ -13,14 +13,15 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Store.Entitlements.EntitlementGrant
   alias Store.Entitlements.Facade, as: EntitlementsFacade
+  alias Store.Payments.Facade, as: PaymentsFacade
+  alias Store.Payments.Inputs.ObservePaymentIntentInput
   alias Store.Payments.Inputs.ValidateRenewalCollectionOutcomeInput
-  alias Store.Payments.PaymentIntent
-  alias Store.Payments.Types.ProviderObservation
   alias Store.Repo
   alias Store.Subscriptions.{AccessEffect, Facade, RenewalAttempt, RenewalCollectionAttempt}
   alias Store.Subscriptions.RenewalCollectionAttempts
   alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   @transaction_timeout 30_000
@@ -32,8 +33,9 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
 
     pool_size = Repo.config()[:pool_size]
 
-    unless is_integer(pool_size) and pool_size >= 3 do
-      raise "charged renewal race proof requires Store.Repo pool_size >= 3, got #{inspect(pool_size)}"
+    # Three race actors hold connections while Ash loads cancellation relationships.
+    unless is_integer(pool_size) and pool_size >= 4 do
+      raise "charged renewal race proof requires Store.Repo pool_size >= 4, got #{inspect(pool_size)}"
     end
 
     :ok = Sandbox.mode(Store.Repo, :auto)
@@ -46,6 +48,9 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
 
     assert_connected_test_database!(Store.Repo, expected_database)
     assert_connected_test_database!(Store.DirectRepo, expected_database)
+    # Auto ownership would retain the setup process's connections for this module.
+    :ok = Sandbox.checkin(Store.Repo)
+    :ok = Sandbox.checkin(Store.DirectRepo)
 
     {:ok, %{effective_repo_pool_size: pool_size}}
   end
@@ -56,6 +61,7 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
 
   test "a newer :now cancellation supersedes the exact committed renewal effect" do
     fixture = renewal_fixture!("jc300_renewal_cancel_newer")
+    :ok = Sandbox.checkin(Repo)
     run_ref = make_ref()
     telemetry_handler_id = attach_paid_renewal_barrier!(run_ref)
     parent = self()
@@ -95,6 +101,7 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
           end)
         end)
 
+      stop_task_on_exit(cancel_task)
       assert_receive {^run_ref, :cancel_backend, cancel_backend}, @task_timeout
       assert renewal_backend != cancel_backend
 
@@ -146,6 +153,7 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
 
   test "an F1 renewal holding the Subscription mutex commits before :now cancellation" do
     fixture = renewal_fixture!("jc300_renewal_cancel_after_f1", issue_initial_grant?: true)
+    :ok = Sandbox.checkin(Repo)
     run_ref = make_ref()
     parent = self()
 
@@ -187,6 +195,9 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
       assert renewal_effect.disposition == :effective
       assert renewal_effect.status == :required
 
+      # Leave the three connections to the barrier, renewal and cancellation tasks.
+      :ok = Sandbox.checkin(Repo)
+
       cancel_task =
         Task.async(fn ->
           Repo.checkout(fn ->
@@ -201,6 +212,7 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
           end)
         end)
 
+      stop_task_on_exit(cancel_task)
       assert_receive {^run_ref, :cancel_backend, cancel_backend}, @task_timeout
       assert length(Enum.uniq([renewal_backend, barrier_backend, cancel_backend])) == 3
 
@@ -236,8 +248,10 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
       assert subscription.status == :canceled
       assert subscription.current_period_start_at == fixture.attempt.period_start_at
       assert subscription.current_period_end_at == fixture.attempt.period_end_at
+      assert subscription.current_plan_revision_id == fixture.attempt.plan_revision_id
       assert fetch_attempt!(fixture.attempt.id).status == :succeeded
       assert fetch_order!(fixture.attempt.order_id).state == :paid
+      assert count_payment_applications(fixture.attempt.order_id) == 1
 
       IO.puts(
         "JC300_RACE_A_BEFORE_B barrier_backend=#{barrier_backend} renewal_backend=#{renewal_backend} " <>
@@ -250,6 +264,17 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
       if Process.alive?(renewal_task.pid), do: Task.shutdown(renewal_task, :brutal_kill)
       if Process.alive?(grant_barrier.pid), do: Task.shutdown(grant_barrier, :brutal_kill)
     end
+  end
+
+  defp stop_task_on_exit(task) do
+    on_exit(fn ->
+      monitor = Process.monitor(task.pid)
+      Process.exit(task.pid, :kill)
+
+      assert_receive {:DOWN, ^monitor, :process, task_pid, _reason}
+                     when task_pid == task.pid,
+                     @task_timeout
+    end)
   end
 
   defp renewal_fixture!(token, opts \\ []) do
@@ -303,21 +328,45 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
                )
     end
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
-               now: now
+    StripeAPIStub.stub_unexpected!("legacy renewal preparation must not submit a charge")
+    reached = ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, now)
+
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "succeeded")
+    )
+
+    assert {:ok, observed} =
+             PaymentsFacade.observe_payment_intent_for_system(%ObservePaymentIntentInput{
+               payment_intent_id: reached.payment_intent.id
+             })
+
+    assert {:ok, %{outcome: outcome}} =
+             PaymentsFacade.apply_observed_payment_outcome_for_system(observed)
+
+    assert outcome in [:authoritative_success, :already_applied_success]
+    collection = fetch_collection!(reached.collection.id)
+
+    assert :ok ==
+             Store.Payments.validate_collection_outcome_certification_for_system(
+               %ValidateRenewalCollectionOutcomeInput{
+                 payment_attempt_id: collection.payment_attempt_id,
+                 payment_intent_id: collection.payment_intent_id,
+                 financial_outcome: :verified_success
+               }
              )
 
-    attempt = fetch_latest_attempt!(fixture.subscription.id)
-    collection = fetch_collection_for_attempt!(attempt.id)
-    mark_collection_successful!(collection)
+    assert {:ok, handoff} =
+             RenewalCollectionAttempts.success_handoff_for_system(reached.collection.id)
 
-    assert {:ok, handoff} = RenewalCollectionAttempts.success_handoff_for_system(collection.id)
+    assert handoff.renewal_attempt_id == reached.attempt.id
+    assert reached.payment_intent.subscription_id == nil
+    assert reached.payment_intent.order_id == reached.attempt.order_id
 
     Map.merge(fixture, %{
-      attempt: fetch_attempt!(attempt.id),
-      collection: fetch_collection!(collection.id),
-      handoff: handoff
+      attempt: fetch_attempt!(reached.attempt.id),
+      collection: fetch_collection!(reached.collection.id),
+      handoff: Map.put(handoff, :order_id, reached.attempt.order_id)
     })
   end
 
@@ -445,19 +494,6 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 
-  defp fetch_latest_attempt!(subscription_id) do
-    RenewalAttempt
-    |> Ash.Query.filter(expr(subscription_id == ^subscription_id))
-    |> Ash.Query.sort(inserted_at: :desc)
-    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-  end
-
-  defp fetch_collection_for_attempt!(attempt_id) do
-    RenewalCollectionAttempt
-    |> Ash.Query.filter(expr(renewal_attempt_id == ^attempt_id))
-    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-  end
-
   defp fetch_collection!(id) do
     RenewalCollectionAttempt
     |> Ash.Query.filter(expr(id == ^id))
@@ -494,61 +530,6 @@ defmodule Store.Subscriptions.ChargedRenewalAccessEffectRaceTest do
 
   defp active_grants_for!(subscription_id) do
     Enum.filter(grants_for!(subscription_id), &(&1.status == :active))
-  end
-
-  defp mark_collection_successful!(collection) do
-    payment_intent = fetch_payment_intent!(collection.payment_intent_id)
-
-    {provider_reference, provider_reference_kind} =
-      cond do
-        is_binary(payment_intent.provider_payment_id) ->
-          {payment_intent.provider_payment_id, :payment_intent}
-
-        is_binary(payment_intent.provider_session_id) ->
-          {payment_intent.provider_session_id, :checkout_session}
-
-        true ->
-          {payment_intent.provider_request_reference, :transaction_reference}
-      end
-
-    observation = %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: provider_reference,
-      provider_reference_kind: provider_reference_kind,
-      provider_transaction_id: payment_intent.provider_payment_id || "pi_#{payment_intent.id}",
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :authoritative_success,
-      raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    }
-
-    assert {:ok, %{outcome: outcome}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               observation
-             )
-
-    assert outcome in [:authoritative_success, :already_applied_success]
-    updated_collection = fetch_collection!(collection.id)
-
-    assert :ok ==
-             Store.Payments.validate_collection_outcome_certification_for_system(
-               %ValidateRenewalCollectionOutcomeInput{
-                 payment_attempt_id: updated_collection.payment_attempt_id,
-                 payment_intent_id: collection.payment_intent_id,
-                 financial_outcome: :verified_success
-               }
-             )
-  end
-
-  defp fetch_payment_intent!(id) do
-    PaymentIntent
-    |> Ash.Query.filter(expr(id == ^id))
-    |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
   end
 
   defp handoff_opts(handoff) do

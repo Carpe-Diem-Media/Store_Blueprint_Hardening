@@ -8,15 +8,14 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
   alias Store.Entitlements.EntitlementGrant
   alias Store.Entitlements.Facade, as: EntitlementsFacade
   alias Store.Orders.Order
-  alias Store.Payments.Inputs.ValidateRenewalCollectionOutcomeInput
-  alias Store.Payments.PaymentIntent
-  alias Store.Payments.Types.ProviderObservation
+  alias Store.Payments.Inputs.ObservePaymentIntentInput
   alias Store.Repo
   alias Store.Subscriptions.{AccessEffect, ContractChange, Facade, RenewalAttempt, Subscription}
   alias Store.Subscriptions.Inputs.QueueSubscriptionPlanChangeInput
   alias Store.Subscriptions.RenewalCollectionAttempt
   alias Store.Subscriptions.RenewalCollectionAttempts
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   @barrier_timeout 10_000
@@ -35,7 +34,6 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
     barrier = make_ref()
     handler_id = attach_dunning_postcommit_barrier!(self(), barrier, fixture.subscription.id)
     on_exit(fn -> :telemetry.detach(handler_id) end)
-    stub_payment!("canceled")
 
     task = start_failure_task(context, fixture)
 
@@ -71,12 +69,36 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
 
   test "same-episode payment retry retains its pointer, snapshot, boundary, and one policy effect" do
     fixture = create_due_fixture!("jc247_b_failure_replay")
-    stub_payment!("canceled")
     assert {:error, %{code: "PAYMENT_FAILED"}} = fixture.run.()
 
     before_subscription = fetch_subscription!(fixture.subscription.id)
     before_attempt = fetch_attempt!(fixture.subscription.id)
     [first_effect] = access_effects!(fixture.subscription.id)
+
+    before_collection = latest_collection_for_attempt!(before_attempt.id)
+    StripeAPIStub.stub_unexpected!("retry preparation must not submit a renewal charge")
+
+    retry =
+      ReachedRenewalFixtures.prepare_reached!(
+        fixture.subscription.id,
+        before_subscription.next_retry_at
+      )
+
+    assert retry.attempt.id == before_attempt.id
+    assert retry.order.id == before_attempt.order_id
+    refute retry.collection.id == before_collection.id
+    refute retry.payment_intent.id == before_collection.payment_intent_id
+    assert retry.collection.renewal_attempt_id == before_attempt.id
+    assert retry.attempt.order_id == before_attempt.order_id
+    assert retry.payment_intent.id == retry.collection.payment_intent_id
+
+    assert retry.payment_intent.payment_intent_key ==
+             RenewalCollectionAttempts.payment_intent_key(retry.collection.id)
+
+    StripeAPIStub.stub_payment_observation(
+      retry.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(retry, "canceled")
+    )
 
     assert {:error, %{code: "PAYMENT_FAILED"}} =
              Facade.process_due_subscription_renewal_for_system(
@@ -98,35 +120,35 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
 
   test "authentication-required replay retains the same B effect and episode" do
     fixture = create_due_fixture!("jc247_b_auth_replay")
-    params_agent = start_supervised!({Agent, fn -> nil end})
+    StripeAPIStub.stub_unexpected!("legacy preparation must not contact Stripe")
+    reached = ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, fixture.now)
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      Agent.update(params_agent, fn _ -> params end)
+    observation =
+      ReachedRenewalFixtures.observation_body(reached, "requires_action", %{
+        "next_action" => %{
+          "redirect_to_url" => %{"url" => "https://payments.example.test/jc247-b-auth"}
+        }
+      })
 
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{
-          "status" => "requires_action",
-          "next_action" => %{
-            "redirect_to_url" => %{"url" => "https://payments.example.test/jc247-b-auth"}
-          }
-        })
-      )
-    end)
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      observation
+    )
 
-    assert {:ok, :processed} = fixture.run.()
+    assert {:ok, :processed} =
+             Facade.process_due_subscription_renewal_for_system(
+               fixture.subscription.id,
+               now: fixture.now
+             )
+
     before_subscription = fetch_subscription!(fixture.subscription.id)
     before_attempt = fetch_attempt!(fixture.subscription.id)
     [first_effect] = access_effects!(fixture.subscription.id)
 
-    StripeAPIStub.stub_observation(fn conn ->
-      params = Agent.get(params_agent, & &1)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_action"})
-      )
-    end)
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      observation
+    )
 
     assert {:ok, :processed} =
              Facade.process_due_subscription_renewal_for_system(
@@ -150,7 +172,6 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
     barrier = make_ref()
     handler_id = attach_dunning_postcommit_barrier!(self(), barrier, fixture.subscription.id)
     on_exit(fn -> :telemetry.detach(handler_id) end)
-    stub_payment!("canceled")
 
     task = start_failure_task(context, fixture)
 
@@ -204,7 +225,6 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
   test "later suspension does not rewrite a B grant revocation reason" do
     fixture = create_due_fixture!("jc247_b_historical_reason")
     issue_source_grant!(fixture)
-    stub_payment!("canceled")
     assert {:error, %{code: "PAYMENT_FAILED"}} = fixture.run.()
 
     [grant] = grants_for_source!(fixture.subscription.id)
@@ -231,7 +251,6 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
   test "later suspension revokes a recovered grant without rewriting the earlier B reason" do
     fixture = create_contract_bound_due_fixture!("jc247_b_recovered_grant_reason")
     issue_source_grant!(fixture)
-    stub_payment!("canceled")
     assert {:error, %{code: "PAYMENT_FAILED"}} = fixture.run.()
 
     [historical_grant] = grants_for_source!(fixture.subscription.id)
@@ -248,16 +267,41 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
         context: %{system?: true}
       )
 
-    stub_payment!("processing")
+    StripeAPIStub.stub_unexpected!("retry preparation must not submit a renewal charge")
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
-               now: failed_subscription.next_retry_at
-             )
+    retry =
+      ReachedRenewalFixtures.prepare_reached!(
+        fixture.subscription.id,
+        failed_subscription.next_retry_at
+      )
 
-    collection = latest_collection_for_attempt!(attempt.id)
-    mark_collection_successful!(collection)
-    assert {:ok, handoff} = RenewalCollectionAttempts.success_handoff_for_system(collection.id)
+    assert retry.attempt.id == attempt.id
+    assert retry.order.id == order.id
+    assert retry.collection.renewal_attempt_id == attempt.id
+    assert retry.attempt.order_id == order.id
+    assert retry.payment_intent.id == retry.collection.payment_intent_id
+
+    assert retry.payment_intent.payment_intent_key ==
+             RenewalCollectionAttempts.payment_intent_key(retry.collection.id)
+
+    StripeAPIStub.stub_payment_observation(
+      retry.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(retry, "succeeded")
+    )
+
+    assert {:ok, observed} =
+             Store.Payments.Facade.observe_payment_intent_for_system(%ObservePaymentIntentInput{
+               payment_intent_id: retry.payment_intent.id
+             })
+
+    assert {:ok, %{outcome: outcome}} =
+             Store.Payments.Facade.apply_observed_payment_outcome_for_system(observed)
+
+    assert outcome in [:authoritative_success, :already_applied_success]
+
+    assert {:ok, handoff} =
+             RenewalCollectionAttempts.success_handoff_for_system(retry.collection.id)
+
     assert handoff.renewal_attempt_id == attempt.id
 
     assert {:ok, :reconciled} =
@@ -281,12 +325,9 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
              queue_plan_change(fixture.customer, fixture.subscription.id, fixture.plan_y)
 
     subscription = fetch_subscription!(queued_y.id)
-    stub_payment!("canceled")
 
     assert {:error, %{code: "PAYMENT_FAILED"}} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id,
-               now: subscription.next_renewal_at
-             )
+             run_reached_fixture!(subscription.id, subscription.next_renewal_at, "canceled")
 
     past_due = fetch_subscription!(subscription.id)
     assert past_due.status == :past_due
@@ -324,11 +365,28 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
   end
 
   defp start_failure_task(context, fixture) do
+    _reached = prepare_reached_observation!(fixture.subscription.id, fixture.now, "canceled")
+
     Task.async(fn ->
       Sandbox.allow(Store.Repo, context.sandbox_owners[Store.Repo], self())
       Sandbox.allow(Store.DirectRepo, context.sandbox_owners[Store.DirectRepo], self())
-      fixture.run.()
+
+      Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
+        now: fixture.now
+      )
     end)
+  end
+
+  defp prepare_reached_observation!(subscription_id, now, status) do
+    StripeAPIStub.stub_unexpected!("legacy preparation must not contact Stripe")
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription_id, now)
+
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, status)
+    )
+
+    reached
   end
 
   defp attach_dunning_postcommit_barrier!(owner, barrier_ref, subscription_id) do
@@ -385,8 +443,15 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
       subscription: subscription,
       customer: customer,
       scope: "membership:#{label}",
-      run: fn -> Facade.process_due_subscription_renewal_for_system(subscription.id, now: now) end
+      now: now,
+      run: fn -> run_reached_fixture!(subscription.id, now, "canceled") end
     }
+  end
+
+  defp run_reached_fixture!(subscription_id, now, status) do
+    _reached = prepare_reached_observation!(subscription_id, now, status)
+
+    Facade.process_due_subscription_renewal_for_system(subscription_id, now: now)
   end
 
   defp create_contract_bound_due_fixture!(label) do
@@ -461,12 +526,13 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
     %{
       subscription: current,
       customer: customer,
+      now: now,
       scope: "membership:#{label}-current",
       label: label,
       plan_y: plan_y,
       change_x: change_x,
       funded_revision_id: current.current_plan_revision_id,
-      run: fn -> Facade.process_due_subscription_renewal_for_system(subscription.id, now: now) end
+      run: fn -> run_reached_fixture!(subscription.id, now, "canceled") end
     }
   end
 
@@ -502,24 +568,6 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
 
                :ok
              end)
-  end
-
-  defp stub_payment!(status) do
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      response =
-        if status == "requires_action" do
-          %{
-            "status" => status,
-            "next_action" => %{
-              "redirect_to_url" => %{"url" => "https://payments.example.test/jc247-b"}
-            }
-          }
-        else
-          %{"status" => status}
-        end
-
-      StripeAPIStub.json_response(conn, StripeAPIStub.payment_intent_response(params, response))
-    end)
   end
 
   defp fetch_subscription!(id) do
@@ -560,62 +608,6 @@ defmodule Store.Subscriptions.Jc247BAcceptanceMatrixTest do
       nil -> raise "no renewal collection for attempt #{attempt_id}"
       collection -> collection
     end
-  end
-
-  defp mark_collection_successful!(collection) do
-    payment_intent =
-      Ash.get!(PaymentIntent, collection.payment_intent_id,
-        domain: Store.Payments,
-        authorize?: false,
-        context: %{system?: true}
-      )
-
-    provider_reference =
-      payment_intent.provider_payment_id || payment_intent.provider_request_reference
-
-    provider_reference_kind =
-      if payment_intent.provider_payment_id, do: :payment_intent, else: :transaction_reference
-
-    observation = %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: provider_reference,
-      provider_reference_kind: provider_reference_kind,
-      provider_transaction_id: payment_intent.provider_payment_id || "pi_#{payment_intent.id}",
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :authoritative_success,
-      raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: db_now!()
-    }
-
-    assert {:ok, %{outcome: outcome}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               observation
-             )
-
-    assert outcome in [:authoritative_success, :already_applied_success]
-
-    updated =
-      Ash.get!(RenewalCollectionAttempt, collection.id,
-        domain: Store.Subscriptions,
-        authorize?: false,
-        context: %{system?: true}
-      )
-
-    assert updated.financial_outcome == :verified_success
-
-    assert :ok ==
-             Store.Payments.validate_collection_outcome_certification_for_system(
-               %ValidateRenewalCollectionOutcomeInput{
-                 payment_attempt_id: updated.payment_attempt_id,
-                 payment_intent_id: collection.payment_intent_id,
-                 financial_outcome: :verified_success
-               }
-             )
   end
 
   defp grants_for_source!(subscription_id) do

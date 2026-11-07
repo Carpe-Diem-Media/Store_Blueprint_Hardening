@@ -36,7 +36,19 @@ An existing bound RenewalAttempt keeps its stored timezone, period, and charged-
 
 The current due-renewal path calculates a live revision period twice before reusing an existing attempt. Replace that discovery step with the existing bounded current-attempt lookup. Validate complete bound evidence and use its stored renewal key. Only an unbound occurrence calculates a new period. Pass the resolved key into the execution helper so it cannot calculate another identity from current timezone configuration. Preserve locked binding and stale-version checks. Timezone contract errors must bypass payment-failure lifecycle mutation, including when a queued target revision fails inside binding.
 
-No schema, index, lifecycle, provider contract, payment-method authority, entitlement executor, or worker architecture changes are needed. This ticket does not select a NewYou billing timezone from geography, participant preferences, or provider behavior.
+No schema, index, lifecycle, provider contract, payment-method authority, or entitlement executor changes are needed. This ticket does not select a NewYou billing timezone from geography, participant preferences, or provider behavior.
+
+## Independent review correction: isolate invalid sources
+
+Review at `6001f015ff3cc19d47ca123e6c0273a688c9ab91` confirmed that propagating the timezone error into the existing batch reducer discards valid jobs from the same selected page. The invalid source remains due, so the outage repeats. The correction belongs to enumeration; direct single-source execution must still return `INVALID_BILLING_TIMEZONE` before new binding or payment work.
+
+Skip only this explicit timezone error during enumeration, with a warning containing the subscription and effective revision IDs and the registered code. Preserve existing unresolved-contract handling and propagate unexpected errors. Historical contracts remain unchanged.
+
+Add a one-page facade result containing valid jobs, selection time and a continuation cursor. Preserve the existing list facade's return shape and selected-row limit. Preserve chronological ordering through `next_renewal_at ASC NULLS LAST, id ASC`, using PostgreSQL UUID comparison. The cursor includes the last scanned row even when that row is invalid and the page has zero jobs. Nullable timestamps require a distinct null phase, so eligible past-due retries remain reachable.
+
+The existing tick worker enqueues a page's valid jobs, then one continuation of itself with the same selection time, limit and cursor. Include arguments in its uniqueness fields so continuation pages can coexist with the root tick and equivalent page insertions deduplicate. Each invocation inspects at most 500 sources. A new root tick begins without a cursor. Rows changing position during a sweep may wait for the next tick; this does not establish a snapshot of the due set.
+
+This extends the existing worker using the repository's scheduled-cancellation continuation pattern. It adds no worker process type, scheduler, dependency, or persistent contract state. Full invalid pages cannot permanently occupy the first selection window. Queue growth under sustained load and multi-node behavior remain separate measurement questions.
 
 ## Evidence
 

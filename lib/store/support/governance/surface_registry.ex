@@ -178,6 +178,8 @@ defmodule Store.Support.Governance.SurfaceRegistry do
         {:handle_payment_method_update_succeeded_for_system, 1},
         {:list_due_renewal_jobs_for_system, 0},
         {:list_due_renewal_jobs_for_system, 1},
+        {:list_due_renewal_job_page_for_system, 0},
+        {:list_due_renewal_job_page_for_system, 1},
         {:process_due_subscription_renewal_for_system, 1},
         {:process_due_subscription_renewal_for_system, 2},
         {:validate_complete_bound_renewal_attempt_for_system, 1},
