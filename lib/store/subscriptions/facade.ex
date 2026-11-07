@@ -2897,18 +2897,14 @@ defmodule Store.Subscriptions.Facade do
          financial_outcome
        ) do
     with true <- financial_outcome == :unresolved,
-         {:ok, submitted_payment_intent} <- maybe_submit_virtual_payment_intent(payment_intent),
-         {:ok, charge_response} <-
-           Providers.charge_off_session(
-             subscription.provider,
-             renewal_collection_charge_request(
-               attempt,
-               order,
-               submitted_payment_intent,
-               provider_payment_method,
-               collection
-             ),
-             []
+         {:captured_response, submitted_payment_intent, charge_response} <-
+           request_captured_renewal_charge(
+             subscription,
+             attempt,
+             order,
+             payment_intent,
+             provider_payment_method,
+             collection
            ),
          {:ok, updated_payment_intent} <-
            persist_payment_intent_provider_refs(submitted_payment_intent, charge_response),
@@ -2930,6 +2926,9 @@ defmodule Store.Subscriptions.Facade do
            "only an unresolved collection may be replayed for submission",
            %{existing_collection_replay?: true}
          )}
+
+      {:observe_captured, exact_payment_intent} ->
+        reconcile_existing_renewal_collection(exact_payment_intent, collection)
 
       {:error, reason} ->
         {:error, reason}
@@ -3509,7 +3508,8 @@ defmodule Store.Subscriptions.Facade do
     renewal_period = renewal_period_from_attempt(attempt)
 
     with {:ok, effective_contract} <- effective_renewal_contract(attempt, live_revision),
-         :ok <- ensure_renewal_chargeability(subscription, effective_contract.plan),
+         :ok <-
+           ensure_due_renewal_chargeability(subscription, attempt, effective_contract.plan, now),
          {:ok, checkout} <-
            build_or_reuse_renewal_checkout(
              subscription,
@@ -6076,6 +6076,29 @@ defmodule Store.Subscriptions.Facade do
     end
   end
 
+  defp ensure_due_renewal_chargeability(subscription, attempt, plan, now) do
+    case ensure_renewal_chargeability(subscription, plan) do
+      :ok ->
+        :ok
+
+      {:error, %Error{code: "PAYMENT_METHOD_REQUIRED"} = reason} ->
+        case RenewalCollectionAttempts.recover_reached_for_subscription_for_system(
+               subscription.id,
+               now
+             ) do
+          {:ok, %{renewal_attempt: %RenewalAttempt{id: attempt_id}}}
+          when attempt_id == attempt.id ->
+            :ok
+
+          _ ->
+            {:error, reason}
+        end
+
+      other ->
+        other
+    end
+  end
+
   defp fetch_active_stored_payment_method(%Subscription{stored_payment_method_id: nil}) do
     {:error,
      Error.new(
@@ -6777,30 +6800,14 @@ defmodule Store.Subscriptions.Facade do
           now: now
         }
 
-        case RenewalCollectionAttempts.attach_and_claim_dispatch_for_system(input) do
-          {:ok, claim} ->
-            if claim.dispatch_claimed? do
-              :telemetry.execute(
-                [:store, :subscriptions, :renewal_charge_dispatch_claimed],
-                %{},
-                %{
-                  source: :fresh_dispatch,
-                  subscription_id: subscription.id,
-                  renewal_attempt_id: bound_attempt.id,
-                  collection_attempt_id: claim.collection_attempt.id,
-                  payment_intent_id: claim.payment_intent.id
-                }
-              )
-            end
-
-            submit_claimed_renewal_collection(subscription, plan, bound_attempt, claim, now)
-
-          {:error, %Error{code: "RENEWAL_AUTHORITY_WITHDRAWN"}} ->
-            fence_withdrawn_renewal_collection(collection_attempt, now)
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        dispatch_renewal_collection(
+          subscription,
+          plan,
+          bound_attempt,
+          collection_attempt,
+          input,
+          now
+        )
       end
 
     settle_replayed_authentication_required(
@@ -6809,6 +6816,197 @@ defmodule Store.Subscriptions.Facade do
       bound_attempt,
       collection_attempt,
       now
+    )
+  end
+
+  defp dispatch_renewal_collection(subscription, plan, bound_attempt, collection, input, now) do
+    result =
+      if collection.dispatch_state == :not_started do
+        PaymentMethodAuthorityGate.with_dispatch_session_gates(
+          subscription.user_id,
+          subscription.provider,
+          fn -> current_dispatch_identity(subscription) end,
+          fn identity, proof ->
+            with {:ok, current} <- current_dispatch_identity(subscription),
+                 true <- current == identity,
+                 {:ok, claim} <-
+                   RenewalCollectionAttempts.attach_and_claim_dispatch_for_system(input) do
+              if claim.dispatch_claimed? do
+                attempt = claim.renewal_attempt || bound_attempt
+                emit_fresh_dispatch_claimed(subscription, attempt, claim)
+
+                with {:ok, payment_intent} <-
+                       maybe_submit_virtual_payment_intent(claim.payment_intent),
+                     :ok <- PaymentMethodAuthorityGate.confirm_dispatch_session(proof) do
+                  response =
+                    initiate_renewal_charge(
+                      subscription,
+                      attempt,
+                      claim.order,
+                      payment_intent,
+                      claim.provider_payment_method,
+                      claim.collection_attempt
+                    )
+
+                  {:fresh_response, attempt, claim.order, payment_intent,
+                   claim.collection_attempt, response}
+                end
+              else
+                {:existing_claim, claim}
+              end
+            else
+              false -> {:error, :method_authority_changed}
+              error -> error
+            end
+          end
+        )
+      else
+        case RenewalCollectionAttempts.attach_and_claim_dispatch_for_system(input) do
+          {:ok, claim} -> {:existing_claim, claim}
+          error -> error
+        end
+      end
+
+    case result do
+      {:fresh_response, attempt, order, payment_intent, claimed_collection, response} ->
+        emit_dispatch_gate_released(subscription, attempt, claimed_collection, payment_intent)
+
+        apply_off_session_renewal_response(
+          subscription,
+          attempt,
+          order,
+          payment_intent,
+          claimed_collection,
+          response,
+          now
+        )
+
+      {:existing_claim, claim} ->
+        submit_claimed_renewal_collection(subscription, plan, bound_attempt, claim, now)
+
+      {:error, %Error{code: "RENEWAL_AUTHORITY_WITHDRAWN"}} ->
+        fence_withdrawn_renewal_collection(collection, now)
+
+      {:error, reason}
+      when reason in [:method_authority_changed, :lock_unavailable, :transaction_required] ->
+        {:error, stale_dispatch_authority()}
+
+      error ->
+        error
+    end
+  end
+
+  defp current_dispatch_identity(subscription) do
+    with {:ok, current} <- fetch_subscription_for_renewal(subscription.id),
+         true <-
+           current.user_id == subscription.user_id and current.provider == subscription.provider,
+         {:ok, method} <- fetch_active_stored_payment_method(current),
+         true <- method.provider == current.provider,
+         true <- current.provider_customer_ref == method.provider_customer_ref,
+         true <- current.provider_billing_ref == method.provider_payment_method_ref do
+      {:ok,
+       %{
+         provider: current.provider,
+         method_id: method.id,
+         customer_ref: method.provider_customer_ref,
+         method_ref: method.provider_payment_method_ref
+       }}
+    else
+      false -> {:error, :method_authority_changed}
+      {:error, %Error{code: "PAYMENT_METHOD_REQUIRED"}} -> {:error, :method_authority_changed}
+      _ -> {:error, :lock_unavailable}
+    end
+  end
+
+  defp request_captured_renewal_charge(
+         subscription,
+         attempt,
+         order,
+         payment_intent,
+         method,
+         collection
+       ) do
+    result =
+      PaymentMethodAuthorityGate.with_dispatch_session_gates(
+        subscription.user_id,
+        subscription.provider,
+        fn -> current_dispatch_identity(subscription) end,
+        fn identity, proof ->
+          with {:ok, current} <- current_dispatch_identity(subscription),
+               true <- current == identity,
+               true <- captured_method_matches?(current, payment_intent, method),
+               {:ok, submitted} <- maybe_submit_virtual_payment_intent(payment_intent),
+               :ok <- PaymentMethodAuthorityGate.confirm_dispatch_session(proof) do
+            response =
+              initiate_renewal_charge(subscription, attempt, order, submitted, method, collection)
+
+            {:captured_response, submitted, response}
+          else
+            false -> {:error, :method_authority_changed}
+            error -> error
+          end
+        end
+      )
+
+    case result do
+      {:captured_response, submitted, response} ->
+        emit_dispatch_gate_released(subscription, attempt, collection, submitted)
+        {:captured_response, submitted, response}
+
+      {:error, :method_authority_changed} ->
+        {:observe_captured, payment_intent}
+
+      {:error, reason} when reason in [:lock_unavailable, :transaction_required] ->
+        {:error, stale_dispatch_authority()}
+
+      error ->
+        error
+    end
+  end
+
+  defp captured_method_matches?(identity, payment_intent, method) do
+    identity.customer_ref == payment_intent.provider_customer_ref and
+      identity.method_ref == payment_intent.provider_payment_method_ref and
+      identity.customer_ref == method.provider_customer_ref and
+      identity.method_ref == method.provider_payment_method_ref
+  end
+
+  defp initiate_renewal_charge(subscription, attempt, order, payment_intent, method, collection) do
+    Providers.charge_off_session(
+      subscription.provider,
+      renewal_collection_charge_request(attempt, order, payment_intent, method, collection),
+      []
+    )
+  end
+
+  defp stale_dispatch_authority do
+    Error.new("STALE_RECORD", "renewal dispatch authority changed before provider request")
+  end
+
+  defp emit_fresh_dispatch_claimed(subscription, attempt, claim) do
+    :telemetry.execute(
+      [:store, :subscriptions, :renewal_charge_dispatch_claimed],
+      %{},
+      %{
+        source: :fresh_dispatch,
+        subscription_id: subscription.id,
+        renewal_attempt_id: attempt.id,
+        collection_attempt_id: claim.collection_attempt.id,
+        payment_intent_id: claim.payment_intent.id
+      }
+    )
+  end
+
+  defp emit_dispatch_gate_released(subscription, attempt, collection, payment_intent) do
+    :telemetry.execute(
+      [:store, :subscriptions, :renewal_charge_dispatch_released],
+      %{},
+      %{
+        subscription_id: subscription.id,
+        renewal_attempt_id: attempt.id,
+        collection_attempt_id: collection.id,
+        payment_intent_id: payment_intent.id
+      }
     )
   end
 
@@ -6982,18 +7180,43 @@ defmodule Store.Subscriptions.Facade do
          collection_attempt,
          now
        ) do
-    with {:ok, charge_response} <-
-           Providers.charge_off_session(
-             subscription.provider,
-             renewal_collection_charge_request(
-               attempt,
-               order,
-               payment_intent,
-               stored_payment_method,
-               collection_attempt
-             ),
-             []
-           ),
+    case request_captured_renewal_charge(
+           subscription,
+           attempt,
+           order,
+           payment_intent,
+           stored_payment_method,
+           collection_attempt
+         ) do
+      {:observe_captured, exact_intent} ->
+        reconcile_existing_renewal_collection(exact_intent, collection_attempt)
+
+      {:captured_response, submitted_payment_intent, response} ->
+        apply_off_session_renewal_response(
+          subscription,
+          attempt,
+          order,
+          submitted_payment_intent,
+          collection_attempt,
+          response,
+          now
+        )
+
+      error ->
+        error
+    end
+  end
+
+  defp apply_off_session_renewal_response(
+         subscription,
+         attempt,
+         order,
+         payment_intent,
+         collection_attempt,
+         response,
+         now
+       ) do
+    with {:ok, charge_response} <- response,
          {:ok, payment_intent} <-
            persist_payment_intent_provider_refs(payment_intent, charge_response),
          observation <-
