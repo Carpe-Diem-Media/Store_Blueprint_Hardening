@@ -10,12 +10,69 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
   alias Store.Repo
   alias Store.Subscriptions.{AccessEffect, Facade, Subscription}
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
+  alias Store.Subscriptions.Inputs.ReconcileSubscriptionAccessInput
   alias Store.SubscriptionsFixtures
   alias Store.Support.Telemetry.RepoStats
   alias Store.TestSupport.StripeAPIStub
+  alias Store.Workers.ReconcileSubscriptionAccessWorker
 
   setup context do
     StripeAPIStub.setup_default(context)
+  end
+
+  test "source reconciliation applies current NON_EFFECTIVE authority" do
+    fixture = create_committed_suspended_effect_fixture!("jc248_reconcile_suspended")
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription_id
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect_id).status == :applied
+    assert Enum.all?(grants_for_source!(fixture.subscription_id), &(&1.status != :active))
+
+    assert :ok =
+             Sandbox.unboxed_run(Repo, fn ->
+               ReconcileSubscriptionAccessWorker.perform(%Oban.Job{
+                 args: %{"subscription_id" => fixture.subscription_id}
+               })
+             end)
+  end
+
+  test "source reconciliation rejects NON_EFFECTIVE plan provenance drift without writes" do
+    fixture =
+      create_committed_suspended_effect_fixture!("jc248_reconcile_non_effective_provenance")
+
+    foreign = create_committed_suspended_effect_fixture!("jc248_reconcile_non_effective_foreign")
+    before_effect = fetch_effect!(fixture.effect_id)
+    foreign_effect = fetch_effect!(foreign.effect_id)
+    before_grants = grants_for_source!(fixture.subscription_id)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.subscription_id),
+        Ecto.UUID.dump!(foreign_effect.plan_revision_id)
+      ])
+    end)
+
+    assert {:error, %Store.Support.Errors.Error{code: "VALIDATION_ERROR"}} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription_id
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect_id) == before_effect
+    assert grants_for_source!(fixture.subscription_id) == before_grants
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.subscription_id),
+        Ecto.UUID.dump!(before_effect.plan_revision_id)
+      ])
+    end)
   end
 
   test "current non-effective effect revokes past-due source grants with purchased-policy reason" do

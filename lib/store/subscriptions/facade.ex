@@ -34,6 +34,7 @@ defmodule Store.Subscriptions.Facade do
     EstablishAccessEffectInput,
     QueueSubscriptionPlanChangeInput,
     QueueSubscriptionVariantChangeInput,
+    ReconcileSubscriptionAccessInput,
     StartSubscriptionPaymentMethodUpdateInput
   }
 
@@ -206,6 +207,78 @@ defmodule Store.Subscriptions.Facade do
     {:error, Error.new("VALIDATION_ERROR", "AccessEffect id must be a UUID")}
   end
 
+  @doc "Reconciles a Subscription's current durable AccessEffect authority and exact-source grants."
+  @spec reconcile_subscription_access_for_system(ReconcileSubscriptionAccessInput.t()) ::
+          {:ok,
+           :applied
+           | :applied_projection_pending
+           | :superseded
+           | :noop
+           | :stale
+           | :repaired
+           | :already_converged}
+          | {:error, Error.t() | term()}
+  def reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{} = input) do
+    with {:ok, input} <- ReconcileSubscriptionAccessInput.new(Map.from_struct(input)) do
+      if Repo.in_transaction?() do
+        {:error,
+         Error.new(
+           "VALIDATION_ERROR",
+           "source reconciliation must own its correctness transaction"
+         )}
+      else
+        reconcile_subscription_access(input)
+      end
+    end
+  end
+
+  def reconcile_subscription_access_for_system(_input),
+    do: {:error, Error.new("VALIDATION_ERROR", "typed source reconciliation input required")}
+
+  defp reconcile_subscription_access(input) do
+    with {:ok, _subscription} <- fetch_subscription_for_renewal(input.subscription_id),
+         {:ok, %AccessEffect{} = effect} <- read_current_access_effect(input.subscription_id) do
+      cond do
+        not is_nil(input.expected_access_effect_id) and
+            input.expected_access_effect_id != effect.id ->
+          {:ok, :stale}
+
+        effect.status == :applied ->
+          repair_applied_access_effect_for_system(effect.id)
+
+        effect.disposition == :effective and
+            effect.status in [:required, :pending, :failed_retryable] ->
+          execute_effective_access_effect_for_system(effect.id)
+
+        effect.disposition == :non_effective and
+            effect.status in [:required, :pending, :failed_retryable] ->
+          execute_suspension_access_effect_for_system(effect.id)
+
+        true ->
+          {:error,
+           Error.new(
+             "INVALID_STATE_TRANSITION",
+             "latest AccessEffect is not executable authority"
+           )}
+      end
+    else
+      {:ok, nil} ->
+        {:error,
+         Error.new(
+           "VALIDATION_ERROR",
+           "Subscription source has no durable AccessEffect authority",
+           %{
+             reason: :missing_access_effect,
+             classification: :unclassified,
+             subscription_id: input.subscription_id
+           }
+         )}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp handle_effective_access_effect_transaction(
          {:ok, {:applied, effect, user_ids}},
          _effect_id
@@ -361,9 +434,7 @@ defmodule Store.Subscriptions.Facade do
   end
 
   defp repair_current_applied_access_effect(effect, subscription_id, user_id) do
-    with {:ok, current_provenance} <- lock_access_effect_subscription(subscription_id),
-         :ok <- validate_access_effect_provenance(effect, current_provenance),
-         :ok <- validate_access_effect_target_entitlement(effect, current_provenance),
+    with :ok <- validate_current_access_effect_provenance(effect, subscription_id),
          {:ok, input} <- applied_source_reconciliation_input(effect, subscription_id, user_id),
          {:ok, {outcome, convergence}} <-
            EntitlementsFacade.reconcile_subscription_source_grants_for_system(input) do
@@ -9805,6 +9876,9 @@ defmodule Store.Subscriptions.Facade do
         )
     end
   catch
+    :throw, {DBConnection, _connection_ref, {:effective_proof_failure, %Error{} = reason}} ->
+      Repo.rollback({:effective_proof_failure, reason})
+
     :throw, {DBConnection, _connection_ref, reason} ->
       Repo.rollback({:effective_execution_failure, reason})
   end
@@ -9820,7 +9894,8 @@ defmodule Store.Subscriptions.Facade do
          source: %{subscription_id: subscription_id, user_id: user_id},
          access_effect: %AccessEffect{} = effect
        }) do
-    with {:ok, pending_effect} <- access_effect_to_pending(effect),
+    with :ok <- validate_current_access_effect_provenance(effect, subscription_id),
+         {:ok, pending_effect} <- access_effect_to_pending(effect),
          {:ok, input} <- effective_source_convergence_input(subscription_id, user_id, effect),
          {:ok, convergence} <- converge_effective_access_source(input),
          {:ok, applied_effect} <-
@@ -9977,7 +10052,8 @@ defmodule Store.Subscriptions.Facade do
          source: %{subscription_id: subscription_id, user_id: user_id},
          access_effect: %AccessEffect{} = effect
        }) do
-    with {:ok, subscription} <- fetch_subscription_for_renewal(subscription_id),
+    with :ok <- validate_current_access_effect_provenance(effect, subscription_id),
+         {:ok, subscription} <- fetch_subscription_for_renewal(subscription_id),
          reason when is_binary(reason) <- non_effective_access_effect_reason(subscription),
          {:ok, input} <-
            non_effective_source_convergence_input(subscription_id, user_id, effect, reason) do
@@ -9995,6 +10071,70 @@ defmodule Store.Subscriptions.Facade do
            )}
         )
     end
+  end
+
+  defp validate_current_access_effect_provenance(effect, subscription_id) do
+    with {:ok, current_provenance} <- lock_access_effect_subscription(subscription_id),
+         {:ok, reference} <- access_effect_contract_reference(effect.contract_change_id) do
+      validate_persisted_access_effect_provenance(effect, current_provenance, reference)
+    end
+  end
+
+  defp access_effect_contract_reference(nil), do: {:ok, nil}
+
+  defp access_effect_contract_reference(contract_change_id) do
+    fetch_contract_change_by_id(contract_change_id)
+  end
+
+  defp validate_persisted_access_effect_provenance(effect, current_provenance, reference) do
+    with true <- effect.source_order_line_item_id == current_provenance.source_order_line_item_id,
+         true <- effect.plan_revision_id == current_provenance.plan_revision_id,
+         :ok <- validate_access_effect_target_entitlement(effect, current_provenance),
+         :ok <- validate_access_effect_contract_reference(effect, reference) do
+      :ok
+    else
+      _ ->
+        {:error,
+         Error.new(
+           "VALIDATION_ERROR",
+           "AccessEffect provenance must match its funded Subscription evidence"
+         )}
+    end
+  end
+
+  defp validate_access_effect_contract_reference(
+         %AccessEffect{contract_change_id: nil},
+         _reference
+       ),
+       do: :ok
+
+  defp validate_access_effect_contract_reference(
+         %AccessEffect{
+           contract_change_id: contract_change_id,
+           subscription_id: subscription_id,
+           source_version: source_version
+         },
+         %{
+           id: reference_id,
+           subscription_id: reference_subscription_id,
+           ordering_version: ordering_version
+         }
+       ) do
+    if reference_id == contract_change_id and reference_subscription_id == subscription_id and
+         is_integer(ordering_version) and ordering_version > 0 and
+         ordering_version <= source_version do
+      :ok
+    else
+      {:error,
+       Error.new(
+         "VALIDATION_ERROR",
+         "AccessEffect ContractChange reference is not valid for its source version"
+       )}
+    end
+  end
+
+  defp validate_access_effect_contract_reference(_effect, _reference) do
+    {:error, Error.new("VALIDATION_ERROR", "AccessEffect ContractChange reference is invalid")}
   end
 
   defp execute_current_non_effective_with_input(effect, input) do

@@ -12,13 +12,497 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   alias Store.Entitlements.Queries.SubscriptionSourceVerificationQuery
   alias Store.Repo
   alias Store.Subscriptions.{AccessEffect, Facade}
-  alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
+  alias Store.Subscriptions.Inputs.{EstablishAccessEffectInput, QueueSubscriptionPlanChangeInput}
+  alias Store.Subscriptions.Inputs.ReconcileSubscriptionAccessInput
   alias Store.Subscriptions.Queries.AppliedAccessVerificationQuery
   alias Store.SubscriptionsFixtures
   alias Store.Support.Errors.Error
   alias Store.Support.Errors.Normalize
   alias Store.Support.ID.BinaryUuidSort
   alias Store.Support.Telemetry.RepoStats
+  alias Store.Workers.ReconcileSubscriptionAccessWorker
+
+  test "source reconciliation input accepts only typed UUID identities" do
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             ReconcileSubscriptionAccessInput.new(%{
+               subscription_id: Ecto.UUID.generate(),
+               grant_id: Ecto.UUID.generate()
+             })
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             ReconcileSubscriptionAccessInput.new(%{subscription_id: "bad"})
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             ReconcileSubscriptionAccessInput.new(%{
+               subscription_id: Ecto.UUID.generate(),
+               expected_access_effect_id: "bad"
+             })
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             ReconcileSubscriptionAccessInput.new(%{"subscription_id" => Ecto.UUID.generate()})
+  end
+
+  test "source reconciliation repairs current effective authority and worker reports outcomes" do
+    fixture = create_committed_effective_effect_fixture!("jc248_reconcile_effective")
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription.id
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect.id).status == :applied
+    assert [grant] = grants_for_source!(fixture.subscription.id)
+    effect_snapshot = fetch_effect!(fixture.effect.id)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+        [
+          Ecto.UUID.dump!(fixture.subscription.id)
+        ]
+      )
+    end)
+
+    handler_id = "jc248-reconcile-#{Ecto.UUID.generate()}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :subscriptions, :source_reconciliation, :stop],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:source_reconciliation, event, measurements, metadata})
+        end,
+        self()
+      )
+
+    assert :ok =
+             Sandbox.unboxed_run(Repo, fn ->
+               ReconcileSubscriptionAccessWorker.perform(%Oban.Job{
+                 args: %{"subscription_id" => fixture.subscription.id}
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect.id) == effect_snapshot
+    assert [repaired] = grants_for_source!(fixture.subscription.id)
+    assert repaired.status == :active
+    assert repaired.kind == grant.kind
+    assert repaired.scope_key == grant.scope_key
+    assert repaired.valid_from_at == grant.valid_from_at
+    assert repaired.valid_to_at == grant.valid_to_at
+
+    assert_receive {:source_reconciliation,
+                    [:store, :subscriptions, :source_reconciliation, :stop],
+                    %{duration: duration},
+                    %{
+                      subscription_id: subscription_id,
+                      access_effect_id: nil,
+                      outcome: :repaired
+                    }}
+
+    assert is_integer(duration)
+    assert subscription_id == fixture.subscription.id
+    :ok = :telemetry.detach(handler_id)
+
+    assert {:discard, _} =
+             ReconcileSubscriptionAccessWorker.perform(%Oban.Job{
+               args: %{"subscription_id" => "bad", "extra" => true}
+             })
+  end
+
+  test "funded entitlement remains executable after a future plan is queued and the Plan is edited" do
+    fixture = create_committed_effective_effect_fixture!("jc248_queued_future_contract")
+
+    future_plan =
+      Sandbox.unboxed_run(Repo, fn ->
+        plan =
+          SubscriptionsFixtures.create_subscription_plan!(%{
+            entitlement_kind: :membership_access,
+            entitlement_scope_key: "future:#{Ecto.UUID.generate()}"
+          })
+
+        SubscriptionsFixtures.create_plan_revision!(plan)
+        SubscriptionsFixtures.attach_variant_plan!(fixture.variant.id, plan.id)
+        plan
+      end)
+
+    on_exit(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!(
+          """
+          UPDATE subscriptions
+          SET current_contract_change_id = NULL,
+              pending_subscription_plan_id = NULL,
+              pending_variant_id = NULL,
+              pending_renewal_amount_minor = NULL,
+              pending_renewal_currency = NULL,
+              change_effective_at = NULL
+          WHERE id = $1
+          """,
+          [Ecto.UUID.dump!(fixture.subscription.id)]
+        )
+
+        Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [
+          Ecto.UUID.dump!(fixture.subscription.id)
+        ])
+
+        Repo.query!("DELETE FROM contract_changes WHERE subscription_id = $1", [
+          Ecto.UUID.dump!(fixture.subscription.id)
+        ])
+
+        Repo.query!("DELETE FROM variant_subscription_plans WHERE subscription_plan_id = $1", [
+          Ecto.UUID.dump!(future_plan.id)
+        ])
+
+        Repo.query!("DELETE FROM plan_revisions WHERE subscription_plan_id = $1", [
+          Ecto.UUID.dump!(future_plan.id)
+        ])
+
+        Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [
+          Ecto.UUID.dump!(future_plan.id)
+        ])
+      end)
+    end)
+
+    assert {:ok, input} =
+             QueueSubscriptionPlanChangeInput.new(%{
+               subscription_id: fixture.subscription.id,
+               subscription_plan_id: future_plan.id
+             })
+
+    assert {:ok, queued} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.queue_subscription_plan_change_for_user(
+                 fixture.customer,
+                 fixture.subscription.id,
+                 input
+               )
+             end)
+
+    assert queued.current_contract_change_id
+    assert queued.aggregate_version > fixture.effect.source_version
+    assert queued.current_plan_revision_id == fixture.effect.plan_revision_id
+
+    original_plan =
+      Sandbox.unboxed_run(Repo, fn ->
+        fixture.plan
+        |> Ash.Changeset.for_update(
+          :update,
+          %{entitlement_scope_key: "mutable-plan:#{Ecto.UUID.generate()}"},
+          context: %{system?: true}
+        )
+        |> Ash.update!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+      end)
+
+    assert original_plan.entitlement_scope_key != fixture.effect.entitlement_scope_key
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription.id
+               })
+             end)
+
+    applied_effect = fetch_effect!(fixture.effect.id)
+    assert applied_effect.status == :applied
+    assert applied_effect.plan_revision_id == fixture.effect.plan_revision_id
+    assert applied_effect.entitlement_scope_key == fixture.effect.entitlement_scope_key
+
+    assert_effective_grant!(fixture)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+        [
+          Ecto.UUID.dump!(fixture.subscription.id)
+        ]
+      )
+    end)
+
+    assert {:ok, :repaired} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription.id
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect.id) == applied_effect
+    assert_effective_grant!(fixture)
+
+    assert {:ok, query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: DateTime.add(DateTime.utc_now(), 1, :second)
+             })
+
+    assert {:ok, verifications} = Facade.list_applied_access_verification_window_for_system(query)
+    assert verification = Enum.find(verifications, &(&1.effect.id == fixture.effect.id))
+
+    assert verification.contract_reference == %{
+             id: nil,
+             subscription_id: nil,
+             ordering_version: nil
+           }
+  end
+
+  test "a same-source captured ContractChange remains valid after a later instruction supersedes it" do
+    fixture = create_committed_effective_effect_fixture!("jc248_historical_contract_reference")
+
+    future_plans =
+      Sandbox.unboxed_run(Repo, fn ->
+        Enum.map(1..2, fn index ->
+          plan =
+            SubscriptionsFixtures.create_subscription_plan!(%{
+              entitlement_kind: :membership_access,
+              entitlement_scope_key: "historical:#{index}:#{Ecto.UUID.generate()}"
+            })
+
+          SubscriptionsFixtures.create_plan_revision!(plan)
+          SubscriptionsFixtures.attach_variant_plan!(fixture.variant.id, plan.id)
+          plan
+        end)
+      end)
+
+    on_exit(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!(
+          """
+          UPDATE subscriptions
+          SET current_contract_change_id = NULL,
+              pending_subscription_plan_id = NULL,
+              pending_variant_id = NULL,
+              pending_renewal_amount_minor = NULL,
+              pending_renewal_currency = NULL,
+              change_effective_at = NULL
+          WHERE id = $1
+          """,
+          [Ecto.UUID.dump!(fixture.subscription.id)]
+        )
+
+        Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [
+          Ecto.UUID.dump!(fixture.subscription.id)
+        ])
+
+        Repo.query!("DELETE FROM contract_changes WHERE subscription_id = $1", [
+          Ecto.UUID.dump!(fixture.subscription.id)
+        ])
+
+        Enum.each(future_plans, fn plan ->
+          Repo.query!("DELETE FROM variant_subscription_plans WHERE subscription_plan_id = $1", [
+            Ecto.UUID.dump!(plan.id)
+          ])
+
+          Repo.query!("DELETE FROM plan_revisions WHERE subscription_plan_id = $1", [
+            Ecto.UUID.dump!(plan.id)
+          ])
+
+          Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [Ecto.UUID.dump!(plan.id)])
+        end)
+      end)
+    end)
+
+    [first_plan, second_plan] = future_plans
+
+    assert {:ok, first_input} =
+             QueueSubscriptionPlanChangeInput.new(%{
+               subscription_id: fixture.subscription.id,
+               subscription_plan_id: first_plan.id
+             })
+
+    assert {:ok, first_queued} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.queue_subscription_plan_change_for_user(
+                 fixture.customer,
+                 fixture.subscription.id,
+                 first_input
+               )
+             end)
+
+    assert {:ok, effect_input} =
+             EstablishAccessEffectInput.new(%{
+               subscription_id: fixture.subscription.id,
+               source_version: first_queued.aggregate_version,
+               disposition: fixture.effect.disposition,
+               entitlement_kind: fixture.effect.entitlement_kind,
+               entitlement_scope_key: fixture.effect.entitlement_scope_key,
+               valid_from_at: fixture.effect.valid_from_at,
+               valid_until_at: fixture.effect.valid_until_at,
+               source_order_line_item_id: fixture.effect.source_order_line_item_id,
+               contract_change_id: first_queued.current_contract_change_id,
+               plan_revision_id: fixture.effect.plan_revision_id
+             })
+
+    assert {:ok, historical_effect} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.establish_access_effect_for_system(effect_input)
+             end)
+
+    assert {:ok, second_input} =
+             QueueSubscriptionPlanChangeInput.new(%{
+               subscription_id: fixture.subscription.id,
+               subscription_plan_id: second_plan.id
+             })
+
+    assert {:ok, superseding_queue} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.queue_subscription_plan_change_for_user(
+                 fixture.customer,
+                 fixture.subscription.id,
+                 second_input
+               )
+             end)
+
+    assert superseding_queue.current_contract_change_id != historical_effect.contract_change_id
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription.id
+               })
+             end)
+
+    applied_effect = fetch_effect!(historical_effect.id)
+    assert applied_effect.status == :applied
+    assert_effective_grant!(%{fixture | effect: historical_effect})
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+        [
+          Ecto.UUID.dump!(fixture.subscription.id)
+        ]
+      )
+    end)
+
+    assert {:ok, :repaired} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription.id
+               })
+             end)
+
+    assert fetch_effect!(historical_effect.id) == applied_effect
+    assert_effective_grant!(%{fixture | effect: historical_effect})
+
+    assert {:ok, query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: DateTime.add(DateTime.utc_now(), 1, :second)
+             })
+
+    assert {:ok, verifications} = Facade.list_applied_access_verification_window_for_system(query)
+    assert verification = Enum.find(verifications, &(&1.effect.id == historical_effect.id))
+
+    assert verification.contract_reference == %{
+             id: historical_effect.contract_change_id,
+             subscription_id: fixture.subscription.id,
+             ordering_version: historical_effect.source_version
+           }
+  end
+
+  test "source reconciliation rejects a too-new captured ContractChange without writes" do
+    fixture = create_committed_effective_effect_fixture!("jc248_bad_contract_reference")
+    before_effect = fetch_effect!(fixture.effect.id)
+    before_grants = grants_for_source!(fixture.subscription.id)
+
+    future_plan =
+      Sandbox.unboxed_run(Repo, fn ->
+        plan =
+          SubscriptionsFixtures.create_subscription_plan!(%{
+            entitlement_kind: :membership_access,
+            entitlement_scope_key: "too-new:#{Ecto.UUID.generate()}"
+          })
+
+        SubscriptionsFixtures.create_plan_revision!(plan)
+        SubscriptionsFixtures.attach_variant_plan!(fixture.variant.id, plan.id)
+        plan
+      end)
+
+    on_exit(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("UPDATE access_effects SET contract_change_id = $2 WHERE id = $1", [
+          Ecto.UUID.dump!(fixture.effect.id),
+          before_effect.contract_change_id && Ecto.UUID.dump!(before_effect.contract_change_id)
+        ])
+
+        recompute_v2_fingerprint!(fixture.effect.id)
+
+        Repo.query!(
+          """
+          UPDATE subscriptions
+          SET current_contract_change_id = NULL,
+              pending_subscription_plan_id = NULL,
+              pending_variant_id = NULL,
+              pending_renewal_amount_minor = NULL,
+              pending_renewal_currency = NULL,
+              change_effective_at = NULL
+          WHERE id = $1
+          """,
+          [Ecto.UUID.dump!(fixture.subscription.id)]
+        )
+
+        Repo.query!("DELETE FROM contract_changes WHERE subscription_id = $1", [
+          Ecto.UUID.dump!(fixture.subscription.id)
+        ])
+
+        Repo.query!("DELETE FROM variant_subscription_plans WHERE subscription_plan_id = $1", [
+          Ecto.UUID.dump!(future_plan.id)
+        ])
+
+        Repo.query!("DELETE FROM plan_revisions WHERE subscription_plan_id = $1", [
+          Ecto.UUID.dump!(future_plan.id)
+        ])
+
+        Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [
+          Ecto.UUID.dump!(future_plan.id)
+        ])
+      end)
+    end)
+
+    assert {:ok, future_input} =
+             QueueSubscriptionPlanChangeInput.new(%{
+               subscription_id: fixture.subscription.id,
+               subscription_plan_id: future_plan.id
+             })
+
+    assert {:ok, future_change} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.queue_subscription_plan_change_for_user(
+                 fixture.customer,
+                 fixture.subscription.id,
+                 future_input
+               )
+             end)
+
+    too_new_effect = %{
+      before_effect
+      | contract_change_id: future_change.current_contract_change_id
+    }
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "UPDATE access_effects SET contract_change_id = $2, target_fingerprint = $3 WHERE id = $1",
+        [
+          Ecto.UUID.dump!(too_new_effect.id),
+          Ecto.UUID.dump!(too_new_effect.contract_change_id),
+          AccessEffect.target_fingerprint(too_new_effect)
+        ]
+      )
+    end)
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription.id
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect.id) == %{
+             too_new_effect
+             | target_fingerprint: AccessEffect.target_fingerprint(too_new_effect)
+           }
+
+    assert grants_for_source!(fixture.subscription.id) == before_grants
+  end
 
   @tag :jc360_task08
   test "EFFECTIVE execution converges one exact-source grant interval" do
@@ -299,6 +783,97 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
       assert [grant] = grants_by_source[fixture.subscription.id]
       assert grant.status == :active
       assert stats.query_count == 1
+    end)
+  end
+
+  test "source reconciliation returns stale expected authority without executing it" do
+    fixture = create_committed_effective_effect_fixture!("jc248_reconcile_stale")
+    before_effect = fetch_effect!(fixture.effect.id)
+    before_grants = grants_for_source!(fixture.subscription.id)
+
+    assert {:ok, :stale} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription.id,
+                 expected_access_effect_id: Ecto.UUID.generate()
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect.id) == before_effect
+    assert grants_for_source!(fixture.subscription.id) == before_grants
+  end
+
+  test "source reconciliation rejects caller transactions and missing durable authority" do
+    fixture = create_committed_effective_effect_fixture!("jc248_reconcile_missing")
+    effect_before_transaction = fetch_effect!(fixture.effect.id)
+    grants_before_transaction = grants_for_source!(fixture.subscription.id)
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Repo.transaction(fn ->
+                 Facade.reconcile_subscription_access_for_system(
+                   %ReconcileSubscriptionAccessInput{
+                     subscription_id: fixture.subscription.id
+                   }
+                 )
+               end)
+               |> elem(1)
+             end)
+
+    assert fetch_effect!(fixture.effect.id) == effect_before_transaction
+    assert grants_for_source!(fixture.subscription.id) == grants_before_transaction
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!("DELETE FROM access_effects WHERE id = $1", [Ecto.UUID.dump!(fixture.effect.id)])
+    end)
+
+    assert {:error,
+            %Error{
+              code: "VALIDATION_ERROR",
+              meta: %{reason: :missing_access_effect, classification: :unclassified}
+            }} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription.id
+               })
+             end)
+
+    assert grants_for_source!(fixture.subscription.id) == []
+
+    assert {:ok, nil} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.get_current_access_effect_for_system(fixture.subscription)
+             end)
+  end
+
+  test "source reconciliation rejects provenance drift before changing authority or grants" do
+    fixture = create_committed_effective_effect_fixture!("jc248_reconcile_provenance")
+    foreign = create_committed_effective_effect_fixture!("jc248_reconcile_foreign")
+    before_effect = fetch_effect!(fixture.effect.id)
+    before_grants = grants_for_source!(fixture.subscription.id)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.subscription.id),
+        Ecto.UUID.dump!(foreign.revision.id)
+      ])
+    end)
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription.id
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect.id) == before_effect
+    assert grants_for_source!(fixture.subscription.id) == before_grants
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.subscription.id),
+        Ecto.UUID.dump!(fixture.revision.id)
+      ])
     end)
   end
 

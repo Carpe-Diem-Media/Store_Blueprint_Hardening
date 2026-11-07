@@ -3,7 +3,7 @@ defmodule Store.Subscriptions.Queries.AppliedAccessVerificationQuery do
 
   import Ecto.Query
 
-  alias Store.Subscriptions.{AccessEffect, PlanRevision, Subscription}
+  alias Store.Subscriptions.{AccessEffect, ContractChange, PlanRevision, Subscription}
 
   alias Store.Support.Errors.Error
 
@@ -61,6 +61,8 @@ defmodule Store.Subscriptions.Queries.AppliedAccessVerificationQuery do
       on: source.id == effect.subscription_id,
       left_join: revision in PlanRevision,
       on: revision.id == source.current_plan_revision_id,
+      left_join: reference in ContractChange,
+      on: reference.id == effect.contract_change_id,
       order_by: [asc: effect.inserted_at, asc: effect.id],
       select: %{
         effect: effect,
@@ -77,6 +79,11 @@ defmodule Store.Subscriptions.Queries.AppliedAccessVerificationQuery do
           id: revision.id,
           entitlement_kind: revision.entitlement_kind,
           entitlement_scope_key: revision.entitlement_scope_key
+        },
+        contract_reference: %{
+          id: reference.id,
+          subscription_id: reference.subscription_id,
+          ordering_version: reference.ordering_version
         }
       }
   end
