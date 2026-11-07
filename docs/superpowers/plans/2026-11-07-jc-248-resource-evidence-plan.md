@@ -86,7 +86,7 @@ test "JC248 discovery and repair have repeated bounded resource evidence" do
           IO.puts("JC248_RESOURCE_QUERY_PLAN " <> Jason.encode!(%{
             repetition: repetition, operation: operation, plan: plan,
             sources: 16, initially_revoked_rows_per_source: 128,
-            statistics_refresh: false, planner_override: false,
+            explicit_statistics_refresh: false, planner_override: false,
             limits: "natural local plan; fixture volume and existing private diagnostic rows only"
           }))
         end
@@ -242,7 +242,7 @@ end
 ```
 
 - [ ] Parse and run the new evidence test. This adds proof of existing behavior and may pass immediately. Do not manufacture a RED result. If pool metrics differ, identify the owner or pending return before changing an assertion; do not replace the check with a fixed sleep or omit cleanup. Remove a metric only if the installed Sandbox pool cannot supply it, and document that dimension as UNMEASURED.
-- [ ] Read every measurement and each natural plan. Record actual query counts, wall and queue times, memory before and after GC, mailbox and handler counts, pool return and exact owned cleanup. Identify selected indexes, sequential scans, rows filtered and history volume. No hidden ANALYZE, VACUUM or forced-plan settings are permitted. If stale statistics explain a slow plan, record that first plan and any explicit bounded follow-up separately.
+- [ ] Read every measurement and each natural plan. Record actual query counts, wall and queue times, memory before and after GC, mailbox and handler counts, pool return and exact owned cleanup. Identify selected indexes, sequential scans, rows filtered and history volume. Returned index rows do not necessarily reveal internal dead-entry visits; record that dimension as UNMEASURED when the plan does not expose it. No hidden ANALYZE, VACUUM or forced-plan settings are permitted. Background autovacuum is not controlled by this test. If stale statistics explain a slow plan, record that first plan and any explicit bounded follow-up separately.
 - [ ] Replace the design's pending-evidence paragraphs with observed results. Discovery's two-row active result bound does not bound source history locked by repair. The locked provenance validation added one fixed SQL read to the existing executor baseline; a non-null captured reference adds one exact historical PK read. Do not describe either cost as zero.
 - [ ] Preserve the limits. Production capacity, multi-node behavior, allocator/RSS trends, arbitrary source-history fanout, and durable PubSub delivery after retry exhaustion remain UNMEASURED. Two local samples do not prove stable memory or no accumulation.
 - [ ] Run both execution modules, format, positional scoped strict Credo, compile warnings-as-errors and migration alignment. Self-review and commit only the test module and design. Report exact head and observed evidence for independent spec and quality reviews.

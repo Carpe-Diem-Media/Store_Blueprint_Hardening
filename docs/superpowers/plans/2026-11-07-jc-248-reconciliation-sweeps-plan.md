@@ -12,7 +12,7 @@
 
 Modify `lib/store/subscriptions/facade.ex`, `config/config.exs` and the effective execution test module. Create `lib/store/workers/verify_subscription_access_worker.ex` and `lib/store/workers/inventory_subscription_access_authority_worker.ex`. Use existing `ops` and `subscriptions` queues. No new pool, schema, dependency, global lock or business target.
 
-- [ ] Add failing integration tests using the existing committed fixtures. Every source repair or worker call that might execute a correctness transaction runs through `Sandbox.unboxed_run`.
+- [x] Add failing integration tests using the existing committed fixtures. Every source repair or worker call that might execute a correctness transaction runs through `Sandbox.unboxed_run`.
 
 ```elixir
 test "verification batches healthy sources and returns only drift repair identities" do
@@ -38,9 +38,9 @@ test "verification batches healthy sources and returns only drift repair identit
 end
 ```
 
-- [ ] Add a second query-count sample at 16 healthy sources, with 32 revoked history rows per source inserted directly as revoked. The two read count must remain constant. Isolate those fixtures in a fixed historical inserted_at window so unrelated private diagnostic rows cannot affect counts. Add a current fingerprint-valid funded-provenance mismatch and assert a conflict with zero repair candidates and no grant/effect mutation. Add an all-stale raw page of size 1 followed by a current mismatched APPLIED row; its cursor must advance and reach that row on the next page. Run RED and save `tmp/jc248/task5-red.log` before production code.
+- [x] Add a second query-count sample at 16 healthy sources, with 32 revoked history rows per source inserted directly as revoked. The two read count must remain constant. Isolate those fixtures in a fixed historical inserted_at window so unrelated private diagnostic rows cannot affect counts. Add a current fingerprint-valid funded-provenance mismatch and assert a conflict with zero repair candidates and no grant/effect mutation. Add an all-stale raw page of size 1 followed by a current mismatched APPLIED row; its cursor must advance and reach that row on the next page. Run RED and save `tmp/jc248/task5-red.log` before production code.
 
-- [ ] Implement the facade page operation with these aliases and helpers. Reuse existing private immutable-provenance validators and input builder, so discovery does not invent another access policy. `SourceConvergence.validate_final_active_set/3` already checks exact owner, source, pair, persisted validity window and clear revocation fields. Do not compare validity to wall-clock `as_of`, normalize historical statuses or use cache contents.
+- [x] Implement the facade page operation with these aliases and helpers. Reuse existing private immutable-provenance validators and input builder, so discovery does not invent another access policy. `SourceConvergence.validate_final_active_set/3` already checks exact owner, source, pair, persisted validity window and clear revocation fields. Do not compare validity to wall-clock `as_of`, normalize historical statuses or use cache contents.
 
 ```elixir
 alias Store.Entitlements.Queries.SubscriptionSourceVerificationQuery
@@ -115,7 +115,7 @@ end
 defp access_verification_cursor(_rows, _limit), do: nil
 ```
 
-- [ ] Implement this APPLIED worker. The installed Oban Basic engine bypasses uniqueness in `insert_all`, so enqueue each bounded repair candidate with `Oban.insert`. Queue insertion failure retries the page. Existing completed/discarded jobs cannot suppress rediscovery because source jobs use finite uniqueness over incomplete states. The page cursor advances only after all candidate insertions succeed.
+- [x] Implement this APPLIED worker. The installed Oban Basic engine bypasses uniqueness in `insert_all`, so enqueue each bounded repair candidate with `Oban.insert`. Queue insertion failure retries the page. Existing completed/discarded jobs cannot suppress rediscovery because source jobs use finite uniqueness over incomplete states. The page cursor advances only after all candidate insertions succeed.
 
 ```elixir
 defmodule Store.Workers.VerifySubscriptionAccessWorker do
@@ -201,7 +201,7 @@ defmodule Store.Workers.VerifySubscriptionAccessWorker do
 end
 ```
 
-- [ ] Implement this inventory worker. Missing rows remain unclassified. It records IDs and available immutable provenance only; it never enqueues a source repair, writes grants, creates effects or changes aggregate versions.
+- [x] Implement this inventory worker. Missing rows remain unclassified. It records IDs and available immutable provenance only; it never enqueues a source repair, writes grants, creates effects or changes aggregate versions.
 
 ```elixir
 defmodule Store.Workers.InventorySubscriptionAccessAuthorityWorker do
@@ -281,11 +281,11 @@ defmodule Store.Workers.InventorySubscriptionAccessAuthorityWorker do
 end
 ```
 
-- [ ] Add daily crons `{"0 0 * * *", Store.Workers.VerifySubscriptionAccessWorker}` and `{"30 0 * * *", Store.Workers.InventorySubscriptionAccessAuthorityWorker}`. The cron's existing UTC clock schedules these at 02:00 and 02:30 South Africa time. Both use priority 3 in the existing ops queue. Continuations delay one second and retain fixed bounds. This bounds each unit of work; it does not assert a production sweep duration or guarantee completion before peak hours.
+- [x] Add daily crons `{"0 0 * * *", Store.Workers.VerifySubscriptionAccessWorker}` and `{"30 0 * * *", Store.Workers.InventorySubscriptionAccessAuthorityWorker}`. The cron's existing UTC clock schedules these at 02:00 and 02:30 South Africa time. Both use priority 3 in the existing ops queue. Continuations delay one second and retain fixed bounds. This bounds each unit of work; it does not assert a production sweep duration or guarantee completion before peak hours.
 
-- [ ] Add worker integration tests with Oban manual testing and actual persisted jobs: lost initial source enqueue is rediscovered from PostgreSQL mismatch; repeated verification creates at most one incomplete source job inside the 55-second window; completed/discarded source jobs do not suppress a new repair; deleting an operational continuation then restarting the initial window repeats safe work and reaches the mismatch; all-stale raw pages still enqueue a continuation with the same `as_of`; inventory healthy pages continue and missing rows only emit unclassified telemetry. Invalid/half cursor arguments cannot silently reset progress. Supplied null cursors are malformed, even when their upper bound is valid; verification requires both supplied cursor strings and inventory requires a supplied non-null UUID. Defaults apply only when cursor keys are absent. Reject malformed continuations before SQL. Capture worker RED before implementing each new behavior, then GREEN.
-- [ ] Add telemetry assertions for page counts and conflict/missing outcomes. Remove handlers in `after`. Do not expose raw source/provider payloads or customer details. All event metadata remains IDs and fixed outcome classes.
-- [ ] Run format, scoped strict Credo, compile warnings-as-errors, focused execution modules and migration alignment. Self-review and commit task-owned files. Separate spec and quality review follow, then a final task supplies real concurrency, two-repeat resource measurements and full repository gates.
+- [x] Add worker integration tests with Oban manual testing and actual persisted jobs: lost initial source enqueue is rediscovered from PostgreSQL mismatch; repeated verification creates at most one incomplete source job inside the 55-second window; completed/discarded source jobs do not suppress a new repair; deleting an operational continuation then restarting the initial window repeats safe work and reaches the mismatch; all-stale raw pages still enqueue a continuation with the same `as_of`; inventory healthy pages continue and missing rows only emit unclassified telemetry. Invalid/half cursor arguments cannot silently reset progress. Supplied null cursors are malformed, even when their upper bound is valid; verification requires both supplied cursor strings and inventory requires a supplied non-null UUID. Defaults apply only when cursor keys are absent. Reject malformed continuations before SQL. Capture worker RED before implementing each new behavior, then GREEN.
+- [x] Add telemetry assertions for page counts and conflict/missing outcomes. Remove handlers in `after`. Do not expose raw source/provider payloads or customer details. All event metadata remains IDs and fixed outcome classes.
+- [x] Run format, scoped strict Credo, compile warnings-as-errors, focused execution modules and migration alignment. Self-review and commit task-owned files. Separate spec and quality review follow, then a final task supplies real concurrency, two-repeat resource measurements and full repository gates.
 
 Use only sequential Mix commands under:
 
@@ -293,4 +293,4 @@ Use only sequential Mix commands under:
 
 Root self-review must verify query/input names against the accepted earlier tasks before dispatch. Exact page bounds and database truth govern execution. No queue state is business completion and no missing-authority backfill is authorized.
 
-Implementation `d49d68f5686189461460fa28d672af42e7f52513` passed 69 focused tests. The first independent specification review found that continuations without `limit` still defaulted to 100. Root added two regressions and observed both fail with one SQL read, then required an explicit continuation limit in both parsers. Correction `2e60684bc401a742049976e0388a2d58a4dd726f` passed 71 focused tests, format, scoped strict Credo, warnings-as-errors compile and migration alignment. The source-conflict fixture now registers restoration before mutation so an earlier assertion failure cannot block teardown. Fresh specification recheck and quality review remain pending.
+Implementation `d49d68f5686189461460fa28d672af42e7f52513` passed 69 focused tests. The first independent specification review found that continuations without `limit` still defaulted to 100. Root added two regressions and observed both fail with one SQL read, then required an explicit continuation limit in both parsers. Correction `2e60684bc401a742049976e0388a2d58a4dd726f` passed 71 focused tests, format, scoped strict Credo, warnings-as-errors compile and migration alignment. The source-conflict fixture now registers restoration before mutation so an earlier assertion failure cannot block teardown. Fresh specification recheck PASS and independent quality review APPROVED for exact code head `2e60684bc401a742049976e0388a2d58a4dd726f` against task base `202eaec3a16dbc0e1682de399668e703e0cf08c3`. These reviews cover Task5 only; the complete ticket still requires its remaining proof and final review.
