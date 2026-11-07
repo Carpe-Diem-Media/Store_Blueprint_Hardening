@@ -46,9 +46,15 @@ end
 alias Store.Entitlements.Queries.SubscriptionSourceVerificationQuery
 alias Store.Entitlements.SourceConvergence
 
+@type access_verification_result :: %{
+  raw_count: non_neg_integer(), current_count: non_neg_integer(), stale_count: non_neg_integer(),
+  healthy_count: non_neg_integer(),
+  repairs: [%{subscription_id: Ecto.UUID.t(), expected_access_effect_id: Ecto.UUID.t()}],
+  conflicts: [%{subscription_id: Ecto.UUID.t(), access_effect_id: Ecto.UUID.t(), reason: :invalid_authority}],
+  as_of: DateTime.t(), cursor: %{timestamp: DateTime.t(), id: Ecto.UUID.t()} | nil}
 @doc "Verifies one bounded APPLIED window and returns current source identities requiring repair."
 @spec verify_subscription_access_window_for_system(AppliedAccessVerificationQuery.t()) ::
-  {:ok, map()} | {:error, Error.t() | term()}
+  {:ok, access_verification_result()} | {:error, Error.t() | term()}
 def verify_subscription_access_window_for_system(%AppliedAccessVerificationQuery{} = query) do
   with {:ok, canonical} <- AppliedAccessVerificationQuery.new(Map.from_struct(query)),
        {:ok, rows} <- list_applied_access_verification_window_for_system(canonical),
@@ -209,7 +215,7 @@ defmodule Store.Workers.InventorySubscriptionAccessAuthorityWorker do
       for row <- missing do
         metadata = %{subscription_id: row.id, classification: :unclassified,
           source_order_line_item_id: row.source_order_line_item_id,
-          contract_change_id: row.current_contract_change_id, plan_revision_id: row.current_plan_revision_id}
+          queued_contract_change_id: row.current_contract_change_id, plan_revision_id: row.current_plan_revision_id}
         Logger.warning("subscription_access_authority_missing", Map.to_list(metadata))
         :telemetry.execute([:store, :subscriptions, :access_authority_inventory, :missing], %{count: 1}, metadata)
       end

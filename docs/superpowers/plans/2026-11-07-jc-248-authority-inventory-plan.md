@@ -12,7 +12,7 @@
 
 Create `lib/store/subscriptions/queries/subscription_access_inventory_query.ex` and `lib/store/subscriptions/actions/read_subscription_access_inventory_window.ex`. Modify the Subscription resource, facade and existing effective execution test module. No migration is required: Subscription's primary key bounds the window and the existing AccessEffect subscription/source-version index supports each existence probe. Do not add a sweep worker or classify absent effects as a proven transition defect.
 
-- [ ] Add the inventory query alias and these tests before production code. Existing committed fixture cleanup remains unchanged.
+- [x] Add the inventory query alias and these tests before production code. Existing committed fixture cleanup remains unchanged.
 
 ```elixir
 alias Store.Subscriptions.Queries.SubscriptionAccessInventoryQuery
@@ -57,7 +57,7 @@ test "authority inventory consumes healthy raw rows and exposes missing authorit
 end
 ```
 
-- [ ] Add raw-action authorization coverage with `RepoStats.capture`, asserting no-system context is FORBIDDEN and issues zero SQL. Capture RED at `tmp/jc248/task4-red.log` before production changes.
+- [x] Add raw-action authorization coverage with `RepoStats.capture`, asserting no-system context is FORBIDDEN and issues zero SQL. Capture RED at `tmp/jc248/task4-red.log` before production changes.
 
 ```elixir
 test "authority inventory action rejects ordinary callers before SQL" do
@@ -78,7 +78,7 @@ test "authority inventory captures the database's native highest UUID" do
 end
 ```
 
-- [ ] Implement this typed query. UUID comparison uses dumped binary values in validation and PostgreSQL UUID comparison in SQL.
+- [x] Implement this typed query. UUID comparison uses dumped binary values in validation and PostgreSQL UUID comparison in SQL.
 
 ```elixir
 defmodule Store.Subscriptions.Queries.SubscriptionAccessInventoryQuery do
@@ -124,7 +124,7 @@ defmodule Store.Subscriptions.Queries.SubscriptionAccessInventoryQuery do
 end
 ```
 
-- [ ] Add this private generic action and its specific system-context runtime policy to `Subscription`. Generic actions do not use the existing read-action policy.
+- [x] Add this private generic action and its specific system-context runtime policy to `Subscription`. Generic actions do not use the existing read-action policy.
 
 ```elixir
 action :read_access_inventory_window_for_system, {:array, :map} do
@@ -142,7 +142,7 @@ policy action(:read_access_inventory_window_for_system) do
 end
 ```
 
-- [ ] Implement the action callback and facade reads.
+- [x] Implement the action callback and facade reads.
 
 ```elixir
 defmodule Store.Subscriptions.Actions.ReadSubscriptionAccessInventoryWindow do
@@ -188,11 +188,13 @@ def subscription_access_inventory_upper_bound_for_system do
 end
 ```
 
-- [ ] Run GREEN, then capture inventory SQL and `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` through the typed query's `to_ecto/1`. Assert a healthy window has one SQL query regardless of its absent-effect count, every raw row consumes the limit, and the upper bound excludes later fixture UUIDs. Add exact frontier read assertion against a DB-native highest-ID query as test-only evidence. Do not use `max(uuid)`, OFFSET, absence filtering before the raw limit, forced planner settings or production full-table scans.
-- [ ] Run format, scoped strict Credo, compile warnings-as-errors and both execution modules. No migration/snapshot drift is expected. Review complete diff and commit only task files. Independent spec then quality review follow.
+- [x] Run GREEN, then capture inventory SQL and `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` through the typed query's `to_ecto/1`. Assert a healthy window has one SQL query regardless of its absent-effect count, every raw row consumes the limit, and the upper bound excludes later fixture UUIDs. Add exact frontier read assertion against a DB-native highest-ID query as test-only evidence. Do not use `max(uuid)`, OFFSET, absence filtering before the raw limit, forced planner settings or production full-table scans.
+- [x] Run format, scoped strict Credo, compile warnings-as-errors and both execution modules. No migration/snapshot drift is expected. Review complete diff and commit only task files. Independent spec then quality review follow.
 
 Every Mix command uses the existing isolated DevCore test environment sequentially:
 
 `MIX_ENV=test STORE_TEST_DB_SUFFIX=_t3_132f19be_hardening STORE_BENCH_POOL_SIZE=4 STORE_BENCH_WRITER_POOL_SIZE=4 ERL_FLAGS='+S 4:4' mise exec -- devcore-project run test -- mix`
 
 Focused command arguments are `test test/store/subscriptions/access_effect_effective_execution_test.exs test/store/subscriptions/access_effect_non_effective_execution_test.exs`. Capture task logs under `tmp/jc248`. Do not expose credentials or delete unrelated fixtures.
+
+Task4 implementation `bb7fadfcd6c3e4d7621a936b1940aba03183610e` passed fresh specification and quality reviews. The focused pair passed 61 tests with zero failures, alongside format, scoped strict Credo, compile warnings-as-errors and migration alignment. EXPLAIN is a tiny-fixture diagnostic.
