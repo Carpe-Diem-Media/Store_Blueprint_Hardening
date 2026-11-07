@@ -3766,8 +3766,14 @@ defmodule Store.Subscriptions.Facade do
        ),
        do: {:authentication_settlement_error, reason}
 
-  defp classify_claimed_renewal_charge_result({:error, reason}, collection_attempt),
-    do: {:renewal_failure, reason, collection_attempt}
+  defp classify_claimed_renewal_charge_result(
+         {:error, %Error{code: "PAYMENT_FAILED"} = reason},
+         collection_attempt
+       ),
+       do: {:renewal_failure, reason, collection_attempt}
+
+  defp classify_claimed_renewal_charge_result({:error, reason}, _collection_attempt),
+    do: {:error, reason}
 
   defp fetch_paid_order(order_id) do
     query = Order |> Ash.Query.filter(expr(id == ^order_id))

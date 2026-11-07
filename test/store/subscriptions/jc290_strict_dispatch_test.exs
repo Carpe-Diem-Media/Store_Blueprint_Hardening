@@ -448,6 +448,96 @@ defmodule Store.Subscriptions.JC290StrictDispatchTest do
     assert inventory_state!(subscription.id) == inventory_before_observation
   end
 
+  test "a succeeded observation without its exact provider id preserves reached uncertainty" do
+    {subscription, now} = due_subscription!()
+    StripeAPIStub.stub_unexpected!("reached renewal may only use exact-ID GET")
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    generation_id = reached.collection.reservation_generation_id
+    source_before = Map.take(subscription, @unchanged_fields)
+    inventory_before = inventory_state!(subscription.id)
+    body = ReachedRenewalFixtures.observation_body(reached, "succeeded")
+
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      %{body | "id" => nil}
+    )
+
+    assert {:error, %{code: "PAYMENT_EVENT_UNVERIFIED"}} =
+             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+
+    assert Map.take(fetch_subscription!(subscription.id), @unchanged_fields) == source_before
+    assert [attempt] = attempts(subscription.id)
+    assert attempt.id == reached.attempt.id
+    assert attempt.order_id == reached.order.id
+    assert attempt.status == :processing
+    assert attempt.failure_code == nil
+    assert [collection] = collections(attempt.id)
+    assert collection.id == reached.collection.id
+    assert collection.payment_intent_id == reached.payment_intent.id
+    payment_intent = Repo.get!(PaymentIntent, collection.payment_intent_id)
+    assert payment_intent.provider_payment_id == reached.payment_intent.provider_payment_id
+    assert payment_intent.state == :submitted
+    assert collection.dispatch_state == :may_have_been_reached
+    assert collection.financial_outcome == :unresolved
+    assert collection.reservation_generation_id == generation_id
+
+    assert Repo.query!("SELECT state FROM inventory_reservations WHERE id = $1::uuid", [
+             Ecto.UUID.dump!(generation_id)
+           ]).rows == [["active"]]
+
+    assert inventory_state!(subscription.id) == inventory_before
+
+    assert [[0]] =
+             Repo.query!(
+               "SELECT count(*) FROM payment_applications WHERE order_id = $1::uuid",
+               [Ecto.UUID.dump!(reached.order.id)]
+             ).rows
+  end
+
+  test "a provider observation HTTP error preserves reached uncertainty" do
+    {subscription, now} = due_subscription!()
+    StripeAPIStub.stub_unexpected!("reached renewal may only use exact-ID GET")
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    generation_id = reached.collection.reservation_generation_id
+    source_before = Map.take(subscription, @unchanged_fields)
+    inventory_before = inventory_state!(subscription.id)
+
+    StripeAPIStub.stub_observation(fn conn ->
+      Plug.Conn.resp(conn, 503, "temporarily unavailable")
+    end)
+
+    assert {:error, %{code: "PAYMENT_PROVIDER_DOWN"}} =
+             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+
+    assert Map.take(fetch_subscription!(subscription.id), @unchanged_fields) == source_before
+    assert [attempt] = attempts(subscription.id)
+    assert attempt.id == reached.attempt.id
+    assert attempt.order_id == reached.order.id
+    assert attempt.status == :processing
+    assert attempt.failure_code == nil
+    assert [collection] = collections(attempt.id)
+    assert collection.id == reached.collection.id
+    assert collection.payment_intent_id == reached.payment_intent.id
+    payment_intent = Repo.get!(PaymentIntent, collection.payment_intent_id)
+    assert payment_intent.provider_payment_id == reached.payment_intent.provider_payment_id
+    assert payment_intent.state == :submitted
+    assert collection.dispatch_state == :may_have_been_reached
+    assert collection.financial_outcome == :unresolved
+    assert collection.reservation_generation_id == generation_id
+
+    assert Repo.query!("SELECT state FROM inventory_reservations WHERE id = $1::uuid", [
+             Ecto.UUID.dump!(generation_id)
+           ]).rows == [["active"]]
+
+    assert inventory_state!(subscription.id) == inventory_before
+
+    assert [[0]] =
+             Repo.query!(
+               "SELECT count(*) FROM payment_applications WHERE order_id = $1::uuid",
+               [Ecto.UUID.dump!(reached.order.id)]
+             ).rows
+  end
+
   defp due_subscription! do
     customer = SubscriptionsFixtures.create_customer!("jc290_strict_dispatch")
 
