@@ -3394,7 +3394,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
           {:memory, memory_before} = Process.info(self(), :memory)
           {:message_queue_len, mailbox_before} = Process.info(self(), :message_queue_len)
           handlers_before = length(:telemetry.list_handlers([:store, :repo, :query]))
-          dictionary_before = Process.get_keys() |> MapSet.new()
+          repo_stats_keys_before = Process.get_keys() |> Enum.filter(&jc248_repo_stats_key?/1)
           {gc_before, words_before, _} = :erlang.statistics(:garbage_collection)
           started = System.monotonic_time(:microsecond)
           {result, stats} = RepoStats.capture(operation)
@@ -3406,13 +3406,10 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
           handlers_after = length(:telemetry.list_handlers([:store, :repo, :query]))
           {gc_after, words_after, _} = :erlang.statistics(:garbage_collection)
 
-          added_repo_stats_keys =
-            Process.get_keys()
-            |> MapSet.new()
-            |> MapSet.difference(dictionary_before)
-            |> Enum.filter(&jc248_repo_stats_key?/1)
+          repo_stats_keys_after = Process.get_keys() |> Enum.filter(&jc248_repo_stats_key?/1)
 
-          assert added_repo_stats_keys == []
+          assert repo_stats_keys_before == []
+          assert repo_stats_keys_after == []
           assert handlers_after == handlers_before
           assert mailbox_before == 0
           assert mailbox_after == 0
@@ -3432,7 +3429,8 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
             global_gc_count_delta: gc_after - gc_before,
             global_reclaimed_words_delta: words_after - words_before,
             transaction_after: false,
-            repo_stats_dictionary_keys_remaining: 0
+            repo_stats_dictionary_keys_before: length(repo_stats_keys_before),
+            repo_stats_dictionary_keys_remaining: length(repo_stats_keys_after)
           }
         end)
       end)
