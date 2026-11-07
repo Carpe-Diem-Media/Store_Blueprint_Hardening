@@ -20,7 +20,7 @@ defmodule Store.Subscriptions.JC256RenewalTermAuditTest do
     :ok
   end
 
-  test "fixed end at before, equal to, and after the charged period end still reaches merchant dispatch" do
+  test "fixed end before, at, and after the renewal start boundary still reaches merchant dispatch" do
     for {label, term_end_at} <- [
           {"before", DateTime.add(@reference_at, -1, :second)},
           {"equal", @reference_at},

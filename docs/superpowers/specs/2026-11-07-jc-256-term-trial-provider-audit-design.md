@@ -29,3 +29,11 @@ Run focused tests, formatting, warnings-as-errors compilation and strict Credo f
 ## Design self-review
 
 The audit separates observation from commercial law and production fixes. The first task uses ordinary rollback fixtures. Committed renewal tests require their own explicit cleanup plan because payment-method authority uses a separate physical connection. No new infrastructure, provider adapter, production test seam, migration or UI change is needed.
+
+## Independent review corrections
+
+The review of `484e1bee231865f954cfab036c04aa377c39bc4b` requires accurate retry-budget, suspension and true-expiry wording; financially consistent Stripe purchase-to-activation evidence; and a fixed-end test title that identifies the renewal start boundary. These corrections preserve the established gaps and candidate owners. JC-362, JC-363 and JC-364 retain all production remediation.
+
+Keep the shared paid-order fixture unchanged after checking its consumers. Add an audit regression that requires matching nonzero finalized Order/line/payment totals and the exact PaymentApplication before activation, then verifies activation replay. First demonstrate that the existing fixture lacks this evidence. Change only the audit's positive Stripe fixture to use public cart/checkout/payment APIs, actual local evidence application and existing provider doubles. Keep the Yoco rejection and downstream renewal characterizations explicitly synthetic. Document that simulated success does not prove external collection, settlement or trial access.
+
+Use the existing isolated review checkout and DevCore suffix `_jc256_review_bc9c8bde` at the builder's confirmed safe checkpoint. Append commits to the existing PR branch without rewriting history. Re-run focused and repository checks, inspect fresh CI, and reassess downstream stack coverage. The builder retains downstream branch ownership. Return the amended head for independent review; do not merge or grant final approval.
