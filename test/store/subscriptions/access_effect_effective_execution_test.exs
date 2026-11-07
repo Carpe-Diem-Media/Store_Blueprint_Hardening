@@ -39,6 +39,81 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert grant.revoked_reason == nil
   end
 
+  test "APPLIED source repair restores missing grants and retries projection without changing the effect" do
+    fixture = create_committed_effective_effect_fixture!("jc248_missing")
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+             end)
+
+    effect_snapshot = fetch_effect!(fixture.effect.id)
+    user_id = fixture.subscription.user_id
+    Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(user_id))
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+        [Ecto.UUID.dump!(fixture.subscription.id)]
+      )
+    end)
+
+    assert {:ok, true} = Cachex.put(Cache, Cache.cache_key(user_id), :jc248_stale)
+
+    assert {:ok, :repaired} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect.id)
+             end)
+
+    assert_effective_grant!(fixture)
+    assert fetch_effect!(fixture.effect.id) == effect_snapshot
+    assert {:ok, nil} = Cachex.get(Cache, Cache.cache_key(user_id))
+
+    assert_receive {:entitlements_invalidated, ^user_id, "subscription_source_reconciliation",
+                    _at}
+
+    repaired_grants = grants_for_source!(fixture.subscription.id)
+
+    assert {:ok, :already_converged} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect.id)
+             end)
+
+    assert grants_for_source!(fixture.subscription.id) == repaired_grants
+    assert fetch_effect!(fixture.effect.id) == effect_snapshot
+  end
+
+  test "APPLIED source repair restores the exact target validity interval" do
+    fixture = create_committed_effective_effect_fixture!("jc248_validity")
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+             end)
+
+    effect_snapshot = fetch_effect!(fixture.effect.id)
+    original_valid_to_at = fixture.effect.valid_until_at
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "UPDATE entitlement_grants SET valid_to_at = valid_to_at + interval '1 day' WHERE source_kind = 'subscription' AND source_id = $1",
+        [Ecto.UUID.dump!(fixture.subscription.id)]
+      )
+    end)
+
+    assert {:ok, :repaired} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect.id)
+             end)
+
+    assert_effective_grant!(fixture)
+
+    assert [%EntitlementGrant{valid_to_at: ^original_valid_to_at}] =
+             grants_for_source!(fixture.subscription.id)
+
+    assert fetch_effect!(fixture.effect.id) == effect_snapshot
+  end
+
   @tag :jc360_task07
   @tag :jc360_task08
   test "a committed REQUIRED initial source effect recovers by exact ID without duplicate rows" do

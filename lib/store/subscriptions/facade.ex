@@ -258,6 +258,112 @@ defmodule Store.Subscriptions.Facade do
     {:error, Error.new("VALIDATION_ERROR", "AccessEffect id must be a UUID")}
   end
 
+  @spec repair_applied_access_effect_for_system(String.t()) ::
+          {:ok, :repaired | :already_converged | :stale} | {:error, Error.t() | term()}
+  @doc """
+  Repairs subscription grants from a current APPLIED AccessEffect in an owned transaction.
+
+  The repair leaves the AccessEffect unchanged and retries cache and PubSub invalidation after
+  commit, including when the source grants already match the effect.
+  """
+  def repair_applied_access_effect_for_system(effect_id) when is_binary(effect_id) do
+    if Repo.in_transaction?() do
+      {:error,
+       Error.new(
+         "VALIDATION_ERROR",
+         "APPLIED source repair must own its correctness transaction"
+       )}
+    else
+      Repo.transaction(fn -> repair_applied_access_effect_in_transaction(effect_id) end)
+      |> handle_applied_access_effect_repair_transaction()
+    end
+  end
+
+  def repair_applied_access_effect_for_system(_effect_id) do
+    {:error, Error.new("VALIDATION_ERROR", "AccessEffect id must be a UUID")}
+  end
+
+  defp handle_applied_access_effect_repair_transaction({:ok, :stale}), do: {:ok, :stale}
+
+  defp handle_applied_access_effect_repair_transaction({:ok, {outcome, effect, user_ids}}) do
+    :ok =
+      AshNotifications.notify_post_commit([],
+        context: %{
+          flow: :repair_applied_access_effect,
+          subscription_id: effect.subscription_id,
+          access_effect_id: effect.id
+        }
+      )
+
+    case EntitlementsFacade.invalidate_subscription_source_users_after_commit_for_system(
+           user_ids,
+           "subscription_source_reconciliation"
+         ) do
+      :ok -> {:ok, outcome}
+      {:error, reason} -> {:error, Normalize.normalize(reason)}
+    end
+  end
+
+  defp handle_applied_access_effect_repair_transaction({:error, reason}),
+    do: {:error, Normalize.normalize(reason)}
+
+  defp repair_applied_access_effect_in_transaction(effect_id) do
+    case AccessEffectCurrentnessFence.prove(effect_id) do
+      {:ok, %{status: :stale}} ->
+        :stale
+
+      {:ok,
+       %{
+         status: :current,
+         access_effect: %AccessEffect{status: :applied} = effect,
+         source: %{subscription_id: subscription_id, user_id: user_id}
+       }} ->
+        repair_current_applied_access_effect(effect, subscription_id, user_id)
+
+      {:ok, %{status: :current, access_effect: %AccessEffect{}}} ->
+        Repo.rollback(
+          Error.new(
+            "INVALID_STATE_TRANSITION",
+            "source drift repair requires a current APPLIED AccessEffect"
+          )
+        )
+
+      {:error, reason} ->
+        Repo.rollback(reason)
+    end
+  end
+
+  defp repair_current_applied_access_effect(effect, subscription_id, user_id) do
+    with {:ok, current_provenance} <- lock_access_effect_subscription(subscription_id),
+         :ok <- validate_access_effect_provenance(effect, current_provenance),
+         :ok <- validate_access_effect_target_entitlement(effect, current_provenance),
+         {:ok, input} <- applied_source_reconciliation_input(effect, subscription_id, user_id),
+         {:ok, {outcome, convergence}} <-
+           EntitlementsFacade.reconcile_subscription_source_grants_for_system(input) do
+      {outcome, effect, convergence.projection_user_ids}
+    else
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp applied_source_reconciliation_input(effect, subscription_id, user_id) do
+    attrs = %{
+      subscription_id: subscription_id,
+      user_id: user_id,
+      disposition: effect.disposition,
+      entitlement_kind: effect.entitlement_kind,
+      entitlement_scope_key: effect.entitlement_scope_key,
+      valid_from_at: effect.valid_from_at,
+      valid_until_at: effect.valid_until_at,
+      reason: "subscription_source_reconciliation",
+      access_effect_id: effect.id,
+      source_version: effect.source_version,
+      target_fingerprint: effect.target_fingerprint
+    }
+
+    SubscriptionSourceConvergenceInput.new(attrs)
+  end
+
   defp handle_non_effective_access_effect_transaction(
          {:ok, {:applied, effect, user_ids}},
          _effect_id

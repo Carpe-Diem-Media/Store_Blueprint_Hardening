@@ -256,6 +256,68 @@ defmodule Store.Entitlements.Facade do
     end
   end
 
+  @spec reconcile_subscription_source_grants_for_system(SubscriptionSourceConvergenceInput.t()) ::
+          {:ok, {:repaired | :already_converged, SourceConvergenceResult.t()}} | {:error, term()}
+  @doc """
+  Repairs exact-source grants inside a caller-owned transaction, skipping writes when the locked
+  source rows already match the requested target. The caller must hold the Subscription source
+  lock for the full transaction and roll back the transaction if this function returns an error
+  after a write.
+  """
+  def reconcile_subscription_source_grants_for_system(input) do
+    if Repo.in_transaction?() do
+      validate_and_reconcile_source_input(input)
+    else
+      source_convergence_validation_error()
+    end
+  end
+
+  defp validate_and_reconcile_source_input(%SubscriptionSourceConvergenceInput{} = input) do
+    case SubscriptionSourceConvergenceInput.new(Map.from_struct(input)) do
+      {:ok, validated_input} ->
+        reconcile_subscription_source_grants_in_transaction(validated_input)
+
+      {:error, %Error{code: "VALIDATION_ERROR"} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp validate_and_reconcile_source_input(_input), do: source_convergence_validation_error()
+
+  defp reconcile_subscription_source_grants_in_transaction(input) do
+    with {:ok, locked_rows} <- lock_subscription_source_grants(input),
+         {:ok, source_state} <-
+           SourceConvergence.derive_locked_source_state(input, locked_rows) do
+      reconcile_locked_source_state(input, source_state, locked_rows)
+    end
+  end
+
+  defp reconcile_locked_source_state(input, source_state, locked_rows) do
+    active_rows = Enum.filter(locked_rows, &(&1.status == :active))
+
+    case SourceConvergence.validate_final_active_set(
+           input,
+           source_state.matching_target_id,
+           active_rows
+         ) do
+      :ok ->
+        result =
+          build_source_convergence_result(
+            input,
+            source_state,
+            source_state.matching_target_id
+          )
+
+        {:ok, {:already_converged, result}}
+
+      {:error, _reason} ->
+        with {:ok, result} <-
+               converge_locked_subscription_source(input, source_state, locked_rows) do
+          {:ok, {:repaired, result}}
+        end
+    end
+  end
+
   defp validate_and_converge_source_input(%SubscriptionSourceConvergenceInput{} = input) do
     case SubscriptionSourceConvergenceInput.new(Map.from_struct(input)) do
       {:ok, validated_input} ->
@@ -271,22 +333,30 @@ defmodule Store.Entitlements.Facade do
   defp converge_subscription_source_grants_in_transaction(input) do
     with {:ok, locked_rows} <- lock_subscription_source_grants(input),
          {:ok, source_state} <-
-           SourceConvergence.derive_locked_source_state(input, locked_rows),
-         {:ok, target_grant_id} <- converge_source_target(input, source_state),
+           SourceConvergence.derive_locked_source_state(input, locked_rows) do
+      converge_locked_subscription_source(input, source_state, locked_rows)
+    end
+  end
+
+  defp converge_locked_subscription_source(input, source_state, locked_rows) do
+    with {:ok, target_grant_id} <- converge_source_target(input, source_state),
          :ok <-
            revoke_active_non_targets(input, source_state, target_grant_id, locked_rows),
          {:ok, active_rows} <- read_final_active_subscription_grants(input),
          :ok <-
            SourceConvergence.validate_final_active_set(input, target_grant_id, active_rows) do
-      {:ok,
-       %SourceConvergenceResult{
-         mode: source_state.mode,
-         subscription_id: input.subscription_id,
-         target_grant_id: target_grant_id,
-         revoked_grant_ids: source_state.active_non_target_ids,
-         projection_user_ids: source_state.projection_user_ids
-       }}
+      {:ok, build_source_convergence_result(input, source_state, target_grant_id)}
     end
+  end
+
+  defp build_source_convergence_result(input, source_state, target_grant_id) do
+    %SourceConvergenceResult{
+      mode: source_state.mode,
+      subscription_id: input.subscription_id,
+      target_grant_id: target_grant_id,
+      revoked_grant_ids: source_state.active_non_target_ids,
+      projection_user_ids: source_state.projection_user_ids
+    }
   end
 
   defp lock_subscription_source_grants(input) do

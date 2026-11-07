@@ -40,6 +40,46 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
     assert_receive {:entitlements_invalidated, _, "non_effective_access_effect_applied", _}
   end
 
+  test "APPLIED source repair revokes an exact-source grant that became active again" do
+    fixture = create_committed_suspended_effect_fixture!("jc248_reactivation")
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.execute_suspension_access_effect_for_system(fixture.effect_id)
+             end)
+
+    effect_snapshot = fetch_effect!(fixture.effect_id)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "UPDATE entitlement_grants SET status = 'active', revoked_at = NULL, revoked_reason = NULL WHERE id = $1",
+        [Ecto.UUID.dump!(fixture.grant_id)]
+      )
+    end)
+
+    assert {:ok, :repaired} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect_id)
+             end)
+
+    assert %EntitlementGrant{
+             status: :revoked,
+             revoked_reason: "subscription_source_reconciliation"
+           } = fetch_grant!(fixture.grant_id)
+
+    assert fetch_effect!(fixture.effect_id) == effect_snapshot
+
+    repaired_grants = grants_for_source!(fixture.subscription_id)
+
+    assert {:ok, :already_converged} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect_id)
+             end)
+
+    assert grants_for_source!(fixture.subscription_id) == repaired_grants
+    assert fetch_effect!(fixture.effect_id) == effect_snapshot
+  end
+
   test "the public NON_EFFECTIVE executor rejects a caller-owned transaction before writes on commit" do
     fixture = create_committed_suspended_effect_fixture!("jc246_nested_commit")
     Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(fixture.user_id))
