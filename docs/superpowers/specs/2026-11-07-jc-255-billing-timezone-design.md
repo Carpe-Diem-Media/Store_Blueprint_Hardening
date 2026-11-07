@@ -32,6 +32,8 @@ The initial paid-order path propagates scheduling failure before creating a sour
 
 An existing bound RenewalAttempt keeps its stored timezone, period, and charged-contract snapshot. Later plan, default, or runtime configuration changes do not recalculate that occurrence. Invalid legacy contract values fail closed for diagnosis and explicit repair. Do not rewrite them to UTC or the current default, infer historical meaning, or add a backfill.
 
+The current due-renewal path calculates a live revision period twice before reusing an existing attempt. Replace that discovery step with the existing bounded current-attempt lookup. Validate complete bound evidence and use its stored renewal key. Only an unbound occurrence calculates a new period. Pass the resolved key into the execution helper so it cannot calculate another identity from current timezone configuration. Preserve locked binding and stale-version checks. Timezone contract errors must bypass payment-failure lifecycle mutation, including when a queued target revision fails inside binding.
+
 No schema, index, lifecycle, provider contract, payment-method authority, entitlement executor, or worker architecture changes are needed. This ticket does not select a NewYou billing timezone from geography, participant preferences, or provider behavior.
 
 ## Evidence

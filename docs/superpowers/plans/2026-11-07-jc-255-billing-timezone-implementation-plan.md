@@ -178,7 +178,7 @@ assert fetch_subscription!(subscription.id) == before_subscription
 
 Repeat the failure boundary with a real Johannesburg contract and a temporarily UTC-only configured database. For initial paid activation, use a valid purchased revision, corrupt its timezone before the facade runs, then assert the explicit error and no new subscription, item, or access-effect rows. Keep the parent JC-360 atomicity proofs intact.
 
-- [ ] Extend the existing bound retry test, `a bound retry uses the occurrence's captured grace policy`, to capture the first attempt's `charged_contract_snapshot["billing_timezone"]`, period boundaries, plan_revision_id, and attempt id. After binding, change the mutable plan's timezone through its public action and publish a later revision with a different supported zone. Retry the same occurrence with the configured database temporarily restricted to UTC-only. Assert the same attempt, stored period, revision, and snapshot timezone remain unchanged and that the provider retry still follows the existing captured contract. Do not re-resolve a bound occurrence from mutable plans or current configuration.
+- [ ] Extend the existing bound retry test, `a bound retry uses the occurrence's captured grace policy`, with explicit Johannesburg zones on both the live plan and queued target plan. Capture the first attempt's `charged_contract_snapshot["billing_timezone"]`, period boundaries, plan_revision_id, renewal_key, and attempt id. After binding, change the mutable target plan's timezone through its public action and publish a later revision with a different supported zone. Retry the same occurrence with the configured database temporarily restricted to UTC-only. Assert the same attempt, stored period, key, revision, and snapshot timezone remain unchanged and that the provider retry still follows the existing captured contract. Do not re-resolve a bound occurrence from mutable plans or current configuration.
 
 - [ ] Run the scheduler and facade regression files before production edits and retain the meaningful failing output.
 - [ ] Introduce Scheduler aliases for BillingTimezone and Error. Define its period type as a map of the three existing DateTime fields and its public return types as `{:ok, period()} | {:error, Error.t()}`. Implement initial and next periods using an explicit successful advance:
@@ -246,6 +246,25 @@ end
 In `shift_calendar_months/6`, first match `{:ok, local} <- shift_zone(...)`; preserve local date/time, anchor selection, and `shift_date_months/3`. Then match `{:ok, shifted_local} <- local_datetime(...)` and return `shift_zone(shifted_local, "Etc/UTC", database)`. Document errors, gap/ambiguity choices, and the fixed-second day contract.
 
 - [ ] Change the paid-order facade's `period <- Scheduler.initial_period(...)` clause to `{:ok, period} <- Scheduler.initial_period(...)`. Change `renewal_period/3` to return `Scheduler.next_period(...)` directly rather than nesting it inside another ok tuple. Preserve the branch that reads existing bound period evidence.
+- [ ] Prevent the discovery of a bound occurrence from recalculating its identity. Reuse the existing bounded `current_bound_renewal_attempt/1` lookup before any new period calculation, validate complete bound evidence, and use its stored key:
+
+```elixir
+defp renewal_identity_key(subscription, revision, now) do
+  case current_bound_renewal_attempt(subscription) do
+    {:ok, %RenewalAttempt{} = attempt} ->
+      with :ok <- ensure_complete_bound_renewal_attempt(attempt) do
+        {:ok, attempt.renewal_key}
+      end
+    {:ok, nil} ->
+      with {:ok, period} <- renewal_period(subscription, revision, now) do
+        {:ok, Scheduler.renewal_key(subscription.id, period.current_period_end_at)}
+      end
+    {:error, _reason} = error -> error
+  end
+end
+```
+
+In `due_renewal_identity/2`, retain contract resolution, revision read, and ownership checks, then call `renewal_identity_key/3` and return its key with the revision. Both callers of `run_single_due_renewal/3` already receive this key; pass it as a fourth argument. Remove the repeated live period and key calculation inside that function while retaining its other validation and locked binding. The stored key may differ from the bound target period end because a queued cadence change keeps the occurrence identity, so never regenerate a bound key from its period end. In its error clauses, return `INVALID_BILLING_TIMEZONE` directly before the generic payment-failure mutation. Add a queued invalid target regression proving the subscription, target, attempt count, orders, and intents remain unchanged when the error arises inside binding. Keep the bounded existing lookup, without new query abstractions or indexes.
 - [ ] Change each direct fixture/test call from `period = Scheduler.next_period(...)` or `Scheduler.initial_period(...)` to `{:ok, period} = ...`, using `assert` in tests. Unwrap chained field accesses into a named period first. Change direct advance assertions to match `{:ok, expected}`. Use `rg -n 'Scheduler\.(initial_period|next_period|advance_period_end)' lib test` to verify every caller, including all seven listed test modules. Do not weaken the existing calendar properties or lifecycle assertions.
 - [ ] Format, run focused tests, self-review the complete diff, and commit `fix(subscriptions): fail closed on billing timezone errors`.
 - [ ] Complete independent spec review, then quality review of the whole ticket.
