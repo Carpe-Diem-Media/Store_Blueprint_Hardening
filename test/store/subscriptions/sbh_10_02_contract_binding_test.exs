@@ -205,7 +205,7 @@ defmodule Store.Subscriptions.Sbh1002ContractBindingTest do
              SubscriptionsFacade.create_subscriptions_from_paid_order_for_system(order.id)
 
     subscription = fetch_subscription_for_order!(order.id)
-    expected_period = Scheduler.initial_period(subscription.started_at, revision)
+    {:ok, expected_period} = Scheduler.initial_period(subscription.started_at, revision)
 
     assert subscription.current_period_end_at == expected_period.current_period_end_at
     assert subscription.renewal_amount_minor == revision.amount_minor
@@ -241,7 +241,7 @@ defmodule Store.Subscriptions.Sbh1002ContractBindingTest do
              SubscriptionsFacade.create_subscriptions_from_paid_order_for_system(order.id)
 
     subscription = fetch_subscription_for_order!(order.id)
-    expected_period = Scheduler.initial_period(subscription.started_at, revision)
+    {:ok, expected_period} = Scheduler.initial_period(subscription.started_at, revision)
 
     assert Map.get(subscription, :current_plan_revision_id) == revision.id
     assert subscription.renewal_amount_minor == revision.amount_minor

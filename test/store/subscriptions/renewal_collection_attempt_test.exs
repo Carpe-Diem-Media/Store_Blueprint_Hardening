@@ -264,7 +264,7 @@ defmodule Store.Subscriptions.RenewalCollectionAttemptTest do
         provider_billing_ref: "pm_#{label}"
       })
 
-    period = Scheduler.next_period(subscription.current_period_end_at, revision)
+    {:ok, period} = Scheduler.next_period(subscription.current_period_end_at, revision)
 
     order =
       Order

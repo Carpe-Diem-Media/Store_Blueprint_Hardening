@@ -2773,7 +2773,7 @@ defmodule Store.Subscriptions.Facade do
   defp process_due_subscription_at_due(subscription, renewal_key, now) do
     with {:ok, current_renewal_key, live_revision} <- due_renewal_identity(subscription, now),
          :ok <- ensure_matching_renewal_key(renewal_key, current_renewal_key) do
-      case run_single_due_renewal(subscription, now, live_revision) do
+      case run_single_due_renewal(subscription, now, live_revision, current_renewal_key) do
         :ok -> {:ok, :processed}
         {:error, reason} -> {:error, reason}
       end
@@ -3164,8 +3164,8 @@ defmodule Store.Subscriptions.Facade do
   defp count_due_renewal_results(due_subscriptions, now) do
     Enum.reduce(due_subscriptions, %{success: 0, failed: 0}, fn subscription, acc ->
       result =
-        with {:ok, _renewal_key, live_revision} <- due_renewal_identity(subscription, now) do
-          run_single_due_renewal(subscription, now, live_revision)
+        with {:ok, renewal_key, live_revision} <- due_renewal_identity(subscription, now) do
+          run_single_due_renewal(subscription, now, live_revision, renewal_key)
         end
 
       case result do
@@ -3196,9 +3196,25 @@ defmodule Store.Subscriptions.Facade do
     with :ok <- ensure_subscription_contract_resolved(subscription),
          {:ok, revision} <- fetch_plan_revision(subscription.current_plan_revision_id),
          :ok <- ensure_revision_belongs_to_plan(revision, subscription.subscription_plan_id),
-         {:ok, renewal_period} <- renewal_period(subscription, revision, now) do
-      {:ok, Scheduler.renewal_key(subscription.id, renewal_period.current_period_end_at),
-       revision}
+         {:ok, renewal_key} <- renewal_identity_key(subscription, revision, now) do
+      {:ok, renewal_key, revision}
+    end
+  end
+
+  defp renewal_identity_key(%Subscription{} = subscription, revision, now) do
+    case current_bound_renewal_attempt(subscription) do
+      {:ok, %RenewalAttempt{} = attempt} ->
+        with :ok <- ensure_complete_bound_renewal_attempt(attempt) do
+          {:ok, attempt.renewal_key}
+        end
+
+      {:ok, nil} ->
+        with {:ok, period} <- renewal_period(subscription, revision, now) do
+          {:ok, Scheduler.renewal_key(subscription.id, period.current_period_end_at)}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -3304,7 +3320,8 @@ defmodule Store.Subscriptions.Facade do
   defp run_single_due_renewal(
          %Subscription{} = subscription,
          now,
-         %PlanRevision{} = live_revision
+         %PlanRevision{} = live_revision,
+         renewal_key
        ) do
     started_at = System.monotonic_time()
 
@@ -3312,9 +3329,6 @@ defmodule Store.Subscriptions.Facade do
       with :ok <- ensure_subscription_contract_resolved(subscription),
            :ok <-
              ensure_revision_belongs_to_plan(live_revision, subscription.subscription_plan_id),
-           {:ok, renewal_identity_period} <- renewal_period(subscription, live_revision, now),
-           renewal_key <-
-             Scheduler.renewal_key(subscription.id, renewal_identity_period.current_period_end_at),
            {:ok, binding} <- bind_renewal_attempt(subscription, renewal_key, live_revision) do
         bound_subscription = binding.subscription
         bound_attempt = binding.attempt
@@ -3354,6 +3368,9 @@ defmodule Store.Subscriptions.Facade do
           {:error, error}
 
         {:error, %Error{code: "VALIDATION_ERROR"} = error} ->
+          {:error, error}
+
+        {:error, %Error{code: "INVALID_BILLING_TIMEZONE"} = error} ->
           {:error, error}
 
         {:error, reason} ->
@@ -3664,7 +3681,7 @@ defmodule Store.Subscriptions.Facade do
          :ok <- ensure_revision_belongs_to_plan(revision, plan.id),
          :ok <- ensure_revision_has_purchase_history(revision),
          {:ok, provider_selection} <- resolve_provider_and_billing_mode(order, plan),
-         period <-
+         {:ok, period} <-
            Scheduler.initial_period(
              DateTime.utc_now() |> DateTime.truncate(:microsecond),
              revision
@@ -4760,7 +4777,7 @@ defmodule Store.Subscriptions.Facade do
          %PlanRevision{} = revision,
          _now
        ) do
-    {:ok, Scheduler.next_period(period_start, revision)}
+    Scheduler.next_period(period_start, revision)
   end
 
   defp renewal_period(%Subscription{}, %PlanRevision{}, _now) do

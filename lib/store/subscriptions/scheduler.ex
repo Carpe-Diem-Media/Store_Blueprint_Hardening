@@ -8,36 +8,32 @@ defmodule Store.Subscriptions.Scheduler do
     "sub:#{subscription_id}:end:#{DateTime.to_iso8601(period_end_at)}"
   end
 
-  @spec initial_period(DateTime.t(), map()) ::
-          %{
-            current_period_start_at: DateTime.t(),
-            current_period_end_at: DateTime.t(),
-            next_renewal_at: DateTime.t()
-          }
-  def initial_period(%DateTime{} = started_at, plan) when is_map(plan) do
-    period_end_at = advance_period_end(started_at, plan)
+  alias Store.Subscriptions.BillingTimezone
+  alias Store.Support.Errors.Error
 
-    %{
-      current_period_start_at: started_at,
-      current_period_end_at: period_end_at,
-      next_renewal_at: period_end_at
-    }
+  @type period :: %{
+          current_period_start_at: DateTime.t(),
+          current_period_end_at: DateTime.t(),
+          next_renewal_at: DateTime.t()
+        }
+
+  @doc "Calculates the first billing period or returns the timezone error."
+  @spec initial_period(DateTime.t(), map()) :: {:ok, period()} | {:error, Error.t()}
+  def initial_period(%DateTime{} = started_at, plan) when is_map(plan) do
+    with {:ok, period_end_at} <- advance_period_end(started_at, plan) do
+      {:ok,
+       %{
+         current_period_start_at: started_at,
+         current_period_end_at: period_end_at,
+         next_renewal_at: period_end_at
+       }}
+    end
   end
 
-  @spec next_period(DateTime.t(), map()) ::
-          %{
-            current_period_start_at: DateTime.t(),
-            current_period_end_at: DateTime.t(),
-            next_renewal_at: DateTime.t()
-          }
+  @doc "Calculates the next billing period or returns the timezone error."
+  @spec next_period(DateTime.t(), map()) :: {:ok, period()} | {:error, Error.t()}
   def next_period(%DateTime{} = current_period_end_at, plan) when is_map(plan) do
-    next_period_end_at = advance_period_end(current_period_end_at, plan)
-
-    %{
-      current_period_start_at: current_period_end_at,
-      current_period_end_at: next_period_end_at,
-      next_renewal_at: next_period_end_at
-    }
+    initial_period(current_period_end_at, plan)
   end
 
   @spec grace_expires_at(DateTime.t(), map()) :: DateTime.t()
@@ -79,39 +75,52 @@ defmodule Store.Subscriptions.Scheduler do
     :erlang.phash2(hashed_source, max_window_seconds + 1)
   end
 
-  @spec advance_period_end(DateTime.t(), map()) :: DateTime.t()
+  @doc "Advances a period boundary using the plan's validated billing timezone."
+  @spec advance_period_end(DateTime.t(), map()) :: {:ok, DateTime.t()} | {:error, Error.t()}
   def advance_period_end(%DateTime{} = period_start_at, plan) when is_map(plan) do
     interval_unit = map_attr(plan, :interval_unit, :month)
     interval_count = map_attr(plan, :interval_count, 1)
     anchor_mode = map_attr(plan, :anchor_mode, :start_anniversary)
     anchor_day_of_month = map_attr(plan, :anchor_day_of_month, nil)
-    billing_timezone = map_attr(plan, :billing_timezone, "Etc/UTC")
+    billing_timezone = required_map_attr(plan, :billing_timezone)
     day_seconds = interval_count * 86_400
+    database = Calendar.get_time_zone_database()
 
-    case interval_unit do
-      :day ->
-        DateTime.add(period_start_at, day_seconds, :second)
+    with :ok <- BillingTimezone.validate(billing_timezone, database) do
+      case interval_unit do
+        :day ->
+          {:ok, DateTime.add(period_start_at, day_seconds, :second)}
 
-      :month ->
-        shift_calendar_months(
-          period_start_at,
-          interval_count,
-          anchor_mode,
-          anchor_day_of_month,
-          billing_timezone
-        )
+        :month ->
+          shift_calendar_months(
+            period_start_at,
+            interval_count,
+            anchor_mode,
+            anchor_day_of_month,
+            billing_timezone,
+            database
+          )
 
-      :year ->
-        shift_calendar_months(
-          period_start_at,
-          interval_count * 12,
-          anchor_mode,
-          anchor_day_of_month,
-          billing_timezone
-        )
+        :year ->
+          shift_calendar_months(
+            period_start_at,
+            interval_count * 12,
+            anchor_mode,
+            anchor_day_of_month,
+            billing_timezone,
+            database
+          )
 
-      _ ->
-        DateTime.add(period_start_at, day_seconds, :second)
+        _ ->
+          {:ok, DateTime.add(period_start_at, day_seconds, :second)}
+      end
+    end
+  end
+
+  defp required_map_attr(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> value
+      :error -> Map.get(map, Atom.to_string(key))
     end
   end
 
@@ -135,28 +144,27 @@ defmodule Store.Subscriptions.Scheduler do
          month_count,
          anchor_mode,
          anchor_day_of_month,
-         billing_timezone
+         billing_timezone,
+         database
        ) do
-    local = shift_zone!(period_start_at, billing_timezone)
-    local_date = DateTime.to_date(local)
-    local_time = DateTime.to_time(local)
+    with {:ok, local} <- shift_zone(period_start_at, billing_timezone, database) do
+      local_date = DateTime.to_date(local)
+      local_time = DateTime.to_time(local)
 
-    anchor_day =
-      case anchor_mode do
-        :fixed_day_of_month when is_integer(anchor_day_of_month) -> anchor_day_of_month
-        _ -> local_date.day
+      anchor_day =
+        case anchor_mode do
+          :fixed_day_of_month when is_integer(anchor_day_of_month) -> anchor_day_of_month
+          _ -> local_date.day
+        end
+
+      shifted_date = shift_date_months(local_date, month_count, anchor_day)
+
+      with {:ok, shifted_local} <-
+             local_datetime(shifted_date, local_time, local.time_zone, database),
+           {:ok, utc} <- shift_zone(shifted_local, "Etc/UTC", database) do
+        {:ok, utc}
       end
-
-    shifted_date = shift_date_months(local_date, month_count, anchor_day)
-
-    shifted_local =
-      case DateTime.new(shifted_date, local_time, local.time_zone) do
-        {:ok, datetime} -> datetime
-        {:ambiguous, first, _second} -> first
-        {:gap, datetime, _after} -> datetime
-      end
-
-    shift_zone!(shifted_local, "Etc/UTC")
+    end
   end
 
   defp shift_date_months(%Date{} = date, month_count, anchor_day) when is_integer(month_count) do
@@ -172,10 +180,27 @@ defmodule Store.Subscriptions.Scheduler do
     |> Date.days_in_month()
   end
 
-  defp shift_zone!(%DateTime{} = datetime, timezone) do
-    case DateTime.shift_zone(datetime, timezone) do
-      {:ok, shifted} -> shifted
-      {:error, _reason} -> datetime
+  defp shift_zone(%DateTime{} = datetime, timezone, database) do
+    case DateTime.shift_zone(datetime, timezone, database) do
+      {:ok, shifted} -> {:ok, shifted}
+      {:error, reason} -> invalid_timezone(timezone, reason)
     end
+  end
+
+  defp local_datetime(date, time, timezone, database) do
+    case DateTime.new(date, time, timezone, database) do
+      {:ok, datetime} -> {:ok, datetime}
+      {:ambiguous, first, _second} -> {:ok, first}
+      {:gap, before, _after} -> {:ok, before}
+      {:error, reason} -> invalid_timezone(timezone, reason)
+    end
+  end
+
+  defp invalid_timezone(timezone, reason) do
+    {:error,
+     Error.new("INVALID_BILLING_TIMEZONE", "billing timezone conversion failed", %{
+       billing_timezone: timezone,
+       reason: reason
+     })}
   end
 end

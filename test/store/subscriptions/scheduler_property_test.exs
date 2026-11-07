@@ -22,11 +22,11 @@ defmodule Store.Subscriptions.SchedulerPropertyTest do
         billing_timezone: "Etc/UTC"
       }
 
-      period_end_at = Scheduler.advance_period_end(period_start_at, plan)
+      {:ok, period_end_at} = Scheduler.advance_period_end(period_start_at, plan)
 
       assert DateTime.compare(period_end_at, period_start_at) == :gt
 
-      next_period = Scheduler.next_period(period_end_at, plan)
+      {:ok, next_period} = Scheduler.next_period(period_end_at, plan)
 
       assert DateTime.compare(
                next_period.current_period_end_at,
@@ -53,7 +53,7 @@ defmodule Store.Subscriptions.SchedulerPropertyTest do
         billing_timezone: "Etc/UTC"
       }
 
-      period_end_at = Scheduler.advance_period_end(period_start_at, plan)
+      {:ok, period_end_at} = Scheduler.advance_period_end(period_start_at, plan)
       days_in_month = Date.days_in_month(Date.new!(period_end_at.year, period_end_at.month, 1))
 
       assert period_end_at.day <= days_in_month
