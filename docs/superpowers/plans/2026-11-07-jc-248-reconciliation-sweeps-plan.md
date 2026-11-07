@@ -142,7 +142,7 @@ defmodule Store.Workers.VerifySubscriptionAccessWorker do
   def perform(_job), do: {:discard, "invalid access verification job"}
   defp parse_query(args) do
     with true <- Enum.all?(Map.keys(args), &(&1 in ["as_of", "after_inserted_at", "after_id", "limit"])),
-         true <- Map.has_key?(args, "as_of") or not Map.has_key?(args, "after_id"),
+         true <- valid_cursor_presence?(args),
          {:ok, as_of} <- as_of(args),
          {:ok, after_at} <- datetime(Map.get(args, "after_inserted_at"), nil),
          {:ok, query} <- AppliedAccessVerificationQuery.new(%{as_of: as_of,
@@ -150,6 +150,14 @@ defmodule Store.Workers.VerifySubscriptionAccessWorker do
       {:ok, query}
     else
       _ -> {:discard, "invalid access verification bounds"}
+    end
+  end
+  defp valid_cursor_presence?(args) do
+    case {Map.fetch(args, "after_inserted_at"), Map.fetch(args, "after_id")} do
+      {:error, :error} -> true
+      {{:ok, timestamp}, {:ok, id}} when is_binary(timestamp) and is_binary(id) ->
+        Map.has_key?(args, "as_of") and Map.has_key?(args, "limit")
+      _ -> false
     end
   end
   defp as_of(args) do
@@ -228,7 +236,7 @@ defmodule Store.Workers.InventorySubscriptionAccessAuthorityWorker do
   def perform(_job), do: {:discard, "invalid access authority inventory job"}
   defp parse_query(args) do
     with true <- Enum.all?(Map.keys(args), &(&1 in ["through_id", "after_id", "limit"])),
-         true <- Map.has_key?(args, "through_id") or not Map.has_key?(args, "after_id"),
+         true <- valid_cursor_presence?(args),
          limit <- Map.get(args, "limit", 100),
          true <- is_integer(limit) and limit in 1..500,
          {:ok, upper} <- upper_bound(args) do
@@ -245,6 +253,14 @@ defmodule Store.Workers.InventorySubscriptionAccessAuthorityWorker do
       false -> {:discard, "invalid access authority inventory bounds"}
       {:error, %Error{code: "VALIDATION_ERROR"}} -> {:discard, "invalid access authority inventory bounds"}
       {:error, reason} -> {:error, reason}
+    end
+  end
+  defp valid_cursor_presence?(args) do
+    case Map.fetch(args, "after_id") do
+      :error -> true
+      {:ok, id} when is_binary(id) ->
+        Map.has_key?(args, "through_id") and Map.has_key?(args, "limit")
+      _ -> false
     end
   end
   defp upper_bound(%{"through_id" => id}) when is_binary(id), do: {:ok, id}
@@ -267,7 +283,7 @@ end
 
 - [ ] Add daily crons `{"0 0 * * *", Store.Workers.VerifySubscriptionAccessWorker}` and `{"30 0 * * *", Store.Workers.InventorySubscriptionAccessAuthorityWorker}`. The cron's existing UTC clock schedules these at 02:00 and 02:30 South Africa time. Both use priority 3 in the existing ops queue. Continuations delay one second and retain fixed bounds. This bounds each unit of work; it does not assert a production sweep duration or guarantee completion before peak hours.
 
-- [ ] Add worker integration tests with Oban manual testing and actual persisted jobs: lost initial source enqueue is rediscovered from PostgreSQL mismatch; repeated verification creates at most one incomplete source job inside the 55-second window; completed/discarded source jobs do not suppress a new repair; deleting an operational continuation then restarting the initial window repeats safe work and reaches the mismatch; all-stale raw pages still enqueue a continuation with the same `as_of`; inventory healthy pages continue and missing rows only emit unclassified telemetry. Invalid/half cursor arguments cannot silently reset progress. Capture worker RED before implementing each new behavior, then GREEN.
+- [ ] Add worker integration tests with Oban manual testing and actual persisted jobs: lost initial source enqueue is rediscovered from PostgreSQL mismatch; repeated verification creates at most one incomplete source job inside the 55-second window; completed/discarded source jobs do not suppress a new repair; deleting an operational continuation then restarting the initial window repeats safe work and reaches the mismatch; all-stale raw pages still enqueue a continuation with the same `as_of`; inventory healthy pages continue and missing rows only emit unclassified telemetry. Invalid/half cursor arguments cannot silently reset progress. Supplied null cursors are malformed, even when their upper bound is valid; verification requires both supplied cursor strings and inventory requires a supplied non-null UUID. Defaults apply only when cursor keys are absent. Reject malformed continuations before SQL. Capture worker RED before implementing each new behavior, then GREEN.
 - [ ] Add telemetry assertions for page counts and conflict/missing outcomes. Remove handlers in `after`. Do not expose raw source/provider payloads or customer details. All event metadata remains IDs and fixed outcome classes.
 - [ ] Run format, scoped strict Credo, compile warnings-as-errors, focused execution modules and migration alignment. Self-review and commit task-owned files. Separate spec and quality review follow, then a final task supplies real concurrency, two-repeat resource measurements and full repository gates.
 
@@ -276,3 +292,5 @@ Use only sequential Mix commands under:
 `MIX_ENV=test STORE_TEST_DB_SUFFIX=_t3_132f19be_hardening STORE_BENCH_POOL_SIZE=4 STORE_BENCH_WRITER_POOL_SIZE=4 ERL_FLAGS='+S 4:4' mise exec -- devcore-project run test -- mix`
 
 Root self-review must verify query/input names against the accepted earlier tasks before dispatch. Exact page bounds and database truth govern execution. No queue state is business completion and no missing-authority backfill is authorized.
+
+Implementation `d49d68f5686189461460fa28d672af42e7f52513` passed 69 focused tests. The first independent specification review found that continuations without `limit` still defaulted to 100. Root added two regressions and observed both fail with one SQL read, then required an explicit continuation limit in both parsers. Correction `2e60684bc401a742049976e0388a2d58a4dd726f` passed 71 focused tests, format, scoped strict Credo, warnings-as-errors compile and migration alignment. The source-conflict fixture now registers restoration before mutation so an earlier assertion failure cannot block teardown. Fresh specification recheck and quality review remain pending.
