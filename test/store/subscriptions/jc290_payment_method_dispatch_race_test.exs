@@ -6,13 +6,16 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
   import Ash.Expr
   require Ash.Query
   alias Ecto.Adapters.SQL.Sandbox
+  alias Store.Payments.WebhookReceipt
   alias Store.Repo
   alias Store.Subscriptions.Facade
   alias Store.Subscriptions.Facade.StaleWrite
   alias Store.Subscriptions.{PaymentMethodAuthorityGate, StoredPaymentMethod, Subscription}
   alias Store.SubscriptionsFixtures
   alias Store.Support.AshNotifications
+  alias Store.Support.Telemetry.RepoStats
   alias Store.TestSupport.StripeAPIStub
+  alias Store.Workers.ProcessWebhookReceiptWorker
 
   setup_all do
     assert_test_database!()
@@ -588,6 +591,17 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
     end
   end
 
+  @tag :jc290_capacity_correction
+  test "bounded held renewals leave capacity for webhook and binding writes twice" do
+    pool_size = Repo.config()[:pool_size]
+    assert pool_size >= 4
+    holder_count = min(4, pool_size - 2)
+
+    for repetition <- 1..2 do
+      run_capacity_liveness_repetition!(repetition, holder_count)
+    end
+  end
+
   for mutation <- [:replace, :revoke], route <- [:due, :not_due] do
     @tag :jc290_matrix
     test "crashed dispatch with #{mutation} observes only on the #{route} route" do
@@ -917,6 +931,379 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
     Subscription
     |> Ash.Query.filter(expr(id == ^fixture.subscription.id))
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp run_capacity_liveness_repetition!(repetition, holder_count) do
+    ref = make_ref()
+    Process.put({ref, :fixtures}, [])
+    Process.put({ref, :tasks}, [])
+    Process.put({ref, :post_handles}, [])
+    Process.put({ref, :receipt}, nil)
+
+    try do
+      source = track_capacity_fixture!(ref, "capacity_source_#{repetition}")
+      writer_fixture = track_capacity_fixture!(ref, "capacity_writer_#{repetition}")
+
+      holders =
+        for index <- 1..holder_count do
+          track_capacity_fixture!(ref, "capacity_holder_#{repetition}_#{index}")
+        end
+
+      parent = self()
+
+      StripeAPIStub.stub_payment_intent(fn conn, params ->
+        customer_ref = params["customer"]
+
+        case Enum.find(holders, &(&1.refs.provider_customer == customer_ref)) do
+          nil ->
+            StripeAPIStub.json_response(
+              conn,
+              StripeAPIStub.payment_intent_response(params, %{
+                "status" => "processing",
+                "amount_received" => 0
+              })
+            )
+
+          fixture ->
+            local_id = params["metadata[local_intent_id]"]
+            [[backend_pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+            send(parent, {ref, :held_post, self(), customer_ref, backend_pid, local_id, params})
+
+            receive do
+              {^ref, :release_post, ^local_id} ->
+                body = StripeAPIStub.payment_intent_response(params, %{"status" => "succeeded"})
+                send(parent, {ref, :provider_response, customer_ref, body["id"]})
+                StripeAPIStub.json_response(conn, body)
+            after
+              20_000 -> raise "JC290 capacity POST barrier expired for #{fixture.subscription.id}"
+            end
+        end
+      end)
+
+      assert {:ok, :processed} =
+               Facade.process_due_subscription_renewal_for_system(source.subscription.id,
+                 now: source.now
+               )
+
+      source_identity = reached_identity!(source)
+
+      [[provider_payment_id, amount_minor, currency]] =
+        Repo.query!(
+          "SELECT p.provider_payment_id, o.grand_total_minor, o.currency_code FROM payment_intents p JOIN orders o ON o.id=p.order_id WHERE p.id=$1::text::uuid",
+          [source_identity.payment_intent_id]
+        ).rows
+
+      assert is_binary(provider_payment_id) and provider_payment_id != ""
+      assert source_identity.financial_outcome == "unresolved"
+      event_id = "evt_jc290_capacity_#{repetition}_#{Ecto.UUID.generate()}"
+
+      receipt =
+        WebhookReceipt
+        |> Ash.Changeset.for_create(:ingest, %{
+          provider: "stripe",
+          provider_event_id: event_id,
+          event_type: "payment_intent.succeeded",
+          verification_status: "verified",
+          processing_status: "new",
+          raw_body:
+            Jason.encode!(%{
+              "id" => event_id,
+              "created" => DateTime.to_unix(source.now),
+              "livemode" => false,
+              "type" => "payment_intent.succeeded",
+              "data" => %{
+                "object" => %{
+                  "id" => provider_payment_id,
+                  "amount_received" => amount_minor,
+                  "currency" => String.downcase(currency),
+                  "livemode" => false,
+                  "metadata" => %{"local_intent_id" => source_identity.payment_intent_id},
+                  "status" => "succeeded"
+                }
+              }
+            }),
+          headers: %{"content-type" => ["application/json"]}
+        })
+        |> Ash.create!(domain: Store.Payments, authorize?: false)
+
+      Process.put({ref, :receipt}, receipt)
+
+      active_method =
+        StoredPaymentMethod
+        |> Ash.Changeset.for_create(
+          :create_or_reuse,
+          %{
+            user_id: writer_fixture.customer.id,
+            provider: :stripe,
+            provider_customer_ref: writer_fixture.refs.provider_customer,
+            provider_payment_method_ref: writer_fixture.refs.new_method,
+            status: :active,
+            fingerprint: "fp_jc290_#{writer_fixture.refs.new_method}"
+          },
+          context: %{system?: true}
+        )
+        |> Ash.create!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+
+      renewal_tasks =
+        Enum.map(holders, fn fixture ->
+          task =
+            Task.async(fn ->
+              Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
+                now: fixture.now
+              )
+            end)
+
+          track_capacity_task!(ref, task)
+          {fixture, task}
+        end)
+
+      held_posts =
+        Enum.reduce(1..holder_count, %{}, fn _, acc ->
+          assert_receive {^ref, :held_post, callback_pid, customer_ref, backend_pid, local_id,
+                          params},
+                         10_000
+
+          Process.put({ref, :post_handles}, [
+            {callback_pid, backend_pid, customer_ref, local_id}
+            | Process.get({ref, :post_handles})
+          ])
+
+          assert Map.has_key?(acc, customer_ref) == false
+          fixture = Enum.find(holders, &(&1.refs.provider_customer == customer_ref))
+          assert fixture
+          assert params["payment_method"] == fixture.refs.old_method
+          assert params["customer"] == fixture.refs.provider_customer
+
+          [[renewal_total, renewal_currency]] =
+            Repo.query!(
+              "SELECT o.grand_total_minor, o.currency_code FROM payment_intents p JOIN orders o ON o.id=p.order_id WHERE p.id=$1::text::uuid",
+              [local_id]
+            ).rows
+
+          assert params["amount"] == Integer.to_string(renewal_total)
+          assert params["currency"] == String.downcase(renewal_currency)
+
+          assert [[nil]] ==
+                   Repo.query!("SELECT xact_start FROM pg_stat_activity WHERE pid=$1", [
+                     backend_pid
+                   ]).rows
+
+          assert_dispatch_locks!(
+            backend_pid,
+            PaymentMethodAuthorityGate.binding_key(fixture.customer.id, :stripe),
+            PaymentMethodAuthorityGate.method_key(
+              :stripe,
+              fixture.refs.provider_customer,
+              fixture.refs.old_method
+            )
+          )
+
+          Map.put(acc, customer_ref, %{
+            fixture: fixture,
+            backend_pid: backend_pid,
+            local_id: local_id
+          })
+        end)
+
+      assert MapSet.new(Map.keys(held_posts)) ==
+               MapSet.new(Enum.map(holders, & &1.refs.provider_customer))
+
+      assert length(Enum.uniq(Enum.map(Map.values(held_posts), & &1.backend_pid))) == holder_count
+
+      primary_metrics = primary_pool_metrics!()
+      assert primary_metrics.ready_conn_count >= 2
+      assert primary_metrics.checkout_queue_length == 0
+
+      worker =
+        start_capacity_operation!(ref, fn ->
+          ProcessWebhookReceiptWorker.perform(%Oban.Job{
+            args: %{"webhook_receipt_id" => receipt.id}
+          })
+        end)
+
+      writer =
+        start_capacity_operation!(ref, fn ->
+          Repo.checkout(fn ->
+            current = current_subscription!(writer_fixture)
+
+            {:ok, updated, notifications} =
+              current
+              |> Ash.Changeset.for_update(
+                :set_provider_billing_reference,
+                %{
+                  provider_customer_ref: writer_fixture.refs.provider_customer,
+                  provider_billing_ref: writer_fixture.refs.new_method,
+                  stored_payment_method_id: active_method.id
+                },
+                context: %{system?: true}
+              )
+              |> Ash.update(
+                domain: Store.Subscriptions,
+                authorize?: false,
+                context: %{system?: true},
+                return_notifications?: true
+              )
+
+            :ok =
+              AshNotifications.notify_post_commit(notifications,
+                context: %{flow: :jc290_capacity_writer, subscription_id: updated.id}
+              )
+
+            updated
+          end)
+        end)
+
+      assert {:ok, webhook_measurements} = Task.await(worker, 10_000)
+      {writer_result, binding_measurements} = Task.await(writer, 10_000)
+      assert writer_result.provider_billing_ref == writer_fixture.refs.new_method
+      assert reached_identity!(source).financial_outcome == "verified_success"
+      assert Enum.all?(renewal_tasks, fn {_fixture, task} -> Process.alive?(task.pid) end)
+
+      IO.puts(
+        Jason.encode!(%{
+          tag: "JC290_BOUNDED_CAPACITY_LIVENESS",
+          repetition: repetition,
+          held_direct_facade_renewals: holder_count,
+          primary_pool_ready_connections_while_held: primary_metrics.ready_conn_count,
+          primary_pool_checkout_queue_while_held: primary_metrics.checkout_queue_length,
+          webhook: webhook_measurements,
+          binding_write: binding_measurements,
+          scope: "one node, stubbed provider requests, no Oban producer or network timeout"
+        })
+      )
+
+      release_capacity_posts!(ref)
+
+      provider_ids =
+        Enum.reduce(1..holder_count, %{}, fn _, acc ->
+          assert_receive {^ref, :provider_response, customer_ref, provider_payment_id}, 10_000
+          Map.put(acc, customer_ref, provider_payment_id)
+        end)
+
+      Enum.each(renewal_tasks, fn {fixture, task} ->
+        assert {:ok, :processed} = Task.await(task, 15_000),
+               "renewal #{fixture.subscription.id} did not finish"
+      end)
+
+      Enum.each(holders, fn fixture ->
+        post = Map.fetch!(held_posts, fixture.refs.provider_customer)
+        exact = reached_identity!(fixture)
+        assert exact.payment_intent_id == post.local_id
+
+        [[provider_payment_id]] =
+          Repo.query!("SELECT provider_payment_id FROM payment_intents WHERE id=$1::text::uuid", [
+            post.local_id
+          ]).rows
+
+        assert provider_payment_id == Map.fetch!(provider_ids, fixture.refs.provider_customer)
+        assert exact.financial_outcome == "verified_success"
+        assert exact.intent_method == fixture.refs.old_method
+      end)
+
+      Enum.each(holders, &assert_dispatch_locks_absent!/1)
+
+      assert primary_pool_metrics!() == %{
+               ready_conn_count: Repo.config()[:pool_size],
+               checkout_queue_length: 0
+             }
+    after
+      release_capacity_posts!(ref)
+      Enum.each(Process.get({ref, :tasks}, []), &Task.shutdown(&1, 3_000))
+
+      if receipt = Process.get({ref, :receipt}),
+        do: Repo.query!("DELETE FROM webhook_receipts WHERE id=$1::text::uuid", [receipt.id])
+
+      Enum.each(Process.get({ref, :fixtures}, []), &cleanup_dispatch_fixture!/1)
+      Process.delete({ref, :fixtures})
+      Process.delete({ref, :tasks})
+      Process.delete({ref, :post_handles})
+      Process.delete({ref, :receipt})
+    end
+  end
+
+  defp track_capacity_fixture!(ref, label) do
+    fixture = create_dispatch_fixture!(label)
+    Process.put({ref, :fixtures}, [fixture | Process.get({ref, :fixtures})])
+    fixture
+  end
+
+  defp track_capacity_task!(ref, task) do
+    Process.put({ref, :tasks}, [task | Process.get({ref, :tasks})])
+    task
+  end
+
+  defp start_capacity_operation!(ref, fun) do
+    task =
+      Task.async(fn ->
+        started = System.monotonic_time()
+        {result, stats} = RepoStats.capture(fun)
+
+        measurements = %{
+          elapsed_us:
+            System.convert_time_unit(System.monotonic_time() - started, :native, :microsecond),
+          query_count: stats.query_count,
+          checkout_queue_time_us:
+            System.convert_time_unit(stats.queue_time, :native, :microsecond)
+        }
+
+        {result, measurements}
+      end)
+
+    track_capacity_task!(ref, task)
+  end
+
+  defp release_capacity_posts!(ref) do
+    pending = collect_pending_capacity_handles!(ref)
+
+    Enum.each(pending ++ Process.get({ref, :post_handles}, []), fn {callback_pid, _backend_pid,
+                                                                    _customer_ref, local_id} ->
+      send(callback_pid, {ref, :release_post, local_id})
+    end)
+  end
+
+  defp collect_pending_capacity_handles!(ref) do
+    receive do
+      {^ref, :held_post, callback_pid, customer_ref, backend_pid, local_id, _params} ->
+        [
+          {callback_pid, backend_pid, customer_ref, local_id}
+          | collect_pending_capacity_handles!(ref)
+        ]
+    after
+      0 -> []
+    end
+  end
+
+  defp primary_pool_metrics! do
+    meta = Ecto.Adapter.lookup_meta(Repo)
+
+    metrics =
+      DBConnection.get_connection_metrics(meta.pid, pool: Keyword.fetch!(meta.opts, :pool))
+
+    %{
+      ready_conn_count: Enum.sum(Enum.map(metrics, & &1.ready_conn_count)),
+      checkout_queue_length: Enum.sum(Enum.map(metrics, & &1.checkout_queue_length))
+    }
+  end
+
+  defp assert_dispatch_locks_absent!(fixture) do
+    keys = [
+      PaymentMethodAuthorityGate.binding_key(fixture.customer.id, :stripe),
+      PaymentMethodAuthorityGate.method_key(
+        :stripe,
+        fixture.refs.provider_customer,
+        fixture.refs.old_method
+      )
+    ]
+
+    Enum.each(keys, fn key ->
+      <<high::unsigned-big-32, low::unsigned-big-32>> = <<key::signed-big-64>>
+
+      assert [[0]] ==
+               Repo.query!(
+                 "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND granted AND objsubid=1 AND classid::bigint=$1 AND objid::bigint=$2",
+                 [high, low]
+               ).rows
+    end)
   end
 
   defp reached_identity!(fixture) do

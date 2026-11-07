@@ -57,6 +57,9 @@ This phase is not “more features”. It is the **go‑to‑production contract
    - optional `ECTO_IPV6`
    - `POOL_SIZE`
    - `STORE_DB_POOL_MODE` (`session` or `transaction`)
+   - `POOL_SIZE` must be at least 3. Subscription workers default to `min(4, POOL_SIZE - 2)` per node, reserving at least two primary Repo connections.
+   - Optional `STORE_SUBSCRIPTIONS_QUEUE_LIMIT` must be a positive integer no greater than `POOL_SIZE - 2`.
+   - New renewal POSTs require declared session mode and a direct PostgreSQL or session-pooled endpoint. Transaction mode keeps `prepare: :unnamed` and rejects fresh renewal POSTs.
 2. **Phoenix**
    - `SECRET_KEY_BASE`
    - `PHX_SERVER`

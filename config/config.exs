@@ -203,7 +203,7 @@ config :store, Oban,
     comms: 10,
     fulfillment: 10,
     digital: 10,
-    subscriptions: 10,
+    subscriptions: 4,
     ops: 5
   ]
 

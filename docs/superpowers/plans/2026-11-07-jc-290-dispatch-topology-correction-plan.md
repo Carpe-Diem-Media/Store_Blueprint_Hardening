@@ -10,6 +10,8 @@
 
 ## Scope and authority
 
+The owner subsequently chose strict provider-side fencing and setup-start supersession. Those follow-up corrections are outside this independent topology checkpoint. References to pending decisions below describe the scope when this checkpoint was designed.
+
 The correction starts at `d1d60edfaa7f9ff24dec340cbee9e3f8fac234eb` on `jc-290-payment-method-races`, PR #216. The PR remains a draft with a merge hold. Append commits only. Do not merge, rewrite history, create a worktree, update descendants, or change provider capabilities.
 
 The topology defect is independent of two pending owner decisions. The frozen checkpoint-C authority requirement and the ordering of overlapping payment-method setup operations remain unresolved. This correction does not close the HTTP/session-loss defect, the setup replay gap, or the concurrency risk. The existing single-dispatch measurements do not certify saturation safety.
