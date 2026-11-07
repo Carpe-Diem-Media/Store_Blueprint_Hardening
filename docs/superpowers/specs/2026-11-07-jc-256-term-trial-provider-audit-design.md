@@ -2,7 +2,7 @@
 
 JC-256 requests a structured audit. It does not authorize production fixes, new trial rules, provider-managed enablement or live provider calls. Linear is the execution tracker. JC-219 and JC-220 are Done and their concrete prerequisites are accepted on canonical main `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`.
 
-The human requested stacked review. This branch starts at JC-248 head `87348afd9f565a31fb5fb0d279c611e8275c3a7b` and its PR will target `jc-248-entitlement-reconciliation`. Each ticket remains a separate draft PR for human review and merge.
+The human requested stacked review. This branch starts at JC-248 head `e1f23d179560cffb073b750b08d1a684a2bb87c5` and its PR will target `jc-248-entitlement-reconciliation`. Each ticket remains a separate draft PR for human review and merge.
 
 ## Audit boundaries
 

@@ -12,7 +12,7 @@
 
 ## Scope and evidence
 
-The live Linear issue JC-256 is a structured audit and is now In Progress. It says the audit outcome must be `PROVEN_GOOD` or a new `CANDIDATE`, and explicitly says findings do not authorize implementation. JC-219 and JC-220 are marked Done in the issue. The authorized stack base is `87348afd9f565a31fb5fb0d279c611e8275c3a7b`, JC-248 draft PR #217. Canonical main remains `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`, where the concrete JC-219 and JC-220 prerequisites are accepted. JC-256 is now In Progress for this structured audit. Historical readiness labels are not execution gates under AGENTS.md.
+The live Linear issue JC-256 is a structured audit and is now In Progress. It says the audit outcome must be `PROVEN_GOOD` or a new `CANDIDATE`, and explicitly says findings do not authorize implementation. JC-219 and JC-220 are marked Done in the issue. The authorized stack base is `e1f23d179560cffb073b750b08d1a684a2bb87c5`, JC-248 draft PR #217. Canonical main remains `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`, where the concrete JC-219 and JC-220 prerequisites are accepted. JC-256 is now In Progress for this structured audit. Historical readiness labels are not execution gates under AGENTS.md.
 
 This Task 1 tests only two observable facts:
 
