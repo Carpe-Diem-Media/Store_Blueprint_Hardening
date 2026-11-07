@@ -8,11 +8,15 @@ defmodule Store.Subscriptions.Sbh3003RetryExhaustionTest do
   alias Store.Entitlements.EntitlementGrant
   alias Store.Entitlements.Facade, as: EntitlementsFacade
   alias Store.Payments.PaymentIntent
+  alias Store.Payments.WebhookReceipt
   alias Store.Repo
   alias Store.Subscriptions.{Facade, RenewalAttempt, Subscription}
   alias Store.Subscriptions.Inputs.QueueSubscriptionPlanChangeInput
+  alias Store.Subscriptions.Inputs.StartSubscriptionPaymentMethodUpdateInput
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.StripeAPIStub
   alias Store.Workers.ProcessSubscriptionRenewalWorker
+  alias Store.Workers.ProcessWebhookReceiptWorker
 
   test "zero retries leaves the failed occurrence past due and dormant without suspension effects" do
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
@@ -202,48 +206,59 @@ defmodule Store.Subscriptions.Sbh3003RetryExhaustionTest do
     )
   end
 
-  test "payment method replacement cannot reopen an exhausted bound occurrence" do
+  test "payment method replacement cannot reopen an exhausted bound occurrence", context do
+    StripeAPIStub.setup_default(context)
+    StripeAPIStub.stub_unexpected!("exhausted occurrence preparation must not contact Stripe")
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
     customer = SubscriptionsFixtures.create_customer!("sbh_30_03_payment_repair")
+    provider_customer_ref = "cus_sbh_30_03_payment_repair"
+    provider_payment_method_ref = "pm_sbh_30_03_payment_repair"
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
     plan = SubscriptionsFixtures.create_subscription_plan!(%{max_retry_attempts: 0})
     SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
 
     %{subscription: subscription} =
       SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
-        next_renewal_at: DateTime.add(now, -1, :second)
+        next_renewal_at: DateTime.add(now, -1, :second),
+        provider: :stripe,
+        provider_customer_ref: provider_customer_ref
       })
 
     assert {:ok, %{failed_count: 1}} = Facade.run_due_renewals_for_system(now: now, limit: 20)
     exhausted = fetch_subscription!(subscription.id)
     suppressed_at = exhausted.retry_suppressed_at
-    provider_customer_ref = "cus_sbh_30_03_payment_repair"
-    provider_payment_method_ref = "pm_sbh_30_03_payment_repair"
+    attempt = fetch_current_attempt!(subscription.id)
+    assert attempt.status == :failed
+    assert attempt.failure_code == "PAYMENT_METHOD_REQUIRED"
+    assert attempt.charged_contract_snapshot["max_retry_attempts"] == 0
+    assert exhausted.provider_customer_ref == provider_customer_ref
+    assert is_nil(exhausted.provider_billing_ref)
+    assert is_nil(exhausted.stored_payment_method_id)
 
-    payment_intent =
-      PaymentIntent
-      |> Ash.Changeset.for_create(
-        :create_or_reuse,
-        %{
-          order_id: exhausted.source_order_id,
-          amount_received_minor: plan.amount_minor,
-          currency: plan.currency,
-          provider: :stripe,
-          provider_customer_ref: provider_customer_ref,
-          provider_payment_method_ref: provider_payment_method_ref,
-          payment_intent_key: "sbh-30-03:pm-update:#{subscription.id}",
-          purpose: :subscription_payment_method_update,
-          subscription_id: subscription.id
-        },
-        context: %{system?: true}
-      )
-      |> Ash.create!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-      |> Ash.Changeset.for_update(:submit, %{}, context: %{system?: true})
-      |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-      |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
-      |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+    StripeAPIStub.stub_setup_intent(fn conn, params ->
+      StripeAPIStub.json_response(conn, StripeAPIStub.setup_intent_response(params))
+    end)
 
-    assert :ok = Facade.handle_payment_method_update_succeeded_for_system(payment_intent.id)
+    {:ok, input} =
+      StartSubscriptionPaymentMethodUpdateInput.new(%{"subscription_id" => subscription.id})
+
+    assert {:ok, started} =
+             Facade.start_subscription_payment_method_update_for_user(
+               customer,
+               subscription.id,
+               input
+             )
+
+    setup_intent = fetch_payment_intent!(started.payment_intent_id)
+    assert is_integer(setup_intent.subscription_setup_generation)
+    assert setup_intent.subscription_setup_generation > 0
+    assert setup_intent.provider_payment_id
+
+    StripeAPIStub.stub_unexpected!("unexpected provider request after setup creation")
+    succeed_setup!(setup_intent, provider_payment_method_ref, "evt_sbh_30_03_payment_repair")
+
+    applied_setup_intent = fetch_payment_intent!(setup_intent.id)
+    assert %DateTime{} = applied_setup_intent.setup_binding_applied_at
 
     repaired = fetch_subscription!(subscription.id)
     assert repaired.status == :past_due
@@ -252,11 +267,67 @@ defmodule Store.Subscriptions.Sbh3003RetryExhaustionTest do
     assert repaired.dunning_attempt_count == 1
     assert repaired.provider_billing_ref == provider_payment_method_ref
     assert is_binary(repaired.stored_payment_method_id)
+    assert repaired.provider_customer_ref == provider_customer_ref
+    preserved_attempt = fetch_current_attempt!(subscription.id)
+    assert preserved_attempt.id == attempt.id
+    assert preserved_attempt.renewal_key == attempt.renewal_key
+    assert preserved_attempt.charged_contract_snapshot == attempt.charged_contract_snapshot
+    assert preserved_attempt.status == :failed
 
     refute_enqueued(
       worker: ProcessSubscriptionRenewalWorker,
       args: %{"subscription_id" => subscription.id}
     )
+  end
+
+  defp succeed_setup!(intent, method_ref, event_id) do
+    receipt =
+      WebhookReceipt
+      |> Ash.Changeset.for_create(:ingest, %{
+        provider: "stripe",
+        provider_event_id: event_id,
+        event_type: "setup_intent.succeeded",
+        verification_status: "verified",
+        processing_status: "new",
+        raw_body: setup_success_body(intent, method_ref, event_id),
+        headers: %{"content-type" => ["application/json"]}
+      })
+      |> Ash.create!(domain: Store.Payments, authorize?: false)
+
+    assert :ok =
+             ProcessWebhookReceiptWorker.perform(%Oban.Job{
+               args: %{"webhook_receipt_id" => receipt.id}
+             })
+  end
+
+  defp setup_success_body(intent, method_ref, event_id) do
+    Jason.encode!(%{
+      "id" => event_id,
+      "created" => 1_700_000_000,
+      "livemode" => false,
+      "type" => "setup_intent.succeeded",
+      "data" => %{
+        "object" => %{
+          "id" => intent.provider_payment_id,
+          "livemode" => false,
+          "status" => "succeeded",
+          "currency" => String.downcase(intent.currency),
+          "customer" => intent.provider_customer_ref,
+          "payment_method" => method_ref,
+          "metadata" => %{
+            "local_intent_id" => intent.id,
+            "subscription_id" => intent.subscription_id,
+            "currency" => intent.currency
+          }
+        }
+      }
+    })
+  end
+
+  defp fetch_payment_intent!(id) do
+    PaymentIntent
+    |> Ash.Query.filter(expr(id == ^id))
+    |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
   end
 
   defp read_due_subscriptions(now) do
