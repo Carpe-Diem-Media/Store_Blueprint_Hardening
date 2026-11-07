@@ -195,6 +195,12 @@ defmodule Store.Support.Governance.SurfaceRegistry do
         {:list_past_due_missing_failed_payment_boundary_for_system, 1},
         {:execute_suspension_access_effect_for_system, 1},
         {:execute_effective_access_effect_for_system, 1},
+        {:repair_applied_access_effect_for_system, 1},
+        {:reconcile_subscription_access_for_system, 1},
+        {:list_applied_access_verification_window_for_system, 1},
+        {:verify_subscription_access_window_for_system, 1},
+        {:list_subscription_access_inventory_window_for_system, 1},
+        {:subscription_access_inventory_upper_bound_for_system, 0},
         {:repair_suspension_access_effect_projection_for_system, 1},
         {:run_subscription_access_effect_recovery_for_system, 0},
         {:run_subscription_access_effect_recovery_for_system, 1},
@@ -219,7 +225,9 @@ defmodule Store.Support.Governance.SurfaceRegistry do
         {:revoke_subscription_entitlements_for_system, 2},
         {:revoke_subscription_source_grants_strict_for_system, 2},
         {:invalidate_subscription_source_users_after_commit_for_system, 2},
-        {:converge_subscription_source_grants_for_system, 1}
+        {:converge_subscription_source_grants_for_system, 1},
+        {:reconcile_subscription_source_grants_for_system, 1},
+        {:list_active_subscription_source_grants_for_system, 1}
       ]
     }
   }
