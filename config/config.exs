@@ -11,6 +11,7 @@ config :ash, default_string_length_count: :codepoints
 
 config :store,
   ecto_repos: [Store.Repo, Store.DirectRepo],
+  database_pool_mode: "session",
   ash_domains: [
     Store.Accounts,
     Store.Admin,

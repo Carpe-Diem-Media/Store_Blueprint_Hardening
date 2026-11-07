@@ -7,6 +7,7 @@ defmodule Store.Subscriptions.PaymentMethodAuthorityGate do
   """
 
   alias Store.Repo
+  alias Store.Support.Errors.Error
 
   @namespace "store:subscription-payment-method-authority:v1"
   @mutation_query_timeout_ms 5_000
@@ -22,6 +23,9 @@ defmodule Store.Subscriptions.PaymentMethodAuthorityGate do
 
   @doc """
   Serializes a dispatch with cooperating binding and method writers.
+
+  Requires the declared database pool mode to be `"session"`. Other modes return
+  `RENEWAL_DISPATCH_UNAVAILABLE` before checkout or callback invocation.
 
   The resolver runs after the binding gate is held. The callback runs outside a
   Repo transaction and must confirm the proof immediately before adapter invocation.
@@ -39,6 +43,21 @@ defmodule Store.Subscriptions.PaymentMethodAuthorityGate do
         ) :: result | {:error, term()}
         when result: var
   def with_dispatch_session_gates(user_id, provider, resolve_identity, fun) do
+    case Application.get_env(:store, :database_pool_mode) do
+      "session" ->
+        do_with_dispatch_session_gates(user_id, provider, resolve_identity, fun)
+
+      _unsupported_mode ->
+        {:error,
+         Error.new(
+           "RENEWAL_DISPATCH_UNAVAILABLE",
+           "renewal dispatch requires a session-pinned database connection",
+           %{reason: :unsupported_database_pool_mode}
+         )}
+    end
+  end
+
+  defp do_with_dispatch_session_gates(user_id, provider, resolve_identity, fun) do
     dispatch_ref = make_ref()
 
     try do

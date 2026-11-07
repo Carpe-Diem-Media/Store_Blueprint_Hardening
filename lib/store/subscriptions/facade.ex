@@ -3387,6 +3387,9 @@ defmodule Store.Subscriptions.Facade do
         {:error, %Error{code: "INVALID_BILLING_TIMEZONE"} = error} ->
           {:error, error}
 
+        {:error, %Error{code: "RENEWAL_DISPATCH_UNAVAILABLE"} = error} ->
+          {:error, error}
+
         {:error, reason} ->
           mark_subscription_past_due(subscription, reason)
           |> stale_result_or({:error, reason})
@@ -3559,6 +3562,9 @@ defmodule Store.Subscriptions.Facade do
       {:error, %Error{code: "RENEWAL_AUTHORITY_WITHDRAWN"}} ->
         :ok
 
+      {:error, %Error{code: "RENEWAL_DISPATCH_UNAVAILABLE"} = reason} ->
+        {:error, reason}
+
       {:error, reason} ->
         {:renewal_failure, reason, nil}
     end
@@ -3610,6 +3616,12 @@ defmodule Store.Subscriptions.Facade do
          _collection_attempt
        ),
        do: :ok
+
+  defp classify_claimed_renewal_charge_result(
+         {:error, %Error{code: "RENEWAL_DISPATCH_UNAVAILABLE"} = reason},
+         _collection_attempt
+       ),
+       do: {:error, reason}
 
   defp classify_claimed_renewal_charge_result(
          {:error, {:authentication_settlement_failed, reason}},

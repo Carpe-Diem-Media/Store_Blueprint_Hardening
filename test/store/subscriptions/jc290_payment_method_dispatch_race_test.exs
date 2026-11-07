@@ -105,6 +105,93 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchRaceTest do
     end
   end
 
+  @tag :jc290_topology_correction
+  test "unsupported pool modes leave due renewal unclaimed and make no provider request" do
+    fixture = create_dispatch_fixture!("unsupported_pool_mode")
+    previous_mode = Application.fetch_env(:store, :database_pool_mode)
+    initial_subscription = current_subscription!(fixture)
+    parent = self()
+    ref = make_ref()
+    posts = :atomics.new(1, [])
+
+    StripeAPIStub.stub_payment_intent(fn conn, params ->
+      :atomics.add(posts, 1, 1)
+      send(parent, {ref, :provider_post, params})
+      StripeAPIStub.json_response(conn, StripeAPIStub.payment_intent_response(params))
+    end)
+
+    try do
+      for mode <- ["transaction", "unsupported", nil] do
+        Application.put_env(:store, :database_pool_mode, mode)
+
+        for _ <- 1..2 do
+          assert {:error,
+                  %Store.Support.Errors.Error{
+                    code: "RENEWAL_DISPATCH_UNAVAILABLE",
+                    meta: %{reason: :unsupported_database_pool_mode}
+                  }} =
+                   Facade.process_due_subscription_renewal_for_system(
+                     fixture.subscription.id,
+                     now: fixture.now
+                   )
+        end
+
+        assert :atomics.get(posts, 1) == 0
+        refute_receive {^ref, :provider_post, _params}, 0
+
+        assert current_subscription!(fixture)
+               |> Map.take([
+                 :status,
+                 :billing_status_reason,
+                 :past_due_since_at,
+                 :failed_payment_boundary_at,
+                 :dunning_attempt_count,
+                 :next_retry_at,
+                 :retry_suppressed_at,
+                 :provider_customer_ref,
+                 :provider_billing_ref,
+                 :stored_payment_method_id
+               ]) ==
+                 Map.take(initial_subscription, [
+                   :status,
+                   :billing_status_reason,
+                   :past_due_since_at,
+                   :failed_payment_boundary_at,
+                   :dunning_attempt_count,
+                   :next_retry_at,
+                   :retry_suppressed_at,
+                   :provider_customer_ref,
+                   :provider_billing_ref,
+                   :stored_payment_method_id
+                 ])
+
+        rows =
+          Repo.query!(
+            """
+            SELECT c.dispatch_state, c.financial_outcome
+            FROM renewal_attempts a
+            JOIN renewal_collection_attempts c ON c.renewal_attempt_id = a.id
+            WHERE a.subscription_id = $1::text::uuid
+            """,
+            [fixture.subscription.id]
+          ).rows
+
+        assert rows != []
+
+        assert Enum.all?(rows, fn [dispatch_state, financial_outcome] ->
+                 dispatch_state == "not_started" and financial_outcome == "unresolved"
+               end)
+      end
+    after
+      case previous_mode do
+        {:ok, value} -> Application.put_env(:store, :database_pool_mode, value)
+        :error -> Application.delete_env(:store, :database_pool_mode)
+      end
+
+      cleanup_dispatch_fixture!(fixture)
+    end
+  end
+
   test "replacement after a crash before the first POST prevents stale replay" do
     fixture = create_dispatch_fixture!("crash")
     ref = make_ref()

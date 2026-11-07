@@ -127,6 +127,63 @@ defmodule Store.Subscriptions.JC290PaymentMethodDispatchCleanupTest do
     assert_keys_available!(identity)
   end
 
+  @tag :jc290_topology_correction
+  test "rejects unsupported pool modes before resolver, callback, or repository query", %{
+    identity: identity
+  } do
+    parent = self()
+
+    for mode <- ["transaction", "unsupported", nil] do
+      previous = Application.fetch_env(:store, :database_pool_mode)
+      Application.put_env(:store, :database_pool_mode, mode)
+      ref = make_ref()
+      handler = {__MODULE__, ref}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:store, :repo, :query],
+          fn _, _, _, _ ->
+            if self() == parent, do: send(parent, {ref, :repo_query})
+          end,
+          nil
+        )
+
+      try do
+        assert {:error,
+                %Store.Support.Errors.Error{
+                  code: "RENEWAL_DISPATCH_UNAVAILABLE",
+                  meta: %{reason: :unsupported_database_pool_mode}
+                }} =
+                 Gate.with_dispatch_session_gates(
+                   identity.user_id,
+                   identity.provider,
+                   fn ->
+                     send(parent, {ref, :resolver_invoked})
+                     {:ok, identity}
+                   end,
+                   fn _, _ ->
+                     send(parent, {ref, :callback_invoked})
+                     :sent
+                   end
+                 )
+
+        refute_receive {^ref, :resolver_invoked}, 0
+        refute_receive {^ref, :callback_invoked}, 0
+        refute_receive {^ref, :repo_query}, 0
+      after
+        :telemetry.detach(handler)
+
+        case previous do
+          {:ok, value} -> Application.put_env(:store, :database_pool_mode, value)
+          :error -> Application.delete_env(:store, :database_pool_mode)
+        end
+      end
+    end
+
+    assert_keys_available!(identity)
+  end
+
   test "cleans both session gates after a callback exception", %{identity: identity} do
     parent = self()
 

@@ -96,6 +96,7 @@ Subscriptions:
 - SUBSCRIPTION_BILLING_MODE_UNSUPPORTED
 - SUBSCRIPTION_PURCHASE_DISABLED
 - RENEWAL_AUTHORITY_WITHDRAWN: cancellation withdrew an unresolved subscription renewal occurrence before its exact Commerce payment application.
+- RENEWAL_DISPATCH_UNAVAILABLE: renewal dispatch requires a session-pinned database connection.
 - VARIANT_PLAN_UNAVAILABLE
 - SHIPPING_PROVIDER_DOWN
 - SHIPPING_UNAVAILABLE

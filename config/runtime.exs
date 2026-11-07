@@ -244,6 +244,8 @@ if config_env() == :prod do
 
   config :store, Store.DirectRepo, direct_repo_opts
 
+  config :store, :database_pool_mode, db_pool_mode
+
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
   # want to use a different value for prod and you most likely don't want
