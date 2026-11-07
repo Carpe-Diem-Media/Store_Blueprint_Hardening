@@ -12,7 +12,7 @@
 
 Files: modify `lib/store/subscriptions/facade.ex`, `lib/store/entitlements/facade.ex`, `test/store/subscriptions/access_effect_effective_execution_test.exs`, and `test/store/subscriptions/access_effect_non_effective_execution_test.exs`. Do not modify the existing currentness fence or effect lifecycle actions. No migration is needed for this task.
 
-- [ ] Add these regression tests to their existing modules, using the existing private fixture and read helpers.
+- [x] Add these regression tests to their existing modules, using the existing private fixture and read helpers.
 
 Effective execution module:
 
@@ -89,13 +89,13 @@ test "JC248 repairs stale reactivation without reopening APPLIED non-effective a
 end
 ```
 
-- [ ] Run RED and preserve output. Use this environment for every Mix command, and serialize all commands:
+- [x] Run RED and preserve output. Use this environment for every Mix command, and serialize all commands:
 
 `MIX_ENV=test STORE_TEST_DB_SUFFIX=_t3_132f19be_hardening STORE_BENCH_POOL_SIZE=4 STORE_BENCH_WRITER_POOL_SIZE=4 ERL_FLAGS='+S 4:4' mise exec -- devcore-project run test -- mix test test/store/subscriptions/access_effect_effective_execution_test.exs test/store/subscriptions/access_effect_non_effective_execution_test.exs`
 
 Expected RED: the three new behavioral tests fail because the public repair function does not exist. Existing tests must retain their assertions.
 
-- [ ] Add this Entitlements facade method and shared helper extraction. Keep the existing public convergence behavior unchanged. `build_source_convergence_result/3` contains the current result struct construction; both old writes and the already-converged branch use it.
+- [x] Add this Entitlements facade method and shared helper extraction. Keep the existing public convergence behavior unchanged. `build_source_convergence_result/3` contains the current result struct construction; both old writes and the already-converged branch use it.
 
 ```elixir
 @doc """
@@ -155,7 +155,7 @@ defp build_source_convergence_result(input, state, target_grant_id) do
 end
 ```
 
-- [ ] Add the Subscriptions public facade method and private helpers below. Use the existing aliases, notification wrapper and provenance validators. The constant reason is operational metadata for a newly repaired grant, not a status-derived business decision. A later task adds source-level routing and worker discovery.
+- [x] Add the Subscriptions public facade method and private helpers below. Use the existing aliases, notification wrapper and provenance validators. The constant reason is operational metadata for a newly repaired grant, not a status-derived business decision. A later task adds source-level routing and worker discovery.
 
 ```elixir
 @doc """
@@ -232,7 +232,7 @@ defp finish_applied_access_effect_repair({:ok, {outcome, effect, user_ids}}) do
 end
 ```
 
-- [ ] Run the two focused modules to GREEN, strict Credo for affected production/tests, and format the four files with explicit MIX_ENV=test. Preserve logs in ignored `tmp/jc248/`.
-- [ ] Review the whole change for notification ordering, source identity, binary UUID lock ordering, no APPLIED writes, no changes to normal executor semantics and no fixture leaks. Commit only these four implementation/test files.
+- [x] Run the two focused modules to GREEN, strict Credo for affected production/tests, and format the four files with explicit MIX_ENV=test. Preserve logs in ignored `tmp/jc248/`.
+- [x] Review the whole change for notification ordering, source identity, binary UUID lock ordering, no APPLIED writes, no changes to normal executor semantics and no fixture leaks. Commit only these four implementation/test files.
 
 Task 1 does not complete JC-248. Bounded APPLIED verification, source-level routing, missing-authority inventory, Oban sweep wiring, full acceptance matrix and runtime/query evidence remain subsequent tasks on the same ticket branch.
