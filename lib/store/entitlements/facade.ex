@@ -10,6 +10,7 @@ defmodule Store.Entitlements.Facade do
   alias Store.Entitlements.Cache, as: EntitlementsCache
   alias Store.Entitlements.EntitlementGrant
   alias Store.Entitlements.Inputs.SubscriptionSourceConvergenceInput
+  alias Store.Entitlements.Queries.SubscriptionSourceVerificationQuery
   alias Store.Entitlements.Queries.UserEntitlementIndexQuery
   alias Store.Entitlements.SourceConvergence
   alias Store.Entitlements.Types.EntitlementSet
@@ -30,6 +31,33 @@ defmodule Store.Entitlements.Facade do
     :revoked_at,
     :revoked_reason
   ]
+
+  @doc "Reads up to two active Subscription-source grants for each requested source in one query."
+  @spec list_active_subscription_source_grants_for_system(SubscriptionSourceVerificationQuery.t()) ::
+          {:ok, %{optional(Ecto.UUID.t()) => [map()]}} | {:error, term()}
+  def list_active_subscription_source_grants_for_system(
+        %SubscriptionSourceVerificationQuery{} = query
+      ) do
+    with {:ok, canonical_query} <- SubscriptionSourceVerificationQuery.new(Map.from_struct(query)) do
+      EntitlementGrant
+      |> Ash.ActionInput.for_action(
+        :read_active_subscription_sources_for_system,
+        Map.from_struct(canonical_query),
+        domain: Entitlements,
+        context: %{system?: true}
+      )
+      |> Ash.run_action(domain: Entitlements, authorize?: true)
+      |> case do
+        {:ok, grants_by_source} -> {:ok, grants_by_source}
+        {:error, reason} -> {:error, Normalize.normalize(reason)}
+      end
+    end
+  end
+
+  def list_active_subscription_source_grants_for_system(_query) do
+    {:error,
+     Error.new("VALIDATION_ERROR", "typed subscription source verification query is required")}
+  end
 
   @spec list_entitlements_for_user(map(), UserEntitlementIndexQuery.t()) ::
           {:ok, [EntitlementGrant.t()]} | {:error, term()}

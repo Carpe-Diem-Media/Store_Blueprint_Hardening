@@ -113,6 +113,31 @@ defmodule Store.Subscriptions.AccessEffect do
       primary?(true)
     end
 
+    action :read_applied_verification_window_for_system, {:array, :map} do
+      public?(false)
+      transaction?(false)
+
+      argument :as_of, :utc_datetime_usec do
+        allow_nil?(false)
+      end
+
+      argument :after_inserted_at, :utc_datetime_usec do
+        allow_nil?(true)
+      end
+
+      argument :after_id, :uuid do
+        allow_nil?(true)
+      end
+
+      argument :limit, :integer do
+        allow_nil?(false)
+        default(100)
+        constraints(min: 1, max: 500)
+      end
+
+      run(Store.Subscriptions.Actions.ReadAppliedAccessVerificationWindow)
+    end
+
     read :read_for_subscription_source_version do
       argument :subscription_id, :uuid do
         allow_nil?(false)
@@ -395,10 +420,21 @@ defmodule Store.Subscriptions.AccessEffect do
           "status = 'applied' AND projection_user_ids IS NOT NULL AND projection_delivered_at IS NULL",
         name: "access_effects_projection_repair_index"
       )
+
+      index([:inserted_at, :id],
+        where: "status = 'applied'",
+        name: "access_effects_applied_verification_index",
+        concurrently: true
+      )
     end
   end
 
   policies do
+    policy action(:read_applied_verification_window_for_system) do
+      access_type(:runtime)
+      authorize_if(context_equals(:system?, true))
+    end
+
     policy action_type(:read) do
       access_type(:runtime)
       authorize_if(context_equals(:system?, true))

@@ -46,6 +46,7 @@ defmodule Store.Subscriptions.Facade do
 
   alias Store.Subscriptions.Queries.{
     AdminSubscriptionIndexQuery,
+    AppliedAccessVerificationQuery,
     UserSubscriptionIndexQuery
   }
 
@@ -116,6 +117,32 @@ defmodule Store.Subscriptions.Facade do
 
   def get_current_access_effect_for_system(_subscription_id) do
     {:error, Error.new("VALIDATION_ERROR", "typed Subscription is required")}
+  end
+
+  @doc "Reads a bounded APPLIED effect window and marks each row's current source version."
+  @spec list_applied_access_verification_window_for_system(AppliedAccessVerificationQuery.t()) ::
+          {:ok, [map()]} | {:error, Error.t() | term()}
+  def list_applied_access_verification_window_for_system(
+        %AppliedAccessVerificationQuery{} = query
+      ) do
+    with {:ok, canonical_query} <- AppliedAccessVerificationQuery.new(Map.from_struct(query)) do
+      AccessEffect
+      |> Ash.ActionInput.for_action(
+        :read_applied_verification_window_for_system,
+        Map.from_struct(canonical_query),
+        domain: Subscriptions,
+        context: %{system?: true}
+      )
+      |> Ash.run_action(domain: Subscriptions, authorize?: true)
+      |> case do
+        {:ok, rows} -> {:ok, rows}
+        {:error, reason} -> {:error, Normalize.normalize(reason)}
+      end
+    end
+  end
+
+  def list_applied_access_verification_window_for_system(_query) do
+    {:error, Error.new("VALIDATION_ERROR", "typed APPLIED verification query is required")}
   end
 
   @spec validate_complete_bound_renewal_attempt_for_system(RenewalAttempt.t()) ::

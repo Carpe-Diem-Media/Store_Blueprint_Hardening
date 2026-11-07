@@ -4,15 +4,20 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   import Ash.Expr
   require Ash.Query
 
+  alias Ecto.Adapters.SQL, as: EctoSQL
   alias Ecto.Adapters.SQL.Sandbox
   alias Store.Entitlements.Cache
   alias Store.Entitlements.EntitlementGrant
   alias Store.Entitlements.Facade, as: EntitlementsFacade
+  alias Store.Entitlements.Queries.SubscriptionSourceVerificationQuery
   alias Store.Repo
   alias Store.Subscriptions.{AccessEffect, Facade}
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
+  alias Store.Subscriptions.Queries.AppliedAccessVerificationQuery
   alias Store.SubscriptionsFixtures
   alias Store.Support.Errors.Error
+  alias Store.Support.Errors.Normalize
+  alias Store.Support.ID.BinaryUuidSort
   alias Store.Support.Telemetry.RepoStats
 
   @tag :jc360_task08
@@ -37,6 +42,258 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert grant.valid_to_at == fixture.effect.valid_until_at
     assert grant.revoked_at == nil
     assert grant.revoked_reason == nil
+  end
+
+  test "verification query constructors reject unbounded or malformed cursors" do
+    as_of = ~U[2020-01-01 00:00:00Z]
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             AppliedAccessVerificationQuery.new(%{as_of: as_of, limit: 0})
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             AppliedAccessVerificationQuery.new(%{as_of: as_of, limit: 501})
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             AppliedAccessVerificationQuery.new(%{as_of: as_of, after_inserted_at: as_of})
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             AppliedAccessVerificationQuery.new(%{as_of: as_of, after_id: Ecto.UUID.generate()})
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: as_of,
+               after_inserted_at: as_of,
+               after_id: "not-a-uuid"
+             })
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             SubscriptionSourceVerificationQuery.new(%{source_ids: ["not-a-uuid"]})
+
+    assert {:error, %Error{code: "VALIDATION_ERROR"}} =
+             SubscriptionSourceVerificationQuery.new(%{
+               source_ids: List.duplicate(Ecto.UUID.generate(), 501)
+             })
+  end
+
+  test "verification resource actions require system context" do
+    timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:error, reason} =
+             AccessEffect
+             |> Ash.ActionInput.for_action(
+               :read_applied_verification_window_for_system,
+               %{as_of: timestamp, limit: 1},
+               domain: Store.Subscriptions
+             )
+             |> Ash.run_action(authorize?: true)
+
+    assert %Error{code: "FORBIDDEN"} = Normalize.normalize(reason)
+
+    assert {:error, reason} =
+             EntitlementGrant
+             |> Ash.ActionInput.for_action(
+               :read_active_subscription_sources_for_system,
+               %{source_ids: []},
+               domain: Store.Entitlements
+             )
+             |> Ash.run_action(authorize?: true)
+
+    assert %Error{code: "FORBIDDEN"} = Normalize.normalize(reason)
+  end
+
+  test "bounded verification reads retain stale window rows and return both dispositions" do
+    stale = create_committed_effective_effect_fixture!("jc248_window_stale")
+
+    current =
+      create_committed_effective_effect_fixture!("jc248_window_current",
+        target: :empty,
+        disposition: :non_effective
+      )
+
+    Sandbox.unboxed_run(Repo, fn ->
+      for fixture <- [stale, current] do
+        assert {:ok, _} = Facade.mark_access_effect_pending_for_system(fixture.effect)
+        assert {:ok, _} = Facade.mark_access_effect_applied_for_system(fixture.effect)
+      end
+
+      create_newer_untransitioned_effect!(stale)
+
+      Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(stale.effect.id),
+        ~U[2020-01-01 00:00:00Z]
+      ])
+
+      Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(current.effect.id),
+        ~U[2020-01-01 00:00:01Z]
+      ])
+    end)
+
+    assert {:ok, query} =
+             AppliedAccessVerificationQuery.new(%{as_of: ~U[2020-01-01 00:00:02Z], limit: 1})
+
+    assert {:ok, [first]} = Facade.list_applied_access_verification_window_for_system(query)
+    assert first.effect.id == stale.effect.id
+    refute first.current?
+
+    assert {:ok, next_query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: query.as_of,
+               limit: 1,
+               after_inserted_at: first.effect.inserted_at,
+               after_id: first.effect.id
+             })
+
+    assert {:ok, [second]} = Facade.list_applied_access_verification_window_for_system(next_query)
+    assert second.effect.id == current.effect.id
+    assert second.current?
+    assert second.effect.disposition == :non_effective
+    assert second.source.user_id == current.subscription.user_id
+    assert %DateTime{} = second.effect.inserted_at
+  end
+
+  test "source grant verification reads are batched and retain empty source keys" do
+    first = create_committed_effective_effect_fixture!("jc248_source_grants")
+    empty = create_committed_effective_effect_fixture!("jc248_source_empty")
+
+    Sandbox.unboxed_run(Repo, fn -> insert_historical_grants!(first, 128) end)
+
+    assert {:ok, query} =
+             SubscriptionSourceVerificationQuery.new(%{
+               source_ids: [first.subscription.id, empty.subscription.id]
+             })
+
+    {result, stats} =
+      RepoStats.capture(fn ->
+        EntitlementsFacade.list_active_subscription_source_grants_for_system(query)
+      end)
+
+    assert {:ok, grants_by_source} = result
+
+    assert Map.keys(grants_by_source) |> MapSet.new() ==
+             MapSet.new([first.subscription.id, empty.subscription.id])
+
+    assert length(grants_by_source[first.subscription.id]) == 2
+    assert grants_by_source[empty.subscription.id] == []
+    assert stats.query_count == 1
+
+    assert Enum.all?(grants_by_source[first.subscription.id], fn grant ->
+             grant.source_id == first.subscription.id and grant.source_kind == :subscription and
+               grant.status == :active and is_struct(grant.valid_from_at, DateTime)
+           end)
+
+    assert {:ok, empty_query} = SubscriptionSourceVerificationQuery.new(%{source_ids: []})
+
+    {empty_result, empty_stats} =
+      RepoStats.capture(fn ->
+        EntitlementsFacade.list_active_subscription_source_grants_for_system(empty_query)
+      end)
+
+    assert {:ok, %{}} = empty_result
+    assert empty_stats.query_count == 0
+  end
+
+  test "APPLIED verification cursor uses UUID order for ties and excludes rows above the high-water mark" do
+    left = create_committed_effective_effect_fixture!("jc248_tie_left")
+    right = create_committed_effective_effect_fixture!("jc248_tie_right")
+    future = create_committed_effective_effect_fixture!("jc248_tie_future")
+    tied_at = ~U[2021-01-01 00:00:00Z]
+
+    Sandbox.unboxed_run(Repo, fn ->
+      for fixture <- [left, right, future] do
+        assert {:ok, _} = Facade.mark_access_effect_pending_for_system(fixture.effect)
+        assert {:ok, _} = Facade.mark_access_effect_applied_for_system(fixture.effect)
+      end
+
+      for fixture <- [left, right] do
+        Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+          Ecto.UUID.dump!(fixture.effect.id),
+          tied_at
+        ])
+      end
+
+      Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(future.effect.id),
+        DateTime.add(tied_at, 2, :second)
+      ])
+    end)
+
+    [first_id, second_id] = BinaryUuidSort.sort_uuids([left.effect.id, right.effect.id])
+
+    assert {:ok, first_query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: DateTime.add(tied_at, 1, :second),
+               limit: 1
+             })
+
+    assert {:ok, [first]} = Facade.list_applied_access_verification_window_for_system(first_query)
+    assert first.effect.id == first_id
+
+    assert {:ok, next_query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: first_query.as_of,
+               limit: 1,
+               after_inserted_at: tied_at,
+               after_id: first_id
+             })
+
+    assert {:ok, [second]} = Facade.list_applied_access_verification_window_for_system(next_query)
+    assert second.effect.id == second_id
+
+    assert {:ok, full_query} =
+             AppliedAccessVerificationQuery.new(%{as_of: first_query.as_of, limit: 500})
+
+    assert {:ok, bounded_rows} =
+             Facade.list_applied_access_verification_window_for_system(full_query)
+
+    assert Enum.map(bounded_rows, & &1.effect.id) == [first_id, second_id]
+    refute future.effect.id in Enum.map(bounded_rows, & &1.effect.id)
+  end
+
+  test "verification query plans expose bounded source access with historical rows" do
+    fixture = create_committed_effective_effect_fixture!("jc248_query_plan")
+
+    Sandbox.unboxed_run(Repo, fn ->
+      insert_historical_grants!(fixture, 128)
+
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+      assert {:ok, applied_query} =
+               AppliedAccessVerificationQuery.new(%{as_of: DateTime.utc_now(), limit: 2})
+
+      assert {:ok, source_query} =
+               SubscriptionSourceVerificationQuery.new(%{source_ids: [fixture.subscription.id]})
+
+      for {operation, query} <- [
+            {"applied_window", AppliedAccessVerificationQuery.to_ecto(applied_query)},
+            {"active_source_grants", SubscriptionSourceVerificationQuery.to_ecto(source_query)}
+          ] do
+        {sql, params} = EctoSQL.to_sql(:all, Repo, query)
+        %{rows: [[plan]]} = Repo.query!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " <> sql, params)
+
+        IO.puts(
+          "JC248_VERIFICATION_QUERY_PLAN " <>
+            Jason.encode!(%{
+              operation: operation,
+              historical_source_rows: 128,
+              sql: sql,
+              plan: plan,
+              limits: "small fixture, no production capacity claim"
+            })
+        )
+      end
+
+      {result, stats} =
+        RepoStats.capture(fn ->
+          EntitlementsFacade.list_active_subscription_source_grants_for_system(source_query)
+        end)
+
+      assert {:ok, grants_by_source} = result
+      assert [grant] = grants_by_source[fixture.subscription.id]
+      assert grant.status == :active
+      assert stats.query_count == 1
+    end)
   end
 
   test "APPLIED source repair restores missing grants and retries projection without changing the effect" do
