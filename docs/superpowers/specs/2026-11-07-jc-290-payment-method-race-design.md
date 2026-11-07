@@ -10,7 +10,7 @@ This stacked layer originally followed JC-255 at `6001f015ff3cc19d47ca123e6c0273
 
 ## Unsupported fresh dispatch
 
-The renewal facade returns registered infrastructure error `RENEWAL_DISPATCH_UNAVAILABLE`, with reason `provider_revocation_fencing_unsupported`, for a collection that has not reached the provider. All installed providers and database modes use this rule. There is no environment switch or test capability that enables a charge POST. Adding a provider later requires an implemented and reviewed provider-side fencing contract.
+The renewal facade returns registered infrastructure error `RENEWAL_DISPATCH_UNAVAILABLE`, with reason `provider_revocation_fencing_unsupported`, when an unreached collection reaches dispatch. No installed provider, database mode, environment switch or test capability can enable a charge POST. Existing contract, provider-configuration and missing-method checks can reject preparation earlier with their existing errors and dunning rules. Adding a provider later requires an implemented and reviewed provider-side fencing contract.
 
 Local preparation may bind one immutable RenewalAttempt, prepare its priced Order, and create one unresolved collection and PaymentIntent. It does not capture method references, attach a provider-contact claim or reserve new physical stock. Repeated ticks retain those identities and do not advance business dunning, the billing period or financial state. The facade uses collection start without automatic reservation assignment or fence resumption.
 
