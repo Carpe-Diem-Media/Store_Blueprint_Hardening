@@ -31,6 +31,7 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
   alias Store.SubscriptionsFixtures
   alias Store.Support.Errors.Error
   alias Store.TestFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
   alias Store.Workers.{ProcessSubscriptionRenewalWorker, ProcessWebhookReceiptWorker}
 
@@ -846,21 +847,34 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
 
     configure_shipping_profile!(source_order, variant)
 
-    assert {:ok, :processed} =
-             Store.Subscriptions.Facade.process_due_subscription_renewal_for_system(
-               subscription.id,
-               now: now
-             )
-
-    attempt = fetch_latest_attempt!(subscription.id)
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
+    payment_intent = reached.payment_intent
 
     reservation = fetch_reservation!(attempt.order_id, variant.id)
-    assert reservation.state == :consumed
+    assert reservation.state == :active
 
     inventory = Repo.get_by!(InventoryItem, variant_id: variant.id)
-    assert inventory.reserved_count == 0
-    assert inventory.stock_on_hand == 0
+    assert inventory.reserved_count == 1
+    assert inventory.stock_on_hand == 1
+
+    StripeAPIStub.stub_payment_observation(
+      payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "succeeded")
+    )
+
+    assert {:ok, observed} =
+             Store.Payments.Facade.observe_payment_intent_for_system(
+               %Store.Payments.Inputs.ObservePaymentIntentInput{
+                 payment_intent_id: payment_intent.id
+               }
+             )
+
+    assert {:ok, %{outcome: :authoritative_success}} =
+             Store.Payments.Facade.apply_observed_payment_outcome_for_system(observed)
+
+    assert fetch_reservation!(attempt.order_id, variant.id).state == :consumed
+    assert Repo.get_by!(InventoryItem, variant_id: variant.id).stock_on_hand == 0
 
     raw_body =
       Jason.encode!(%{
@@ -870,10 +884,14 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
         "data" => %{
           "object" => %{
             "id" => payment_intent.provider_payment_id,
-            "amount_received" => payment_intent.amount_received_minor,
-            "currency" => String.downcase(payment_intent.currency || "USD"),
+            "amount" => reached.order.grand_total_minor,
+            "amount_received" => reached.order.grand_total_minor,
+            "currency" => String.downcase(reached.order.currency_code),
             "livemode" => false,
-            "metadata" => %{"local_intent_id" => payment_intent.id},
+            "metadata" =>
+              ReachedRenewalFixtures.observation_body(reached, "succeeded")["metadata"],
+            "customer" => payment_intent.provider_customer_ref,
+            "payment_method" => payment_intent.provider_payment_method_ref,
             "status" => "succeeded"
           }
         }
@@ -929,7 +947,7 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
              |> Ash.count!(domain: Store.Orders, authorize?: false)
   end
 
-  test "retryable recurring payment failure webhook retains renewal inventory" do
+  test "zero-received failure webhook is rejected and retains renewal inventory until success" do
     customer = SubscriptionsFixtures.create_customer!("phase27_webhook_release")
 
     %{variant: base_variant} =
@@ -953,21 +971,9 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
 
     configure_shipping_profile!(source_order, variant)
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_payment_method"})
-      )
-    end)
-
-    assert {:ok, :processed} =
-             Store.Subscriptions.Facade.process_due_subscription_renewal_for_system(
-               subscription.id,
-               now: now
-             )
-
-    attempt = fetch_latest_attempt!(subscription.id)
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
+    payment_intent = reached.payment_intent
 
     raw_body =
       Jason.encode!(%{
@@ -977,11 +983,17 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
         "data" => %{
           "object" => %{
             "id" => payment_intent.provider_payment_id,
-            "amount_received" => payment_intent.amount_received_minor,
-            "currency" => String.downcase(payment_intent.currency || "USD"),
+            "amount" => reached.order.grand_total_minor,
+            "amount_received" => 0,
+            "currency" => String.downcase(reached.order.currency_code),
             "livemode" => false,
             "status" => "requires_payment_method",
-            "metadata" => %{"local_intent_id" => payment_intent.id}
+            "metadata" =>
+              ReachedRenewalFixtures.observation_body(reached, "requires_payment_method")[
+                "metadata"
+              ],
+            "customer" => payment_intent.provider_customer_ref,
+            "payment_method" => payment_intent.provider_payment_method_ref
           }
         }
       })
@@ -1002,7 +1014,13 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
       )
       |> Ash.create!(domain: Store.Payments, authorize?: false)
 
-    assert :ok =
+    # The existing receipt validator compares received amount with the full Order
+    # total even for a nonterminal failure. Keep the truthful zero-received event.
+    assert {:error,
+            %{
+              code: "PAYMENT_EVENT_UNVERIFIED",
+              message: "receipt amount mismatch for finalized order totals"
+            }} =
              perform_job(ProcessWebhookReceiptWorker, %{"webhook_receipt_id" => receipt.id})
 
     reservation = fetch_reservation!(attempt.order_id, variant.id)
@@ -1014,12 +1032,7 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
     assert inventory.stock_on_hand == 1
 
     success_receipt =
-      create_payment_receipt!(
-        "evt_worker_renewal_success_001",
-        "payment_intent.succeeded",
-        payment_intent,
-        "succeeded"
-      )
+      create_reached_payment_receipt!(reached, "evt_worker_renewal_success_001", "succeeded")
 
     assert :ok =
              perform_job(ProcessWebhookReceiptWorker, %{
@@ -1043,7 +1056,7 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
              |> Ash.count!(domain: Store.Orders, authorize?: false)
   end
 
-  test "retryable off-session failure retains payment and renewal reservation authority" do
+  test "nonterminal exact-ID recovery retains payment and renewal reservation authority" do
     customer = SubscriptionsFixtures.create_customer!("phase27_direct_retryable_failure")
 
     %{variant: base_variant} =
@@ -1065,21 +1078,9 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
 
     configure_shipping_profile!(source_order, variant)
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      response =
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_payment_method"})
-
-      StripeAPIStub.json_response(conn, response)
-    end)
-
-    assert {:ok, :processed} =
-             Store.Subscriptions.Facade.process_due_subscription_renewal_for_system(
-               subscription.id,
-               now: now
-             )
-
-    attempt = fetch_latest_attempt!(subscription.id)
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
+    payment_intent = reached.payment_intent
     reservation = fetch_reservation!(attempt.order_id, variant.id)
     inventory = Repo.get_by!(InventoryItem, variant_id: variant.id)
 
@@ -1089,14 +1090,33 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
     assert inventory.reserved_count == 1
     assert inventory.stock_on_hand == 1
 
+    StripeAPIStub.stub_payment_observation(
+      payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "requires_payment_method")
+    )
+
+    assert {:ok, observed} =
+             Store.Payments.Facade.observe_payment_intent_for_system(
+               %Store.Payments.Inputs.ObservePaymentIntentInput{
+                 payment_intent_id: payment_intent.id
+               }
+             )
+
+    assert {:ok, %{outcome: :unresolved}} =
+             Store.Payments.Facade.apply_observed_payment_outcome_for_system(observed)
+
     assert {:ok, [payment_attempt]} =
              PaymentAttempt
              |> Ash.Query.filter(expr(payment_intent_id == ^payment_intent.id))
              |> Ash.read(domain: Store.Payments, authorize?: false)
 
-    assert payment_attempt.observation_source == "direct_response"
-    assert payment_attempt.outcome == "failure_observation"
+    assert payment_attempt.observation_source == "verification"
+    assert payment_attempt.outcome == "unresolved"
     assert payment_attempt.raw_provider_status == "requires_payment_method"
+    assert fetch_payment_intent!(payment_intent.id).state == :submitted
+    assert fetch_reservation!(attempt.order_id, variant.id).state == :active
+    assert Repo.get_by!(InventoryItem, variant_id: variant.id).reserved_count == 1
+    assert Repo.get_by!(InventoryItem, variant_id: variant.id).stock_on_hand == 1
   end
 
   defp create_payment_receipt!(event_id, event_type, payment_intent, provider_status) do
@@ -1125,6 +1145,34 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
         provider: "stripe",
         provider_event_id: event_id,
         event_type: event_type,
+        verification_status: "verified",
+        processing_status: "new",
+        raw_body: raw_body,
+        headers: %{"content-type" => ["application/json"]}
+      }
+    )
+    |> Ash.create!(domain: Store.Payments, authorize?: false)
+  end
+
+  defp create_reached_payment_receipt!(reached, event_id, provider_status) do
+    body = ReachedRenewalFixtures.observation_body(reached, provider_status)
+
+    raw_body =
+      Jason.encode!(%{
+        "id" => event_id,
+        "created" => 1_700_000_000,
+        "livemode" => false,
+        "type" => "payment_intent.succeeded",
+        "data" => %{"object" => body}
+      })
+
+    WebhookReceipt
+    |> Ash.Changeset.for_create(
+      :ingest,
+      %{
+        provider: "stripe",
+        provider_event_id: event_id,
+        event_type: "payment_intent.succeeded",
         verification_status: "verified",
         processing_status: "new",
         raw_body: raw_body,
@@ -1206,20 +1254,6 @@ defmodule Store.Workers.ProcessWebhookReceiptWorkerTest do
              )
 
     subscription
-  end
-
-  defp fetch_latest_attempt!(subscription_id) do
-    assert {:ok, [attempt | _]} =
-             Store.Subscriptions.RenewalAttempt
-             |> Ash.Query.filter(expr(subscription_id == ^subscription_id))
-             |> Ash.Query.sort(inserted_at: :desc, id: :desc)
-             |> Ash.read(
-               domain: Store.Subscriptions,
-               authorize?: false,
-               context: %{system?: true}
-             )
-
-    attempt
   end
 
   defp fetch_reservation!(order_id, variant_id) do

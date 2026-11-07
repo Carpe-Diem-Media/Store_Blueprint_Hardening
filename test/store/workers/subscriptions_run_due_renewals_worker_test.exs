@@ -19,6 +19,7 @@ defmodule Store.Workers.SubscriptionsRunDueRenewalsWorkerTest do
   }
 
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
   alias Store.Workers.ProcessSubscriptionRenewalWorker
   alias Store.Workers.ProcessWebhookReceiptWorker
@@ -64,18 +65,26 @@ defmodule Store.Workers.SubscriptionsRunDueRenewalsWorkerTest do
     assert is_binary(scheduled_job.args["renewal_key"])
     assert DateTime.compare(scheduled_job.scheduled_at, scheduled_job.inserted_at) in [:eq, :gt]
 
-    assert :ok = perform_job(ProcessSubscriptionRenewalWorker, scheduled_job.args)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, DateTime.utc_now())
 
-    attempt = fetch_latest_attempt!(subscription.id)
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "processing")
+    )
+
+    assert {:error, %{code: "PAYMENT_OUTCOME_UNRESOLVED"}} =
+             perform_job(ProcessSubscriptionRenewalWorker, scheduled_job.args)
+
+    attempt = reached.attempt
     assert attempt.status == :processing
     assert is_binary(attempt.order_id)
     assert is_binary(attempt.payment_intent_id)
 
     renewal_order = fetch_order!(attempt.order_id)
-    assert renewal_order.state == :paid
+    assert renewal_order.state == :pending_payment
 
     renewal_payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
-    assert renewal_payment_intent.state == :succeeded
+    assert renewal_payment_intent.state == :submitted
     assert is_binary(renewal_payment_intent.provider_payment_id)
 
     refute_enqueued(
@@ -88,7 +97,7 @@ defmodule Store.Workers.SubscriptionsRunDueRenewalsWorkerTest do
              |> Ash.Query.filter(expr(order_id == ^renewal_order.id))
              |> Ash.read!(domain: Store.Digital, authorize?: false, context: %{system?: true})
 
-    receipt = create_success_webhook_receipt!(renewal_order, renewal_payment_intent)
+    receipt = create_success_webhook_receipt!(reached)
 
     assert :ok =
              perform_job(ProcessWebhookReceiptWorker, %{"webhook_receipt_id" => receipt.id})
@@ -102,6 +111,8 @@ defmodule Store.Workers.SubscriptionsRunDueRenewalsWorkerTest do
         context: %{system?: true}
       )
 
+    assert fetch_payment_intent!(renewal_payment_intent.id).state == :succeeded
+    assert collection.financial_outcome == :verified_success
     assert {:ok, handoff} = RenewalCollectionAttempts.success_handoff_for_system(collection.id)
 
     assert handoff == %{
@@ -213,25 +224,16 @@ defmodule Store.Workers.SubscriptionsRunDueRenewalsWorkerTest do
     |> List.first()
   end
 
-  defp create_success_webhook_receipt!(order, payment_intent) do
+  defp create_success_webhook_receipt!(reached) do
     alias Store.Payments.WebhookReceipt
 
     raw_body =
       Jason.encode!(%{
-        "id" => "evt_renewal_#{payment_intent.id}",
+        "id" => "evt_renewal_#{reached.payment_intent.id}",
+        "livemode" => false,
         "type" => "payment_intent.succeeded",
         "data" => %{
-          "object" => %{
-            "id" => payment_intent.provider_payment_id,
-            "amount_received" => payment_intent.amount_received_minor,
-            "currency" => String.downcase(payment_intent.currency || "USD"),
-            "customer" => "cus_renewal_worker_001",
-            "payment_method" => "pm_renewal_worker_001",
-            "metadata" => %{
-              "order_ref" => order.order_ref,
-              "local_intent_id" => payment_intent.id
-            }
-          }
+          "object" => ReachedRenewalFixtures.observation_body(reached, "succeeded")
         }
       })
 
@@ -240,7 +242,7 @@ defmodule Store.Workers.SubscriptionsRunDueRenewalsWorkerTest do
       :ingest,
       %{
         provider: "stripe",
-        provider_event_id: "evt_renewal_#{payment_intent.id}",
+        provider_event_id: "evt_renewal_#{reached.payment_intent.id}",
         event_type: "payment_intent.succeeded",
         verification_status: "verified",
         processing_status: "new",

@@ -5,20 +5,18 @@ defmodule Store.Subscriptions.Sbh4003StaleRescissionReEvaluationTest do
   require Ash.Query
 
   alias Ecto.Adapters.SQL.Sandbox
-  alias Store.Payments.PaymentIntent
-  alias Store.Payments.Types.ProviderObservation
   alias Store.Repo
 
   alias Store.Subscriptions.{
     ContractChange,
     Facade,
-    RenewalAttempt,
     RenewalCollectionAttempt,
     Subscription
   }
 
   alias Store.SubscriptionsFixtures
   alias Store.Support.Telemetry.RepoStats
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   setup context do
@@ -139,21 +137,12 @@ defmodule Store.Subscriptions.Sbh4003StaleRescissionReEvaluationTest do
     on_exit(fn -> cleanup_fixture!(fixture) end)
     enable_stripe!()
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-      )
-    end)
+    reached =
+      Sandbox.unboxed_run(Repo, fn ->
+        ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, now)
+      end)
 
-    assert {:ok, :processed} =
-             Sandbox.unboxed_run(Repo, fn ->
-               Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
-                 now: now
-               )
-             end)
-
-    [attempt] = Sandbox.unboxed_run(Repo, fn -> renewal_attempts(fixture.subscription.id) end)
+    attempt = reached.attempt
     assert DateTime.compare(attempt.period_end_at, now) == :gt
 
     scheduled =
@@ -213,13 +202,22 @@ defmodule Store.Subscriptions.Sbh4003StaleRescissionReEvaluationTest do
 
     {payment_intent, collection} =
       Sandbox.unboxed_run(Repo, fn ->
-        payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
+        payment_intent = reached.payment_intent
+
+        StripeAPIStub.stub_payment_observation(
+          payment_intent.provider_payment_id,
+          ReachedRenewalFixtures.observation_body(reached, "succeeded")
+        )
+
+        assert {:ok, observed} =
+                 Store.Payments.Facade.observe_payment_intent_for_system(
+                   %Store.Payments.Inputs.ObservePaymentIntentInput{
+                     payment_intent_id: payment_intent.id
+                   }
+                 )
 
         assert {:ok, %{outcome: :authoritative_success}} =
-                 Store.Payments.record_and_apply_payment_observation_for_system(
-                   payment_intent,
-                   authoritative_success_observation(payment_intent)
-                 )
+                 Store.Payments.Facade.apply_observed_payment_outcome_for_system(observed)
 
         {payment_intent, fetch_collection_for_attempt!(attempt.id)}
       end)
@@ -431,39 +429,10 @@ defmodule Store.Subscriptions.Sbh4003StaleRescissionReEvaluationTest do
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 
-  defp renewal_attempts(subscription_id) do
-    RenewalAttempt
-    |> Ash.Query.filter(expr(subscription_id == ^subscription_id))
-    |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-  end
-
   defp fetch_collection_for_attempt!(renewal_attempt_id) do
     RenewalCollectionAttempt
     |> Ash.Query.filter(expr(renewal_attempt_id == ^renewal_attempt_id))
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-  end
-
-  defp fetch_payment_intent!(id) do
-    PaymentIntent
-    |> Ash.Query.filter(expr(id == ^id))
-    |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-  end
-
-  defp authoritative_success_observation(%PaymentIntent{} = payment_intent) do
-    %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: payment_intent.provider_payment_id,
-      provider_reference_kind: :payment_intent,
-      provider_transaction_id: payment_intent.provider_payment_id,
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :authoritative_success,
-      raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    }
   end
 
   defp bump_subscription_aggregate!(subscription_id, attempt) do
