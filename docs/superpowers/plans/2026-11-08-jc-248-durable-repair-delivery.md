@@ -8,7 +8,7 @@ Use `subagent-driven-development` for R3. Root owns all Mix, DevCore, formatting
 - Add private action/change/query helpers only where needed to preserve resource ownership and indexed bounded reads. Do not add a public facade entrypoint or a new worker solely for delivery.
 - Modify the existing APPLIED repair transaction and the existing periodic recovery facade and worker.
 - Add focused tests beside the committed AccessEffect execution fixtures, plus migration tests as needed. Leave the shared paid-activation fixture unchanged.
-- Root generates the migration and resource snapshot, then adds a rollback fence before dropping a table with pending delivery obligations.
+- Root generates the migration and resource snapshot, then adds a rollback fence before dropping a table with pending delivery obligations. The rollback must lock the table before checking and dropping within the same DDL transaction, so a concurrent request cannot insert an obligation between the check and drop.
 
 ## Test first
 
