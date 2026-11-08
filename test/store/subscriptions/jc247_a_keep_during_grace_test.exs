@@ -10,6 +10,7 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
   alias Store.Subscriptions.RenewalAttempt
   alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   setup context do
@@ -20,12 +21,7 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
   test "first bound payment failure establishes keep-grace EFFECTIVE target at grace boundary" do
     fixture = create_due_fixture!("jc247_a_first_failure")
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
+    fixture = prepare_observation!(fixture, "canceled")
 
     assert {:error, %{code: "PAYMENT_FAILED"}} = fixture.run.()
 
@@ -48,12 +44,7 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
   test "past_due retry failure does not establish a second keep-grace producer effect" do
     fixture = create_due_fixture!("jc247_a_retry_no_second_effect")
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
+    fixture = prepare_observation!(fixture, "canceled")
 
     assert {:error, %{code: "PAYMENT_FAILED"}} = fixture.run.()
 
@@ -61,9 +52,7 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
     [first_effect] = access_effects!(subscription.id)
 
     assert {:error, %{code: "PAYMENT_FAILED"}} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id,
-               now: subscription.next_retry_at
-             )
+             prepare_retry_observation!(fixture, subscription.next_retry_at, "canceled")
 
     subscription = reload_subscription!(subscription.id)
     effects = access_effects!(subscription.id)
@@ -75,12 +64,7 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
   test "nil/nil funded composition produces EFFECTIVE keep-grace target without valid_from_at" do
     fixture = create_due_fixture!("jc247_a_nil_nil", entitlement_pair: {nil, nil})
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
+    fixture = prepare_observation!(fixture, "canceled")
 
     assert {:error, %{code: "PAYMENT_FAILED"}} = fixture.run.()
 
@@ -96,12 +80,7 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
   test "effect establishment failure rolls back commercial past_due transition" do
     fixture = create_due_fixture!("jc247_a_effect_rollback")
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
+    fixture = prepare_observation!(fixture, "canceled")
 
     before = reload_subscription!(fixture.subscription.id)
     fail_access_effect_insert!(fixture.subscription.id)
@@ -124,17 +103,7 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
   test "first authentication-required transition establishes keep-grace effect and preserves outer result" do
     fixture = create_due_fixture!("jc247_a_auth_required")
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{
-          "status" => "requires_action",
-          "next_action" => %{
-            "redirect_to_url" => %{"url" => "https://payments.example.test/authenticate/jc247"}
-          }
-        })
-      )
-    end)
+    fixture = prepare_observation!(fixture, "requires_action")
 
     assert {:ok, :processed} = fixture.run.()
 
@@ -149,36 +118,13 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
 
   test "authentication-required replay does not create a second keep-grace producer effect" do
     fixture = create_due_fixture!("jc247_a_auth_replay")
-    params_agent = start_supervised!({Agent, fn -> nil end})
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      Agent.update(params_agent, fn _ -> params end)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{
-          "status" => "requires_action",
-          "next_action" => %{
-            "redirect_to_url" => %{
-              "url" => "https://payments.example.test/authenticate/jc247-replay"
-            }
-          }
-        })
-      )
-    end)
+    fixture = prepare_observation!(fixture, "requires_action")
 
     assert {:ok, :processed} = fixture.run.()
     subscription = reload_subscription!(fixture.subscription.id)
     [first_effect] = access_effects!(subscription.id)
 
-    StripeAPIStub.stub_observation(fn conn ->
-      params = Agent.get(params_agent, & &1)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_action"})
-      )
-    end)
+    stub_observation!(fixture.reached, "requires_action")
 
     assert {:ok, :processed} =
              Facade.process_due_subscription_renewal_for_system(
@@ -194,14 +140,8 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
     armed = create_due_fixture!("jc247_a_fault_isolation_armed")
     other = create_due_fixture!("jc247_a_fault_isolation_other")
 
+    other = prepare_observation!(other, "canceled")
     fail_access_effect_insert!(armed.subscription.id)
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
 
     assert {:error, %{code: "PAYMENT_FAILED"}} = other.run.()
     assert length(access_effects!(other.subscription.id)) == 1
@@ -210,14 +150,8 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
 
   test "malformed keep-grace pair interval rolls back past_due without AccessEffect" do
     fixture = create_due_fixture!("jc247_a_malformed_pair")
+    fixture = prepare_observation!(fixture, "canceled")
     force_malformed_keep_grace_boundary!(fixture.subscription.id)
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
 
     before = reload_subscription!(fixture.subscription.id)
 
@@ -240,12 +174,7 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
   test "postcommit F1 convergence does not change committed payment-failure outer result" do
     fixture = create_due_fixture!("jc247_a_f1_error_outer")
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
+    fixture = prepare_observation!(fixture, "canceled")
 
     assert {:error, %{code: "PAYMENT_FAILED"}} = fixture.run.()
     subscription = reload_subscription!(fixture.subscription.id)
@@ -297,8 +226,37 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
 
     %{
       subscription: subscription,
+      now: now,
       run: fn -> Facade.process_due_subscription_renewal_for_system(subscription.id, now: now) end
     }
+  end
+
+  defp prepare_observation!(fixture, status) do
+    StripeAPIStub.stub_unexpected!("legacy preparation must not contact Stripe")
+    reached = ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, fixture.now)
+    stub_observation!(reached, status)
+    Map.put(fixture, :reached, reached)
+  end
+
+  defp prepare_retry_observation!(fixture, now, status) do
+    StripeAPIStub.stub_unexpected!("legacy retry preparation must not contact Stripe")
+    reached = ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, now)
+    first = fixture.reached
+
+    assert reached.attempt.id == first.attempt.id
+    assert reached.order.id == first.order.id
+    refute reached.collection.id == first.collection.id
+    refute reached.payment_intent.id == first.payment_intent.id
+
+    stub_observation!(reached, status)
+    Facade.process_due_subscription_renewal_for_system(fixture.subscription.id, now: now)
+  end
+
+  defp stub_observation!(reached, status) do
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, status)
+    )
   end
 
   defp unique_label(label), do: "#{label}_#{Ecto.UUID.generate()}"
@@ -372,7 +330,7 @@ defmodule Store.Subscriptions.Jc247AKeepDuringGraceTest do
     {trigger_name, function_name}
   end
 
-  defp install_subscription_boundary_trigger!(subscription_id) do
+  defp install_subscription_boundary_trigger!(_subscription_id) do
     suffix = System.unique_integer([:positive])
     trigger_name = "jc247_malformed_boundary_#{suffix}"
     function_name = "jc247_malformed_boundary_fn_#{suffix}"

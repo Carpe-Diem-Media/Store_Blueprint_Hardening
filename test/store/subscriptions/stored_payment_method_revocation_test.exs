@@ -6,10 +6,13 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
   require Ash.Query
 
   alias Store.Payments.PaymentIntent
+  alias Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority
   alias Store.Subscriptions.Facade, as: SubscriptionsFacade
+  alias Store.Subscriptions.Inputs.StartSubscriptionPaymentMethodUpdateInput
   alias Store.Subscriptions.{StoredPaymentMethod, Subscription}
   alias Store.SubscriptionsFixtures
   alias Store.TestFixtures
+  alias Store.TestSupport.StripeAPIStub
   alias Store.Workers.ProcessSubscriptionRenewalWorker
 
   @provider_refs %{
@@ -18,7 +21,8 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
     provider_payment_method_ref: "pm_sbh_80_01"
   }
 
-  setup do
+  setup context do
+    StripeAPIStub.setup_default(context)
     user = TestFixtures.register_user!(email: TestFixtures.unique_email("sbh_80_01"))
 
     {:ok, user: user}
@@ -177,6 +181,55 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
   end
 
   describe "upsert bypass protection" do
+    test "payment method authority callbacks fail closed outside a transaction", %{user: user} do
+      create_attrs =
+        %{
+          user_id: user.id,
+          status: :active,
+          fingerprint: "fp_sbh_80_01"
+        }
+        |> Map.merge(@provider_refs)
+
+      create_changeset =
+        StoredPaymentMethod
+        |> Ash.Changeset.for_create(:create_or_reuse, create_attrs, context: %{system?: true})
+        |> AcquireStoredPaymentMethodAuthority.change([], %{})
+
+      assert {%Ash.Changeset{valid?: false}, _instructions} =
+               Ash.Changeset.run_before_actions(create_changeset)
+
+      assert identity_count!() == 0
+
+      spm = create_spm!(user, %{status: :active})
+
+      for action <- [:mark_active, :mark_inactive, :mark_revoked] do
+        update_changeset =
+          spm
+          |> Ash.Changeset.for_update(action, %{}, context: %{system?: true})
+          |> AcquireStoredPaymentMethodAuthority.change([], %{})
+
+        assert {%Ash.Changeset{valid?: false}, _instructions} =
+                 Ash.Changeset.run_before_actions(update_changeset)
+
+        assert reload_spm!(spm.id).status == :active
+      end
+    end
+
+    for status <- [:active, :inactive, :revoked] do
+      test "create_or_reuse rejects a foreign owner for #{status}", %{user: user} do
+        original = create_spm!(user, %{status: unquote(status)})
+        foreign_user = TestFixtures.register_user!(email: TestFixtures.unique_email("sbh_80_02"))
+
+        assert {:error, %Ash.Error.Invalid{}} = upsert_spm(foreign_user, unquote(status))
+
+        reloaded = reload_spm!(original.id)
+        assert reloaded.user_id == user.id
+        assert reloaded.status == unquote(status)
+        assert reloaded.fingerprint == original.fingerprint
+        assert identity_count!() == 1
+      end
+    end
+
     test "create_or_reuse cannot resurrect REVOKED row to ACTIVE", %{user: user} do
       spm =
         create_spm!(user, %{status: :active})
@@ -592,30 +645,11 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
       assert {:ok, _revoked} = mark_revoked!(spm)
 
       payment_intent =
-        PaymentIntent
-        |> Ash.Changeset.for_create(
-          :create_or_reuse,
-          %{
-            order_id: past_due_subscription.source_order_id,
-            amount_received_minor: plan.amount_minor,
-            currency: plan.currency,
-            provider: :stripe,
-            provider_customer_ref: provider_customer_ref,
-            provider_payment_method_ref: provider_payment_method_ref,
-            payment_intent_key: "sbh-80-01:pm-update:#{past_due_subscription.id}",
-            purpose: :subscription_payment_method_update,
-            subscription_id: past_due_subscription.id
-          },
-          context: %{system?: true}
+        create_succeeded_setup_intent!(
+          customer,
+          past_due_subscription,
+          provider_payment_method_ref
         )
-        |> Ash.create!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-
-      payment_intent =
-        payment_intent
-        |> Ash.Changeset.for_update(:submit, %{}, context: %{system?: true})
-        |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-        |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
-        |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
 
       assert {:error, error} =
                SubscriptionsFacade.handle_payment_method_update_succeeded_for_system(
@@ -684,31 +718,7 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
 
       original_stored_payment_method_id = past_due_subscription.stored_payment_method_id
 
-      payment_intent =
-        PaymentIntent
-        |> Ash.Changeset.for_create(
-          :create_or_reuse,
-          %{
-            order_id: past_due_subscription.source_order_id,
-            amount_received_minor: plan.amount_minor,
-            currency: plan.currency,
-            provider: :stripe,
-            provider_customer_ref: provider_customer_ref,
-            provider_payment_method_ref: nil,
-            payment_intent_key: "sbh-80-01:pm-update-nil:#{past_due_subscription.id}",
-            purpose: :subscription_payment_method_update,
-            subscription_id: past_due_subscription.id
-          },
-          context: %{system?: true}
-        )
-        |> Ash.create!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-
-      payment_intent =
-        payment_intent
-        |> Ash.Changeset.for_update(:submit, %{}, context: %{system?: true})
-        |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-        |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
-        |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+      payment_intent = create_succeeded_setup_intent!(customer, past_due_subscription, nil)
 
       assert {:error, error} =
                SubscriptionsFacade.handle_payment_method_update_succeeded_for_system(
@@ -738,6 +748,37 @@ defmodule Store.Subscriptions.StoredPaymentMethodRevocationTest do
     Subscription
     |> Ash.Query.filter(expr(id == ^subscription_id))
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp create_succeeded_setup_intent!(customer, subscription, method_ref) do
+    assert {:ok, result} =
+             SubscriptionsFacade.start_subscription_payment_method_update_for_user(
+               customer,
+               subscription.id,
+               %StartSubscriptionPaymentMethodUpdateInput{subscription_id: subscription.id}
+             )
+
+    intent =
+      PaymentIntent
+      |> Ash.Query.filter(expr(id == ^result.payment_intent_id))
+      |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+
+    intent =
+      if is_binary(method_ref) do
+        intent
+        |> Ash.Changeset.for_update(
+          :set_provider_reference,
+          %{provider_payment_method_ref: method_ref},
+          context: %{system?: true}
+        )
+        |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+      else
+        intent
+      end
+
+    intent
+    |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
+    |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
   end
 
   defp wait_until(predicate, attempts \\ 200)

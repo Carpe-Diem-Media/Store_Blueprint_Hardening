@@ -7,9 +7,10 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Store.Entitlements.EntitlementGrant
   alias Store.Orders.Order
+  alias Store.Payments.Facade, as: PaymentsFacade
+  alias Store.Payments.Inputs.ObservePaymentIntentInput
   alias Store.Payments.Inputs.ValidateRenewalCollectionOutcomeInput
   alias Store.Payments.PaymentIntent
-  alias Store.Payments.Types.ProviderObservation
   alias Store.Subscriptions.Facade
   alias Store.Subscriptions.Inputs.QueueSubscriptionPlanChangeInput
   alias Store.Subscriptions.Inputs.QueueSubscriptionVariantChangeInput
@@ -25,6 +26,7 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
 
   alias Store.SubscriptionsFixtures
   alias Store.Support.Errors.Error
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   setup context do
@@ -514,11 +516,9 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
         next_renewal_at: DateTime.add(now, -10, :second)
       })
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    attempt = fetch_latest_attempt!(subscription.id)
-    renewal_order = fetch_order!(attempt.order_id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
+    renewal_order = reached.order
     period_end_before = fetch_subscription!(subscription.id).current_period_end_at
 
     SubscriptionsFixtures.create_plan_revision!(target_plan)
@@ -528,7 +528,7 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
 
     clear_legacy_projection!(subscription.id)
 
-    mark_collection_successful!(attempt)
+    mark_collection_successful!(reached)
 
     assert {:error, %Error{code: "VALIDATION_ERROR"}} =
              Facade.reconcile_paid_subscription_renewal_for_system(
@@ -582,10 +582,8 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
     target_revision = SubscriptionsFixtures.create_plan_revision!(target_plan)
     assert {:ok, queued} = queue_plan_change(customer, subscription, target_plan)
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    attempt = fetch_latest_attempt!(subscription.id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
     contract_change_id = Map.get(queued, :current_contract_change_id)
     assert attempt.plan_revision_id == target_revision.id
     assert attempt.contract_change_id == contract_change_id
@@ -594,7 +592,7 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
     assert bound_change.status == :bound_to_renewal
     assert bound_change.target_plan_revision_id == target_revision.id
 
-    mark_collection_successful!(attempt)
+    mark_collection_successful!(reached)
 
     Store.Repo.query!(
       "UPDATE subscription_plans SET entitlement_kind = 'membership_access', entitlement_scope_key = 'membership:decoy' WHERE id = $1",
@@ -659,12 +657,12 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
         next_renewal_at: DateTime.add(now, -10, :second)
       })
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
+    renewal_order = reached.order
+    payment_intent = reached.payment_intent
 
-    attempt = fetch_latest_attempt!(subscription.id)
-    renewal_order = fetch_order!(attempt.order_id)
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
+    mark_collection_successful!(reached)
 
     assert {:ok, %{applied?: false}} =
              Store.Payments.apply_payment_success_once(payment_intent.id)
@@ -773,11 +771,9 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
         next_renewal_at: DateTime.add(now, -10, :second)
       })
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    attempt = fetch_latest_attempt!(subscription.id)
-    renewal_order = fetch_order!(attempt.order_id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
+    renewal_order = reached.order
     before = fetch_subscription!(subscription.id)
 
     Store.Repo.query!(
@@ -785,7 +781,7 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
       [Ecto.UUID.dump!(subscription.id), Ecto.UUID.dump!(target_plan.id), 8_800, "EUR"]
     )
 
-    mark_collection_successful!(attempt)
+    mark_collection_successful!(reached)
 
     assert {:error, %Error{code: "VALIDATION_ERROR"}} =
              Facade.reconcile_paid_subscription_renewal_for_system(
@@ -993,29 +989,10 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 
-  defp fetch_latest_attempt!(subscription_id) do
-    RenewalAttempt
-    |> Ash.Query.filter(expr(subscription_id == ^subscription_id))
-    |> Ash.Query.sort(inserted_at: :desc)
-    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-  end
-
   defp fetch_attempt!(id) do
     RenewalAttempt
     |> Ash.Query.filter(expr(id == ^id))
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-  end
-
-  defp fetch_order!(id) do
-    Order
-    |> Ash.Query.filter(expr(id == ^id))
-    |> Ash.read_one!(domain: Store.Orders, authorize?: false, context: %{system?: true})
-  end
-
-  defp fetch_payment_intent!(id) do
-    PaymentIntent
-    |> Ash.Query.filter(expr(id == ^id))
-    |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
   end
 
   defp fetch_collection!(id) do
@@ -1037,51 +1014,25 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
     ]
   end
 
-  defp mark_collection_successful!(attempt) do
-    collection =
-      RenewalCollectionAttempt
-      |> Ash.Query.filter(expr(renewal_attempt_id == ^attempt.id))
-      |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  defp mark_collection_successful!(reached) do
+    payment_intent = reached.payment_intent
 
-    payment_intent = fetch_payment_intent!(collection.payment_intent_id)
+    StripeAPIStub.stub_payment_observation(
+      payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "succeeded")
+    )
 
-    {provider_reference, provider_reference_kind} =
-      cond do
-        is_binary(payment_intent.provider_payment_id) ->
-          {payment_intent.provider_payment_id, :payment_intent}
+    assert {:ok, observed} =
+             PaymentsFacade.observe_payment_intent_for_system(%ObservePaymentIntentInput{
+               payment_intent_id: payment_intent.id
+             })
 
-        is_binary(payment_intent.provider_session_id) ->
-          {payment_intent.provider_session_id, :checkout_session}
-
-        true ->
-          {payment_intent.provider_request_reference, :transaction_reference}
-      end
-
-    observation = %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: provider_reference,
-      provider_reference_kind: provider_reference_kind,
-      provider_transaction_id:
-        payment_intent.provider_payment_id || "pi_sbh_10_06_#{payment_intent.id}",
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :authoritative_success,
-      raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    }
-
-    assert {:ok, %{outcome: outcome, evidence: _evidence}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               observation
-             )
+    assert {:ok, %{outcome: outcome}} =
+             PaymentsFacade.apply_observed_payment_outcome_for_system(observed)
 
     assert outcome in [:authoritative_success, :already_applied_success]
 
-    updated_collection = fetch_collection!(collection.id)
+    updated_collection = fetch_collection!(reached.collection.id)
     assert updated_collection.financial_outcome == :verified_success
     assert is_binary(updated_collection.payment_attempt_id)
 
@@ -1089,7 +1040,7 @@ defmodule Store.Subscriptions.Sbh1006ContractChangeTest do
              Store.Payments.validate_collection_outcome_certification_for_system(
                %ValidateRenewalCollectionOutcomeInput{
                  payment_attempt_id: updated_collection.payment_attempt_id,
-                 payment_intent_id: collection.payment_intent_id,
+                 payment_intent_id: reached.collection.payment_intent_id,
                  financial_outcome: :verified_success
                }
              )

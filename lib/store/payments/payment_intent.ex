@@ -9,6 +9,8 @@ defmodule Store.Payments.PaymentIntent do
     authorizers: [Ash.Policy.Authorizer],
     domain: Store.Payments
 
+  alias Ash.Resource.Change.OptimisticLock
+
   attributes do
     uuid_v7_primary_key(:id)
 
@@ -44,6 +46,22 @@ defmodule Store.Payments.PaymentIntent do
     attribute :subscription_id, :uuid do
       allow_nil?(true)
       public?(true)
+    end
+
+    attribute :subscription_setup_generation, :integer do
+      allow_nil?(true)
+      constraints(min: 1)
+      public?(false)
+
+      description(
+        "Subscription payment method setup generation captured at local intent creation."
+      )
+    end
+
+    attribute :setup_binding_applied_at, :utc_datetime_usec do
+      allow_nil?(true)
+      public?(false)
+      description("Time when this setup intent first changed the subscription binding.")
     end
 
     attribute :provider_payment_id, :string do
@@ -162,6 +180,38 @@ defmodule Store.Payments.PaymentIntent do
       ])
     end
 
+    create :create_subscription_setup do
+      description(
+        "Persists the setup operation reserved by a Subscription generation transaction."
+      )
+
+      public?(false)
+
+      accept([
+        :amount_received_minor,
+        :currency,
+        :provider,
+        :subscription_id,
+        :provider_customer_ref,
+        :payment_intent_key,
+        :subscription_setup_generation
+      ])
+
+      validate(fn changeset, _context ->
+        generation = Ash.Changeset.get_attribute(changeset, :subscription_setup_generation)
+
+        if is_integer(generation) and generation > 0 and
+             is_binary(Ash.Changeset.get_attribute(changeset, :subscription_id)) do
+          :ok
+        else
+          {:error,
+           field: :subscription_setup_generation, message: "must be a positive generation"}
+        end
+      end)
+
+      change(set_attribute(:purpose, :subscription_payment_method_update))
+    end
+
     create :create_or_reuse do
       accept([
         :order_id,
@@ -200,6 +250,38 @@ defmodule Store.Payments.PaymentIntent do
         :provider_checkout_url,
         :provider_client_secret
       ])
+    end
+
+    update :mark_setup_binding_applied do
+      description(
+        "Records binding application in the same transaction as the Subscription update."
+      )
+
+      public?(false)
+      require_atomic?(false)
+      accept([])
+
+      change(
+        filter(
+          expr(
+            state == :succeeded and purpose == :subscription_payment_method_update and
+              not is_nil(subscription_setup_generation) and
+              is_nil(setup_binding_applied_at)
+          )
+        )
+      )
+
+      change(fn changeset, _context ->
+        Ash.Changeset.change_attribute(
+          changeset,
+          :setup_binding_applied_at,
+          DateTime.utc_now() |> DateTime.truncate(:microsecond)
+        )
+      end)
+
+      change(fn changeset, context ->
+        OptimisticLock.change(changeset, [attribute: :version], context)
+      end)
     end
 
     update :prepare_renewal_dispatch do
@@ -319,6 +401,11 @@ defmodule Store.Payments.PaymentIntent do
       authorize_if({Store.Admin.Checks.HasRole, roles: [:super_admin, :admin]})
     end
 
+    policy action(:create_subscription_setup) do
+      access_type(:runtime)
+      authorize_if(context_equals(:system?, true))
+    end
+
     policy action(:submit) do
       access_type(:runtime)
       authorize_if(context_equals(:system?, true))
@@ -363,6 +450,11 @@ defmodule Store.Payments.PaymentIntent do
       access_type(:runtime)
       authorize_if(context_equals(:system?, true))
       authorize_if({Store.Admin.Checks.HasRole, roles: [:super_admin, :admin]})
+    end
+
+    policy action(:mark_setup_binding_applied) do
+      access_type(:runtime)
+      authorize_if(context_equals(:system?, true))
     end
   end
 end

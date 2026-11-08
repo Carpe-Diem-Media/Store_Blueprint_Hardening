@@ -22,6 +22,7 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
 
   alias Store.SubscriptionsFixtures
   alias Store.Support.Telemetry.RepoStats
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   @system_context %{system?: true}
@@ -32,18 +33,8 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
   end
 
   test "attempt failure storage errors do not settle dunning" do
-    fixture = create_due_fixture!("jc235_attempt_storage_error")
+    fixture = create_reached_fixture!("jc235_attempt_storage_error", "canceled")
     before_subscription = fetch_subscription!(fixture.subscription.id)
-    provider_calls = :atomics.new(1, [])
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      :atomics.add_get(provider_calls, 1, 1)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
 
     {trigger_name, function_name} =
       install_attempt_failure_rejection_trigger!(fixture.subscription.id)
@@ -58,7 +49,6 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     attempt = fetch_attempt_for_subscription!(fixture.subscription.id)
     assert attempt.status == :processing
     assert fetch_subscription!(fixture.subscription.id) == before_subscription
-    assert :atomics.get(provider_calls, 1) == 1
     refute_receive {:jc235_dunning, _metadata}, 0
   end
 
@@ -84,16 +74,8 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     refute_receive {:jc235_dunning, _metadata}, 0
   end
 
-  test "retry attempt identity is checked before dispatch and again after provider work",
-       context do
-    fixture = create_due_fixture!("jc247_retry_identity_race")
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
+  test "retry attempt identity is checked before and after exact-ID observation", context do
+    fixture = create_reached_fixture!("jc247_retry_identity_race", "canceled")
 
     assert {:error, %{code: "PAYMENT_FAILED"}} = fixture.run.()
 
@@ -101,7 +83,15 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     attempt = fetch_attempt_for_subscription!(fixture.subscription.id)
     assert past_due.current_dunning_renewal_attempt_id == attempt.id
 
-    other_attempt = create_sibling_attempt!(attempt)
+    reached_retry =
+      ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, past_due.next_retry_at)
+
+    assert reached_retry.attempt.id == attempt.id
+    assert reached_retry.collection.collection_ordinal == 2
+    assert reached_retry.collection.id != fixture.collection.id
+    assert reached_retry.payment_intent.id != fixture.payment_intent.id
+    retry_attempt = reached_retry.attempt
+    other_attempt = create_sibling_attempt!(retry_attempt)
 
     assert {:error, %{code: "RENEWAL_AUTHORITY_WITHDRAWN"}} =
              RenewalCollectionAttempts.start_for_system(%StartInput{
@@ -147,22 +137,19 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     assert fetch_subscription!(fixture.subscription.id).current_dunning_renewal_attempt_id ==
              attempt.id
 
+    observation = ReachedRenewalFixtures.observation_body(reached_retry, "canceled")
     parent = self()
-    barrier = make_ref()
+    {:ok, barrier} = Agent.start_link(fn -> %{release?: false} end)
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      send(parent, {:jc247_retry_provider_started, self(), params})
+    StripeAPIStub.stub_observation(fn conn ->
+      assert conn.method == "GET"
 
-      receive do
-        {:jc247_release_retry_provider, ^barrier} -> :ok
-      after
-        10_000 -> raise "retry provider barrier timed out"
-      end
+      assert conn.request_path ==
+               "/v1/payment_intents/#{reached_retry.payment_intent.provider_payment_id}"
 
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
+      send(parent, {:jc247_exact_observation_read, barrier})
+      wait_for_observation_release!(barrier)
+      StripeAPIStub.json_response(conn, observation)
     end)
 
     retry_task =
@@ -172,40 +159,39 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
         )
       end)
 
-    assert_receive {:jc247_retry_provider_started, provider_pid, _params}, 10_000
     :ok = Sandbox.allow(Store.Repo, context.sandbox_owners[Store.Repo], retry_task.pid)
 
     :ok =
       Sandbox.allow(Store.DirectRepo, context.sandbox_owners[Store.DirectRepo], retry_task.pid)
+
+    on_exit(fn ->
+      release_observation_barrier(barrier)
+
+      if Process.alive?(retry_task.pid) do
+        Task.shutdown(retry_task, :brutal_kill)
+      end
+    end)
+
+    assert_receive {:jc247_exact_observation_read, ^barrier}, 10_000
 
     Repo.query!(
       "UPDATE subscriptions SET current_dunning_renewal_attempt_id = $2 WHERE id = $1",
       [Ecto.UUID.dump!(fixture.subscription.id), Ecto.UUID.dump!(other_attempt.id)]
     )
 
-    send(provider_pid, {:jc247_release_retry_provider, barrier})
+    Agent.update(barrier, &Map.put(&1, :release?, true))
     assert {:error, _reason} = Task.await(retry_task, 10_000)
 
     unchanged = fetch_subscription!(fixture.subscription.id)
     assert unchanged.status == :past_due
     assert unchanged.current_dunning_renewal_attempt_id == other_attempt.id
     assert unchanged.dunning_attempt_count == 1
-    assert fetch_attempt!(attempt.id).status == :processing
+    assert fetch_attempt!(retry_attempt.id).status == :processing
   end
 
   test "dunning write errors roll back the attempt failure" do
-    fixture = create_due_fixture!("jc235_dunning_storage_error")
+    fixture = create_reached_fixture!("jc235_dunning_storage_error", "canceled")
     before_subscription = fetch_subscription!(fixture.subscription.id)
-    provider_calls = :atomics.new(1, [])
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      :atomics.add_get(provider_calls, 1, 1)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
 
     {trigger_name, function_name} =
       install_status_rejection_trigger!("subscriptions", fixture.subscription.id, "past_due")
@@ -220,73 +206,44 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     attempt = fetch_attempt_for_subscription!(fixture.subscription.id)
     assert attempt.status == :processing
     assert fetch_subscription!(fixture.subscription.id) == before_subscription
-    assert :atomics.get(provider_calls, 1) == 1
     refute_receive {:jc235_dunning, _metadata}, 0
   end
 
   test "ordinary terminal failure query count is measured on collection-attempt identity" do
-    fixture = create_due_fixture!("jc235_failure_query_shape")
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
+    fixture = create_reached_fixture!("jc235_failure_query_shape", "canceled")
 
     {result, stats} = RepoStats.capture(fixture.run)
 
-    IO.puts("JC-235 current collection-identity failure query_count=#{stats.query_count}")
+    IO.puts("JC-235 exact-ID recovery query_count=#{stats.query_count}")
     assert {:error, %{code: "PAYMENT_FAILED"}} = result
     assert stats.query_count > 0
-    # JC247-A keep-grace establishment measured 120 queries on 2026-10-27 (was <=110 pre-JC247-A).
     assert stats.query_count <= 122
     assert fetch_subscription!(fixture.subscription.id).status == :past_due
     assert fetch_attempt_for_subscription!(fixture.subscription.id).status == :failed
   end
 
-  test "requires_action replay does not repeat attempt, dunning, provider, or outbox effects" do
-    fixture = create_due_fixture!("jc235_requires_action_replay")
-    provider_calls = :atomics.new(1, [])
-    params_agent = start_supervised!({Agent, fn -> nil end})
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      :atomics.add_get(provider_calls, 1, 1)
-      Agent.update(params_agent, fn _previous -> params end)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{
-          "status" => "requires_action",
-          "next_action" => %{
-            "redirect_to_url" => %{"url" => "https://payments.example.test/authenticate/jc235"}
-          }
-        })
-      )
-    end)
+  test "requires_action replay preserves attempt, dunning and the legacy outbox" do
+    fixture = create_reached_fixture!("jc235_requires_action_replay", "requires_action")
 
     assert {:ok, :processed} = fixture.run.()
 
     attempt_before = fetch_attempt_for_subscription!(fixture.subscription.id)
     subscription_before = fetch_subscription!(fixture.subscription.id)
     [collection_before] = list_collections!(attempt_before.id)
-    email_before = count_authentication_emails(attempt_before.order_id)
     assert attempt_before.status == :processing
     assert subscription_before.status == :past_due
     assert subscription_before.dunning_attempt_count == 1
     assert collection_before.financial_outcome == :requires_action
+
+    # This models the committed authentication outbox from legacy dispatch history.
+    assert {:ok, _outbox} =
+             Store.Comms.enqueue_payment_authentication_required_for_system(
+               attempt_before.order_id,
+               action_url: "https://payments.example.test/authenticate/jc235"
+             )
+
+    email_before = count_authentication_emails(attempt_before.order_id)
     assert email_before == 1
-    assert :atomics.get(provider_calls, 1) == 1
-
-    StripeAPIStub.stub_observation(fn conn ->
-      assert conn.method == "GET"
-      params = Agent.get(params_agent, & &1)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_action"})
-      )
-    end)
 
     assert {:ok, :processed} =
              Facade.process_due_subscription_renewal_for_system(
@@ -313,24 +270,11 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     assert replayed_collection.financial_outcome == :requires_action
     assert count_collections_for_attempt(attempt_before.id) == 1
     assert count_authentication_emails(attempt_before.order_id) == email_before
-    assert :atomics.get(provider_calls, 1) == 1
   end
 
   test "a failed requires_action settlement can replay the same collection after recovery" do
-    fixture = create_due_fixture!("jc235_requires_action_crash_recovery")
-    provider_calls = :atomics.new(1, [])
-    params_agent = start_supervised!({Agent, fn -> nil end})
+    fixture = create_reached_fixture!("jc235_requires_action_crash_recovery", "requires_action")
     before_subscription = fetch_subscription!(fixture.subscription.id)
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      :atomics.add_get(provider_calls, 1, 1)
-      Agent.update(params_agent, fn _previous -> params end)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_action"})
-      )
-    end)
 
     {trigger_name, function_name} =
       install_status_rejection_trigger!("subscriptions", fixture.subscription.id, "past_due")
@@ -350,19 +294,8 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
       |> then(&list_collections!(&1.id))
 
     assert collection_before.financial_outcome == :requires_action
-    assert :atomics.get(provider_calls, 1) == 1
 
     drop_trigger_and_function!("subscriptions", trigger_name, function_name)
-
-    StripeAPIStub.stub_observation(fn conn ->
-      assert conn.method == "GET"
-      params = Agent.get(params_agent, & &1)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "requires_action"})
-      )
-    end)
 
     assert {:ok, :processed} = fixture.run.()
 
@@ -377,34 +310,16 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     assert collection_after.financial_outcome == :requires_action
     assert count_collections_for_attempt(attempt_after.id) == 1
     assert count_authentication_emails(attempt_after.order_id) == 0
-    assert :atomics.get(provider_calls, 1) == 1
   end
 
   test "exact paid success wins after requires_action evidence commits before auth settlement",
        context do
-    fixture = create_due_fixture!("jc235_requires_action_paid_success_race")
+    fixture =
+      create_reached_fixture!("jc235_requires_action_paid_success_race", "requires_action")
+
     assert is_binary(fixture.subscription.stored_payment_method_id)
     parent = self()
-    provider_calls = :atomics.new(1, [])
     settlement_barrier = make_ref()
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      :atomics.add_get(provider_calls, 1, 1)
-      send(parent, {:jc235_auth_provider_returned, params})
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{
-          "status" => "requires_action",
-          "next_action" => %{
-            "redirect_to_url" => %{
-              "url" => "https://payments.example.test/authenticate/jc235-race"
-            }
-          }
-        })
-      )
-    end)
-
     dunning_handler_id = attach_dunning_counter(self())
     on_exit(fn -> :telemetry.detach(dunning_handler_id) end)
 
@@ -436,11 +351,9 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     end)
 
     send(renewal_task.pid, {:start_renewal, start_ref})
-    assert_receive {:jc235_auth_provider_returned, params}, 10_000
-
     attempt = fetch_attempt_for_subscription!(fixture.subscription.id)
-    collection_id = Map.fetch!(params, "metadata[collection_attempt_id]")
-    payment_intent_id = Map.fetch!(params, "metadata[local_intent_id]")
+    collection_id = fixture.collection.id
+    payment_intent_id = fixture.payment_intent.id
 
     assert_receive {:jc235_requires_action_evidence_committed, ^settlement_barrier}, 10_000
 
@@ -448,7 +361,7 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     assert collection.financial_outcome == :requires_action
     assert collection.payment_intent_id == payment_intent_id
 
-    mark_collection_successful!(collection, db_now!())
+    mark_collection_successful!(fixture, db_now!())
 
     {:ok, handoff} = RenewalCollectionAttempts.success_handoff_for_system(collection_id)
 
@@ -474,61 +387,62 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     assert final_collection.payment_intent_id == payment_intent_id
     assert count_collections_for_attempt(attempt.id) == 1
     assert count_authentication_emails(attempt.order_id) == 0
-    assert :atomics.get(provider_calls, 1) == 1
     refute_receive {:jc235_dunning, _metadata}, 0
   end
 
-  test "late provider failure after exact paid renewal application cannot reopen dunning",
+  test "a stale nonterminal failure observation cannot undo exact paid renewal application",
        context do
+    fixture = create_reached_fixture!("jc235_late_failure_after_paid", "requires_payment_method")
+
     fixture =
-      start_blocked_failure_charge!("jc235_late_failure_after_paid", context.sandbox_owners)
+      start_paused_observation!(fixture, context.sandbox_owners, "requires_payment_method")
 
-    handler_id = attach_dunning_counter(self())
-    on_exit(fn -> :telemetry.detach(handler_id) end)
+    mark_collection_successful!(fixture, db_now!())
 
-    payment_intent = fetch_payment_intent!(fixture.payment_intent_id)
-    collection = fetch_collection!(fixture.collection_id)
-
-    mark_collection_successful!(collection, db_now!())
-    {:ok, handoff} = RenewalCollectionAttempts.success_handoff_for_system(collection.id)
+    assert {:ok, handoff} =
+             RenewalCollectionAttempts.success_handoff_for_system(fixture.collection.id)
 
     assert {:ok, :reconciled} =
-             Facade.reconcile_paid_subscription_renewal_for_system(
-               fixture.attempt.order_id,
-               renewal_attempt_id: fixture.attempt.id,
+             Facade.reconcile_paid_subscription_renewal_for_system(fixture.order.id,
+               renewal_attempt_id: handoff.renewal_attempt_id,
                collection_attempt_id: handoff.collection_attempt_id,
                payment_intent_id: handoff.payment_intent_id
              )
 
-    paid = fetch_subscription!(fixture.subscription.id)
-    assert paid.status == :active
-    assert fetch_attempt!(fixture.attempt.id).status == :succeeded
-    assert fetch_collection!(collection.id).financial_outcome == :verified_success
+    paid_source = fetch_subscription!(fixture.subscription.id)
+    paid_attempt = fetch_attempt!(fixture.attempt.id)
+    paid_collection = fetch_collection!(fixture.collection.id)
 
-    Agent.update(fixture.barrier, &Map.put(&1, :release_provider?, true))
+    handler_id = attach_dunning_counter(self())
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    Agent.update(fixture.barrier, &Map.put(&1, :release?, true))
     assert {:ok, :processed} = Task.await(fixture.task, 10_000)
 
     final_attempt = fetch_attempt!(fixture.attempt.id)
     final_subscription = fetch_subscription!(fixture.subscription.id)
-    final_collection = fetch_collection!(collection.id)
+    final_collection = fetch_collection!(fixture.collection.id)
 
+    assert final_attempt == paid_attempt
     assert final_attempt.status == :succeeded
-    assert is_nil(final_attempt.failure_code)
-    assert final_attempt.payment_intent_id == payment_intent.id
+    assert final_subscription.status == paid_source.status
     assert final_subscription.status == :active
-    assert final_subscription.aggregate_version == paid.aggregate_version
+    assert final_subscription.aggregate_version == paid_source.aggregate_version
+    assert final_subscription.current_period_start_at == paid_source.current_period_start_at
+    assert final_subscription.current_period_end_at == paid_source.current_period_end_at
+    assert final_subscription.failed_payment_boundary_at == paid_source.failed_payment_boundary_at
+    assert final_subscription.dunning_attempt_count == paid_source.dunning_attempt_count
     assert final_subscription.dunning_attempt_count == 0
-    assert is_nil(final_subscription.failed_payment_boundary_at)
-    assert final_collection.id == fixture.collection_id
-    assert final_collection.payment_intent_id == payment_intent.id
+    assert final_collection == paid_collection
+    assert final_collection.payment_intent_id == fixture.payment_intent.id
     assert final_collection.financial_outcome == :verified_success
     assert count_collections_for_attempt(fixture.attempt.id) == 1
     refute_receive {:jc235_dunning, _metadata}, 0
   end
 
   test "late provider failure after immediate cancellation cannot reopen dunning", context do
-    fixture =
-      start_blocked_failure_charge!("jc235_late_failure_after_cancel", context.sandbox_owners)
+    fixture = create_reached_fixture!("jc235_late_failure_after_cancel", "canceled")
+    fixture = start_paused_observation!(fixture, context.sandbox_owners)
 
     handler_id = attach_dunning_counter(self())
     on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -543,8 +457,7 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     assert canceled.status == :canceled
     attempt_after_cancel = fetch_attempt!(fixture.attempt.id)
     [collection_after_cancel] = list_collections!(fixture.attempt.id)
-
-    Agent.update(fixture.barrier, &Map.put(&1, :release_provider?, true))
+    Agent.update(fixture.barrier, &Map.put(&1, :release?, true))
     assert {:ok, :processed} = Task.await(fixture.task, 10_000)
 
     final_attempt = fetch_attempt!(fixture.attempt.id)
@@ -595,6 +508,96 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     }
   end
 
+  defp create_reached_fixture!(label, status) do
+    fixture = create_due_fixture!(label)
+    reached = ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, fixture.now)
+
+    StripeAPIStub.stub_unexpected!("reached renewal recovery must not submit another charge")
+
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(
+        reached,
+        status,
+        if(status == "requires_action",
+          do: %{
+            "next_action" => %{
+              "redirect_to_url" => %{"url" => "https://payments.example.test/authenticate/jc235"}
+            }
+          },
+          else: %{}
+        )
+      )
+    )
+
+    Map.merge(fixture, reached)
+  end
+
+  defp start_paused_observation!(fixture, sandbox_owners, status \\ "canceled") do
+    parent = self()
+    {:ok, barrier} = Agent.start_link(fn -> %{release?: false, reads: 0} end)
+    observation = ReachedRenewalFixtures.observation_body(fixture, status)
+
+    StripeAPIStub.stub_observation(fn conn ->
+      assert conn.method == "GET"
+
+      assert conn.request_path ==
+               "/v1/payment_intents/#{fixture.payment_intent.provider_payment_id}"
+
+      read_number =
+        Agent.get_and_update(barrier, fn state ->
+          {state.reads + 1, %{state | reads: state.reads + 1}}
+        end)
+
+      if read_number == 1 do
+        send(parent, {:jc235_exact_observation_ready, barrier})
+        wait_for_observation_release!(barrier)
+      end
+
+      StripeAPIStub.json_response(conn, observation)
+    end)
+
+    task = Task.async(fixture.run)
+    :ok = Sandbox.allow(Store.Repo, sandbox_owners[Store.Repo], task.pid)
+    :ok = Sandbox.allow(Store.DirectRepo, sandbox_owners[Store.DirectRepo], task.pid)
+
+    on_exit(fn ->
+      release_observation_barrier(barrier)
+
+      if Process.alive?(task.pid) do
+        Task.shutdown(task, :brutal_kill)
+      end
+    end)
+
+    assert_receive {:jc235_exact_observation_ready, ^barrier}, 10_000
+
+    Map.merge(fixture, %{task: task, barrier: barrier})
+  end
+
+  defp wait_for_observation_release!(barrier) do
+    unless wait_until(fn -> Agent.get(barrier, & &1.release?) end, 2_000) do
+      raise "exact observation release barrier timed out"
+    end
+  end
+
+  defp release_observation_barrier(barrier) do
+    if Process.alive?(barrier), do: Agent.update(barrier, &Map.put(&1, :release?, true))
+  end
+
+  defp wait_until(predicate, attempts) do
+    cond do
+      predicate.() ->
+        true
+
+      attempts <= 0 ->
+        false
+
+      true ->
+        Process.sleep(5)
+        wait_until(predicate, attempts - 1)
+    end
+  end
+
   defp create_sibling_attempt!(%RenewalAttempt{} = attempt) do
     attrs =
       attempt
@@ -620,70 +623,20 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
     |> Ash.create!(domain: Store.Subscriptions, authorize?: false, context: @system_context)
   end
 
-  defp start_blocked_failure_charge!(label, sandbox_owners) do
-    fixture = create_due_fixture!(label)
-    parent = self()
-
-    {:ok, barrier} =
-      Agent.start_link(fn -> %{release_provider?: false, started?: false, params: nil} end)
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      Agent.update(barrier, fn state -> %{state | started?: true, params: params} end)
-      send(parent, {:jc235_provider_started, params})
-      wait_until(fn -> Agent.get(barrier, & &1.release_provider?) end)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-      )
-    end)
-
-    task = Task.async(fixture.run)
-    assert_receive {:jc235_provider_started, params}, 10_000
-    :ok = Sandbox.allow(Store.Repo, sandbox_owners[Store.Repo], task.pid)
-    :ok = Sandbox.allow(Store.DirectRepo, sandbox_owners[Store.DirectRepo], task.pid)
-
-    attempt = fetch_attempt_for_subscription!(fixture.subscription.id)
-    collection_id = Map.fetch!(params, "metadata[collection_attempt_id]")
-    payment_intent_id = Map.fetch!(params, "metadata[local_intent_id]")
-
-    on_exit(fn ->
-      if Process.alive?(task.pid) do
-        Agent.update(barrier, &Map.put(&1, :release_provider?, true))
-        Task.shutdown(task, :brutal_kill)
-      end
-    end)
-
-    Map.merge(fixture, %{
-      task: task,
-      barrier: barrier,
-      attempt: attempt,
-      collection_id: collection_id,
-      payment_intent_id: payment_intent_id
-    })
-  end
-
-  defp mark_collection_successful!(collection, observed_at) do
-    payment_intent = fetch_payment_intent!(collection.payment_intent_id)
-
-    {provider_reference, provider_reference_kind} =
-      if is_binary(payment_intent.provider_payment_id) do
-        {payment_intent.provider_payment_id, :payment_intent}
-      else
-        {payment_intent.provider_request_reference, :transaction_reference}
-      end
+  defp mark_collection_successful!(fixture, observed_at) do
+    payment_intent = fetch_payment_intent!(fixture.payment_intent.id)
 
     observation = %ProviderObservation{
       provider: payment_intent.provider,
-      provider_reference: provider_reference,
-      provider_reference_kind: provider_reference_kind,
-      provider_transaction_id: payment_intent.provider_payment_id || "pi_#{payment_intent.id}",
+      provider_reference: payment_intent.provider_payment_id,
+      provider_reference_kind: :payment_intent,
+      provider_transaction_id: payment_intent.provider_payment_id,
       local_payment_intent_id: payment_intent.id,
       observation_source: :verification,
       normalized_outcome: :authoritative_success,
       raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
+      amount_minor: fixture.order.grand_total_minor,
+      currency: fixture.order.currency_code,
       provider_environment: "test",
       observed_at: observed_at
     }
@@ -905,17 +858,4 @@ defmodule Store.Subscriptions.Sbh2005SuccessVsLateFailureDunningTest do
   end
 
   defp unique_label(label), do: "#{label}_#{System.unique_integer([:positive])}"
-
-  defp wait_until(predicate, attempts \\ 200) do
-    if predicate.() do
-      :ok
-    else
-      if attempts <= 0 do
-        flunk("timed out waiting for provider release")
-      else
-        Process.sleep(5)
-        wait_until(predicate, attempts - 1)
-      end
-    end
-  end
 end

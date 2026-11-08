@@ -76,6 +76,8 @@ defmodule Store.Subscriptions.StoredPaymentMethod do
     end
 
     create :create_or_reuse do
+      transaction?(true)
+
       accept([
         :user_id,
         :provider,
@@ -90,11 +92,14 @@ defmodule Store.Subscriptions.StoredPaymentMethod do
       upsert_fields([:status, :fingerprint])
       upsert_condition(expr(status != :revoked))
       return_skipped_upsert?(true)
+
+      change(Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority)
     end
 
     update :mark_active do
       require_atomic?(false)
       accept([])
+      change(Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority)
       change(filter(expr(status != :revoked)))
       change(set_attribute(:status, :active))
     end
@@ -102,6 +107,7 @@ defmodule Store.Subscriptions.StoredPaymentMethod do
     update :mark_inactive do
       require_atomic?(false)
       accept([])
+      change(Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority)
       change(filter(expr(status != :revoked)))
       change(set_attribute(:status, :inactive))
     end
@@ -109,6 +115,7 @@ defmodule Store.Subscriptions.StoredPaymentMethod do
     update :mark_revoked do
       require_atomic?(false)
       accept([])
+      change(Store.Subscriptions.Changes.AcquireStoredPaymentMethodAuthority)
       change(set_attribute(:status, :revoked))
     end
   end
