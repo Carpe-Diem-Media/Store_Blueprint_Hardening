@@ -15,6 +15,7 @@ This document pins stable, registry-backed error codes referenced across governa
 - STALE_RECORD: optimistic lock failure / concurrent write
 - WEBHOOK_DUPLICATE: duplicate receipt/event detected (often NOOP)
 - VALIDATION_ERROR: generic validation failure when no more specific code fits
+- INVALID_BILLING_TIMEZONE: runtime period calculation cannot resolve the commercial billing timezone
 - INTERNAL_ERROR: unexpected internal failure (non-leaky, used as a safe fallback)
 
 ## Ecommerce correctness codes (MUST)

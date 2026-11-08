@@ -10,6 +10,7 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
   alias Store.Subscriptions.{
     ContractChange,
     Facade,
+    PlanRevision,
     RenewalAttempt,
     RenewalCollectionAttempt,
     Scheduler,
@@ -111,7 +112,7 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     assert before_consumption.pending_renewal_currency == "EUR"
     assert before_consumption.change_effective_at == before_consumption.current_period_end_at
 
-    expected_period =
+    {:ok, expected_period} =
       Scheduler.next_period(before_consumption.current_period_end_at, target_revision)
 
     StripeAPIStub.stub_payment_intent(fn conn, params ->
@@ -475,9 +476,10 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     attempt = fetch_attempt_for_subscription!(subscription.id)
     assert attempt.plan_revision_id == current_revision.id
 
-    assert attempt.period_end_at ==
-             Scheduler.next_period(subscription.current_period_end_at, current_revision)
-             |> Map.fetch!(:current_period_end_at)
+    {:ok, expected_period} =
+      Scheduler.next_period(subscription.current_period_end_at, current_revision)
+
+    assert attempt.period_end_at == expected_period.current_period_end_at
 
     assert attempt.charged_contract_snapshot["interval_count"] == current_revision.interval_count
   end
@@ -489,7 +491,8 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     live_plan =
       SubscriptionsFixtures.create_subscription_plan!(%{
         interval_unit: :day,
-        grace_period_days: 0
+        grace_period_days: 0,
+        billing_timezone: "Africa/Johannesburg"
       })
 
     target_plan =
@@ -497,7 +500,8 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
         interval_unit: :month,
         grace_period_days: 14,
         amount_minor: 3_800,
-        currency: "EUR"
+        currency: "EUR",
+        billing_timezone: "Africa/Johannesburg"
       })
 
     SubscriptionsFixtures.attach_variant_plan!(variant.id, live_plan.id)
@@ -531,13 +535,19 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
     assert attempt.charged_contract_snapshot["grace_period_days"] == 14
+    captured_attempt_id = attempt.id
+    captured_renewal_key = attempt.renewal_key
+    captured_period = {attempt.period_start_at, attempt.period_end_at}
+    captured_revision_id = attempt.plan_revision_id
+    captured_snapshot = attempt.charged_contract_snapshot
 
     later_plan =
       SubscriptionsFixtures.create_subscription_plan!(%{
         interval_unit: :year,
         interval_count: 1,
         amount_minor: 9_900,
-        currency: "GBP"
+        currency: "GBP",
+        billing_timezone: "Europe/Berlin"
       })
 
     SubscriptionsFixtures.attach_variant_plan!(variant.id, later_plan.id)
@@ -547,6 +557,14 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
              queue_plan_change(customer, fetch_subscription!(subscription.id), later_plan)
 
     later_target_id = later_target.current_contract_change_id
+
+    target_plan
+    |> Ash.Changeset.for_update(
+      :update,
+      %{billing_timezone: "Etc/UTC"},
+      context: %{system?: true}
+    )
+    |> Ash.update!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
 
     attempt
     |> Ash.Changeset.for_update(
@@ -572,8 +590,19 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     )
     |> Ash.update!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+    previous_database = Application.fetch_env(:elixir, :time_zone_database)
+
+    try do
+      Application.put_env(:elixir, :time_zone_database, Calendar.UTCOnlyTimeZoneDatabase)
+
+      assert {:ok, :processed} =
+               Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+    after
+      case previous_database do
+        {:ok, database} -> Application.put_env(:elixir, :time_zone_database, database)
+        :error -> Application.delete_env(:elixir, :time_zone_database)
+      end
+    end
 
     assert :atomics.get(request_count, 1) == 2
 
@@ -582,6 +611,12 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
 
     assert retried_subscription.status == :past_due
     assert retried_attempt.status == :processing
+    assert retried_attempt.id == captured_attempt_id
+    assert retried_attempt.renewal_key == captured_renewal_key
+    assert {retried_attempt.period_start_at, retried_attempt.period_end_at} == captured_period
+    assert retried_attempt.plan_revision_id == captured_revision_id
+    assert retried_attempt.charged_contract_snapshot == captured_snapshot
+    assert retried_attempt.charged_contract_snapshot["billing_timezone"] == "Africa/Johannesburg"
     assert retried_attempt.plan_revision_id == target_revision.id
     assert retried_attempt.contract_change_id == attempt.contract_change_id
     assert retried_attempt.variant_id == attempt.variant_id
@@ -592,7 +627,103 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     assert retried_attempt.charged_contract_snapshot["interval_unit"] == "month"
     assert retried_attempt.charged_contract_snapshot["grace_period_days"] == 14
     assert later_revision.id != retried_attempt.plan_revision_id
+    assert length(list_attempts!(subscription.id)) == 1
     assert fetch_contract_change!(later_target_id).status == :queued
+  end
+
+  test "an invalid historical billing timezone fails before renewal binding" do
+    %{subscription: subscription, revision: revision, now: now} =
+      create_due_live_fixture!("sbh_10_03_invalid_timezone")
+
+    before = fetch_subscription!(subscription.id)
+    attempts_before = list_attempts!(subscription.id)
+    orders_before = Store.Repo.aggregate(Order, :count, :id)
+    intents_before = Store.Repo.aggregate(PaymentIntent, :count, :id)
+
+    Store.Repo.query!(
+      "UPDATE plan_revisions SET billing_timezone = $1 WHERE id = $2",
+      ["Not/A_Real_Zone", Ecto.UUID.dump!(revision.id)]
+    )
+
+    StripeAPIStub.stub_unexpected!("invalid timezone must fail before provider submission")
+
+    assert {:error, %{code: "INVALID_BILLING_TIMEZONE"}} =
+             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+
+    assert list_attempts!(subscription.id) == attempts_before
+    assert Store.Repo.aggregate(Order, :count, :id) == orders_before
+    assert Store.Repo.aggregate(PaymentIntent, :count, :id) == intents_before
+    assert fetch_subscription!(subscription.id) == before
+
+    assert PlanRevision
+           |> Ash.Query.filter(expr(id == ^revision.id))
+           |> Ash.read_one!(
+             domain: Store.Subscriptions,
+             authorize?: false,
+             context: %{system?: true}
+           )
+           |> Map.fetch!(:billing_timezone) == "Not/A_Real_Zone"
+  end
+
+  test "a configured but unavailable historical timezone fails closed" do
+    %{subscription: subscription, revision: revision, now: now} =
+      create_due_live_fixture!("sbh_10_03_unavailable_timezone")
+
+    Store.Repo.query!(
+      "UPDATE plan_revisions SET billing_timezone = $1 WHERE id = $2",
+      ["Africa/Johannesburg", Ecto.UUID.dump!(revision.id)]
+    )
+
+    previous_database = Application.fetch_env(:elixir, :time_zone_database)
+    StripeAPIStub.stub_unexpected!("unavailable timezone must fail before provider submission")
+
+    try do
+      Application.put_env(:elixir, :time_zone_database, Calendar.UTCOnlyTimeZoneDatabase)
+
+      assert {:error, %{code: "INVALID_BILLING_TIMEZONE"}} =
+               Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+    after
+      case previous_database do
+        {:ok, database} -> Application.put_env(:elixir, :time_zone_database, database)
+        :error -> Application.delete_env(:elixir, :time_zone_database)
+      end
+    end
+
+    assert list_attempts!(subscription.id) == []
+  end
+
+  test "a queued target with an invalid billing timezone fails before binding or dunning mutation" do
+    %{subscription: subscription, variant: variant, customer: customer, now: now} =
+      create_due_live_fixture!("sbh_10_03_invalid_target_timezone", %{
+        billing_timezone: "Etc/UTC"
+      })
+
+    target_plan = SubscriptionsFixtures.create_subscription_plan!(%{interval_unit: :month})
+    SubscriptionsFixtures.attach_variant_plan!(variant.id, target_plan.id)
+    target_revision = SubscriptionsFixtures.create_plan_revision!(target_plan)
+    assert {:ok, queued} = queue_plan_change(customer, subscription, target_plan)
+    target_id = queued.current_contract_change_id
+
+    Store.Repo.query!(
+      "UPDATE plan_revisions SET billing_timezone = $1 WHERE id = $2",
+      ["Not/A_Real_Zone", Ecto.UUID.dump!(target_revision.id)]
+    )
+
+    before_subscription = fetch_subscription!(subscription.id)
+    before_target = fetch_contract_change!(target_id)
+    attempts_before = list_attempts!(subscription.id)
+    orders_before = Store.Repo.aggregate(Order, :count, :id)
+    intents_before = Store.Repo.aggregate(PaymentIntent, :count, :id)
+    StripeAPIStub.stub_unexpected!("invalid target timezone must fail before provider submission")
+
+    assert {:error, %{code: "INVALID_BILLING_TIMEZONE"}} =
+             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+
+    assert list_attempts!(subscription.id) == attempts_before
+    assert Store.Repo.aggregate(Order, :count, :id) == orders_before
+    assert Store.Repo.aggregate(PaymentIntent, :count, :id) == intents_before
+    assert fetch_subscription!(subscription.id) == before_subscription
+    assert fetch_contract_change!(target_id) == before_target
   end
 
   test "mutable SubscriptionPlan cadence and price do not rewrite B evidence" do
@@ -616,9 +747,8 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     assert attempt.amount_minor == subscription.renewal_amount_minor
     assert attempt.currency == subscription.renewal_currency
 
-    assert attempt.period_end_at ==
-             Scheduler.next_period(subscription.current_period_end_at, revision)
-             |> Map.fetch!(:current_period_end_at)
+    {:ok, expected_period} = Scheduler.next_period(subscription.current_period_end_at, revision)
+    assert attempt.period_end_at == expected_period.current_period_end_at
 
     assert attempt.charged_contract_snapshot["interval_unit"] ==
              Atom.to_string(revision.interval_unit)
@@ -635,7 +765,7 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     orders_before = Store.Repo.aggregate(Order, :count, :id)
     intents_before = Store.Repo.aggregate(PaymentIntent, :count, :id)
 
-    next_period = Scheduler.next_period(subscription.current_period_end_at, revision)
+    {:ok, next_period} = Scheduler.next_period(subscription.current_period_end_at, revision)
     renewal_key = Scheduler.renewal_key(subscription.id, next_period.current_period_end_at)
 
     legacy_attempt =
@@ -777,7 +907,7 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     %{subscription: subscription, revision: revision} =
       create_due_live_fixture!("sbh_10_03_partial_evidence")
 
-    period = Scheduler.next_period(subscription.current_period_end_at, revision)
+    {:ok, period} = Scheduler.next_period(subscription.current_period_end_at, revision)
 
     result =
       RenewalAttempt

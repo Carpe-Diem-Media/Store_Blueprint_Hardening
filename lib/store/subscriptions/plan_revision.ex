@@ -5,6 +5,8 @@ defmodule Store.Subscriptions.PlanRevision do
 
   import Ash.Expr
 
+  alias Store.Subscriptions.BillingTimezone
+
   use Ash.Resource,
     data_layer: AshPostgres.DataLayer,
     extensions: [AshStateMachine],
@@ -207,6 +209,7 @@ defmodule Store.Subscriptions.PlanRevision do
       change(set_attribute(:status, :draft))
       change(set_attribute(:version, 1))
       change(&normalize_fields/2)
+      validate(&validate_billing_timezone/2)
       validate(&validate_anchor/2)
       validate(&validate_term/2)
       validate(&validate_retry_schedule/2)
@@ -220,6 +223,7 @@ defmodule Store.Subscriptions.PlanRevision do
       change(filter(expr(status == :draft)))
       change(optimistic_lock(:version))
       change(&normalize_fields/2)
+      validate(&validate_billing_timezone/2)
       validate(&validate_anchor/2)
       validate(&validate_term/2)
       validate(&validate_retry_schedule/2)
@@ -229,6 +233,8 @@ defmodule Store.Subscriptions.PlanRevision do
     update :publish do
       require_atomic?(false)
       accept([])
+
+      validate(&validate_billing_timezone/2)
 
       change(
         {Store.Support.Governance.TransitionState,
@@ -356,6 +362,13 @@ defmodule Store.Subscriptions.PlanRevision do
     |> normalize_attr(:billing_timezone, & &1)
     |> normalize_attr(:entitlement_scope_key, & &1)
     |> normalize_retry_schedule()
+  end
+
+  defp validate_billing_timezone(changeset, _context) do
+    case BillingTimezone.validate(Ash.Changeset.get_attribute(changeset, :billing_timezone)) do
+      :ok -> :ok
+      {:error, error} -> {:error, field: :billing_timezone, message: error.message}
+    end
   end
 
   defp normalize_attr(changeset, attr, transform) do

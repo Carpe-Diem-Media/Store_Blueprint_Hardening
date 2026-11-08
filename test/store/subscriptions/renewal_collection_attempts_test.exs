@@ -2028,7 +2028,7 @@ defmodule Store.Subscriptions.RenewalCollectionAttemptsTest do
         started_at: DateTime.add(now, -40 * 86_400, :second)
       })
 
-    period = Scheduler.next_period(subscription.current_period_end_at, revision)
+    {:ok, period} = Scheduler.next_period(subscription.current_period_end_at, revision)
 
     attrs = %{
       subscription_id: subscription.id,

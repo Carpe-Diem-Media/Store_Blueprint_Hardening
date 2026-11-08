@@ -182,7 +182,7 @@ defmodule Store.SubscriptionsFixtures do
     started_at =
       Map.get(overrides, :started_at, DateTime.utc_now() |> DateTime.truncate(:microsecond))
 
-    period = Scheduler.initial_period(started_at, revision)
+    {:ok, period} = Scheduler.initial_period(started_at, revision)
     provider = Map.get(overrides, :provider, :stripe)
     stored_payment_method = maybe_create_stored_payment_method!(user_id, provider, overrides)
 

@@ -6,6 +6,7 @@ defmodule Store.Subscriptions.Facade do
   import Ash.Expr
   import Ecto.Query
   require Ash.Query
+  require Logger
 
   alias Store.Carts.CartItem
   alias Store.Catalog.{Product, Variant}
@@ -2699,28 +2700,119 @@ defmodule Store.Subscriptions.Facade do
              }
            ]}
           | {:error, Error.t() | term()}
+  @doc "Lists eligible renewal jobs from the first selected due-source page."
   def list_due_renewal_jobs_for_system(opts \\ []) when is_list(opts) do
-    now = Keyword.get(opts, :now, DateTime.utc_now() |> DateTime.truncate(:microsecond))
-    limit = Keyword.get(opts, :limit, @default_due_limit)
-
-    query =
-      Subscription
-      |> Ash.Query.for_read(:read_due_for_system, %{now: now, limit: limit})
-      |> Ash.Query.load([:subscription_plan])
-
-    case Ash.read(query, domain: Subscriptions, authorize?: false, context: %{system?: true}) do
-      {:ok, due_subscriptions} ->
-        due_subscriptions
-        |> build_due_renewal_jobs(now)
-        |> case do
-          {:ok, jobs} -> {:ok, Enum.reverse(jobs)}
-          {:error, reason} -> {:error, Normalize.normalize(reason)}
-        end
-
-      {:error, reason} ->
-        {:error, Normalize.normalize(reason)}
+    case list_due_renewal_job_page_for_system(opts) do
+      {:ok, %{jobs: jobs}} -> {:ok, jobs}
+      {:error, _reason} = error -> error
     end
   end
+
+  @doc """
+  Reads one bounded page of eligible renewal jobs and returns a cursor for the last scanned source.
+
+  Pass `after_renewal_at` with `after_id` to continue a non-null timestamp range. Pass only
+  `after_id` to continue through rows whose `next_renewal_at` is null. Supply the same `now` on
+  every page to keep the due cutoff fixed during the sweep. Rows that change during a sweep
+  may wait for a later tick.
+
+  A cursor is returned whenever the selected row count reaches the cast limit, even when some or
+  all rows were rejected because their historical billing contract is invalid.
+  """
+  @spec list_due_renewal_job_page_for_system(keyword()) ::
+          {:ok,
+           %{
+             jobs: [map()],
+             cursor: %{timestamp: DateTime.t() | nil, id: Ecto.UUID.t()} | nil,
+             now: DateTime.t()
+           }}
+          | {:error, Error.t() | term()}
+  def list_due_renewal_job_page_for_system(opts \\ [])
+
+  def list_due_renewal_job_page_for_system(opts) when is_list(opts) do
+    now = Keyword.get(opts, :now, DateTime.utc_now() |> DateTime.truncate(:microsecond))
+    limit = Keyword.get(opts, :limit, @default_due_limit)
+    after_renewal_at = Keyword.get(opts, :after_renewal_at)
+    after_id = Keyword.get(opts, :after_id)
+
+    with :ok <- validate_due_page_now(now),
+         {:ok, after_id} <- validate_due_page_cursor(after_renewal_at, after_id) do
+      args = %{
+        now: now,
+        limit: limit,
+        after_renewal_at: after_renewal_at,
+        after_id: after_id
+      }
+
+      query =
+        Subscription
+        |> Ash.Query.for_read(:read_due_for_system, args)
+        |> Ash.Query.load([:subscription_plan])
+
+      read_due_renewal_job_page(query, now)
+    end
+  end
+
+  def list_due_renewal_job_page_for_system(_opts) do
+    {:error, Error.new("VALIDATION_ERROR", "due renewal page options must be a keyword list")}
+  end
+
+  defp read_due_renewal_job_page(query, now) do
+    with {:ok, due_subscriptions} <-
+           Ash.read(query, domain: Subscriptions, authorize?: false, context: %{system?: true}),
+         {:ok, jobs} <- build_due_renewal_jobs(due_subscriptions, now) do
+      {:ok,
+       %{
+         jobs: Enum.reverse(jobs),
+         cursor: due_renewal_cursor(due_subscriptions, Ash.Query.get_argument(query, :limit)),
+         now: now
+       }}
+    else
+      {:error, reason} -> {:error, Normalize.normalize(reason)}
+    end
+  end
+
+  defp due_renewal_cursor(subscriptions, limit) when length(subscriptions) == limit do
+    last = List.last(subscriptions)
+    %{timestamp: last.next_renewal_at, id: last.id}
+  end
+
+  defp due_renewal_cursor(_subscriptions, _limit), do: nil
+
+  defp validate_due_page_now(%DateTime{} = now) do
+    DateTime.to_unix(now, :microsecond)
+    :ok
+  rescue
+    _ -> {:error, Error.new("VALIDATION_ERROR", "now must be a valid DateTime")}
+  end
+
+  defp validate_due_page_now(_now),
+    do: {:error, Error.new("VALIDATION_ERROR", "now must be a valid DateTime")}
+
+  defp validate_due_page_cursor(nil, nil), do: {:ok, nil}
+
+  defp validate_due_page_cursor(%DateTime{} = timestamp, id) when is_binary(id) do
+    with :ok <- validate_due_page_now(timestamp),
+         {:ok, cast_id} <- Ecto.UUID.cast(id) do
+      {:ok, cast_id}
+    else
+      _ ->
+        {:error,
+         Error.new("VALIDATION_ERROR", "after_renewal_at and after_id must form a valid cursor")}
+    end
+  end
+
+  defp validate_due_page_cursor(nil, id) when is_binary(id) do
+    case Ecto.UUID.cast(id) do
+      {:ok, cast_id} -> {:ok, cast_id}
+      :error -> {:error, Error.new("VALIDATION_ERROR", "after_id must be a UUID")}
+    end
+  end
+
+  defp validate_due_page_cursor(_timestamp, _id),
+    do:
+      {:error,
+       Error.new("VALIDATION_ERROR", "after_renewal_at and after_id must form a valid cursor")}
 
   defp build_due_renewal_jobs(due_subscriptions, now) do
     Enum.reduce_while(due_subscriptions, {:ok, []}, fn subscription, {:ok, jobs} ->
@@ -2733,6 +2825,13 @@ defmodule Store.Subscriptions.Facade do
            code: "VALIDATION_ERROR",
            message: @unresolved_contract_message
          }} ->
+          {:cont, {:ok, jobs}}
+
+        {:error, %Error{code: "INVALID_BILLING_TIMEZONE"}} ->
+          Logger.warning(
+            "Skipping due renewal with INVALID_BILLING_TIMEZONE subscription_id=#{subscription.id} plan_revision_id=#{subscription.current_plan_revision_id}"
+          )
+
           {:cont, {:ok, jobs}}
 
         {:error, reason} ->
@@ -2773,7 +2872,7 @@ defmodule Store.Subscriptions.Facade do
   defp process_due_subscription_at_due(subscription, renewal_key, now) do
     with {:ok, current_renewal_key, live_revision} <- due_renewal_identity(subscription, now),
          :ok <- ensure_matching_renewal_key(renewal_key, current_renewal_key) do
-      case run_single_due_renewal(subscription, now, live_revision) do
+      case run_single_due_renewal(subscription, now, live_revision, current_renewal_key) do
         :ok -> {:ok, :processed}
         {:error, reason} -> {:error, reason}
       end
@@ -3164,8 +3263,8 @@ defmodule Store.Subscriptions.Facade do
   defp count_due_renewal_results(due_subscriptions, now) do
     Enum.reduce(due_subscriptions, %{success: 0, failed: 0}, fn subscription, acc ->
       result =
-        with {:ok, _renewal_key, live_revision} <- due_renewal_identity(subscription, now) do
-          run_single_due_renewal(subscription, now, live_revision)
+        with {:ok, renewal_key, live_revision} <- due_renewal_identity(subscription, now) do
+          run_single_due_renewal(subscription, now, live_revision, renewal_key)
         end
 
       case result do
@@ -3196,9 +3295,25 @@ defmodule Store.Subscriptions.Facade do
     with :ok <- ensure_subscription_contract_resolved(subscription),
          {:ok, revision} <- fetch_plan_revision(subscription.current_plan_revision_id),
          :ok <- ensure_revision_belongs_to_plan(revision, subscription.subscription_plan_id),
-         {:ok, renewal_period} <- renewal_period(subscription, revision, now) do
-      {:ok, Scheduler.renewal_key(subscription.id, renewal_period.current_period_end_at),
-       revision}
+         {:ok, renewal_key} <- renewal_identity_key(subscription, revision, now) do
+      {:ok, renewal_key, revision}
+    end
+  end
+
+  defp renewal_identity_key(%Subscription{} = subscription, revision, now) do
+    case current_bound_renewal_attempt(subscription) do
+      {:ok, %RenewalAttempt{} = attempt} ->
+        with :ok <- ensure_complete_bound_renewal_attempt(attempt) do
+          {:ok, attempt.renewal_key}
+        end
+
+      {:ok, nil} ->
+        with {:ok, period} <- renewal_period(subscription, revision, now) do
+          {:ok, Scheduler.renewal_key(subscription.id, period.current_period_end_at)}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -3304,7 +3419,8 @@ defmodule Store.Subscriptions.Facade do
   defp run_single_due_renewal(
          %Subscription{} = subscription,
          now,
-         %PlanRevision{} = live_revision
+         %PlanRevision{} = live_revision,
+         renewal_key
        ) do
     started_at = System.monotonic_time()
 
@@ -3312,9 +3428,6 @@ defmodule Store.Subscriptions.Facade do
       with :ok <- ensure_subscription_contract_resolved(subscription),
            :ok <-
              ensure_revision_belongs_to_plan(live_revision, subscription.subscription_plan_id),
-           {:ok, renewal_identity_period} <- renewal_period(subscription, live_revision, now),
-           renewal_key <-
-             Scheduler.renewal_key(subscription.id, renewal_identity_period.current_period_end_at),
            {:ok, binding} <- bind_renewal_attempt(subscription, renewal_key, live_revision) do
         bound_subscription = binding.subscription
         bound_attempt = binding.attempt
@@ -3354,6 +3467,9 @@ defmodule Store.Subscriptions.Facade do
           {:error, error}
 
         {:error, %Error{code: "VALIDATION_ERROR"} = error} ->
+          {:error, error}
+
+        {:error, %Error{code: "INVALID_BILLING_TIMEZONE"} = error} ->
           {:error, error}
 
         {:error, reason} ->
@@ -3664,7 +3780,7 @@ defmodule Store.Subscriptions.Facade do
          :ok <- ensure_revision_belongs_to_plan(revision, plan.id),
          :ok <- ensure_revision_has_purchase_history(revision),
          {:ok, provider_selection} <- resolve_provider_and_billing_mode(order, plan),
-         period <-
+         {:ok, period} <-
            Scheduler.initial_period(
              DateTime.utc_now() |> DateTime.truncate(:microsecond),
              revision
@@ -4783,7 +4899,7 @@ defmodule Store.Subscriptions.Facade do
          %PlanRevision{} = revision,
          _now
        ) do
-    {:ok, Scheduler.next_period(period_start, revision)}
+    Scheduler.next_period(period_start, revision)
   end
 
   defp renewal_period(%Subscription{}, %PlanRevision{}, _now) do

@@ -268,6 +268,7 @@ config :sentry,
 
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
+config :elixir, :time_zone_database, Tz.TimeZoneDatabase
 
 # JSON:API media type support for accepts/content-negotiation.
 config :mime, :types, %{

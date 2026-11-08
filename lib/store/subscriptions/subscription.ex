@@ -358,17 +358,32 @@ defmodule Store.Subscriptions.Subscription do
         constraints(min: 1, max: 500)
       end
 
+      argument :after_renewal_at, :utc_datetime_usec do
+        allow_nil?(true)
+      end
+
+      argument :after_id, :uuid do
+        allow_nil?(true)
+      end
+
       filter(
         expr(
           ((status == :active and not is_nil(next_renewal_at) and next_renewal_at <= ^arg(:now)) or
              (status == :past_due and not is_nil(failed_payment_boundary_at) and
                 is_nil(retry_suppressed_at) and
                 (is_nil(next_retry_at) or next_retry_at <= ^arg(:now)))) and
-            cancel_at_period_end == false
+            cancel_at_period_end == false and
+            (is_nil(^arg(:after_id)) or
+               (not is_nil(^arg(:after_renewal_at)) and
+                  (next_renewal_at > ^arg(:after_renewal_at) or
+                     (next_renewal_at == ^arg(:after_renewal_at) and id > ^arg(:after_id)) or
+                     is_nil(next_renewal_at))) or
+               (is_nil(^arg(:after_renewal_at)) and is_nil(next_renewal_at) and
+                  id > ^arg(:after_id)))
         )
       )
 
-      prepare(build(sort: [next_renewal_at: :asc, id: :asc], limit: arg(:limit)))
+      prepare(build(sort: [next_renewal_at: :asc_nils_last, id: :asc], limit: arg(:limit)))
     end
 
     read :read_due_failed_payment_boundary_for_system do

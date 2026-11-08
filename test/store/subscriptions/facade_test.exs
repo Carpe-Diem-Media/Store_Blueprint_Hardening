@@ -437,6 +437,23 @@ defmodule Store.Subscriptions.FacadeTest do
     assert_no_initial_activation_rows!(fixture)
   end
 
+  test "initial activation rolls back when a purchased revision has an invalid billing timezone" do
+    fixture = create_paid_order_with_two_revision_lines!("jc255_invalid_activation_timezone")
+    second_revision = List.last(fixture.revisions)
+
+    Repo.query!(
+      "UPDATE plan_revisions SET billing_timezone = $1 WHERE id = $2",
+      ["Not/A_Real_Zone", Ecto.UUID.dump!(second_revision.id)]
+    )
+
+    StripeAPIStub.stub_unexpected!("invalid billing timezone must fail before provider work")
+
+    assert {:error, %Error{code: "INVALID_BILLING_TIMEZONE"}} =
+             SubscriptionsFacade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+    assert_no_initial_activation_rows!(fixture)
+  end
+
   @tag :jc360_task01
   test "initial activation rejects a persisted same-plan revision mismatch" do
     fixture = create_paid_order_with_two_revision_lines!("jc360_same_plan_revision")

@@ -675,8 +675,8 @@ defmodule Store.Subscriptions.Sbh2003RenewalVsContractChangeTest do
   end
 
   defp current_renewal_period(%{subscription: subscription, revision: revision}) do
-    period_end_at =
-      Scheduler.next_period(subscription.current_period_end_at, revision).current_period_end_at
+    {:ok, period} = Scheduler.next_period(subscription.current_period_end_at, revision)
+    period_end_at = period.current_period_end_at
 
     {subscription.current_period_end_at, period_end_at}
   end

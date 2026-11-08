@@ -5,6 +5,8 @@ defmodule Store.Subscriptions.SubscriptionPlan do
 
   import Ash.Expr
 
+  alias Store.Subscriptions.BillingTimezone
+
   use Ash.Resource,
     data_layer: AshPostgres.DataLayer,
     authorizers: [Ash.Policy.Authorizer],
@@ -218,6 +220,7 @@ defmodule Store.Subscriptions.SubscriptionPlan do
       ])
 
       change(&normalize_fields/2)
+      validate(&validate_billing_timezone/2)
       validate(&validate_anchor/2)
       validate(&validate_term/2)
       validate(&validate_retry_schedule/2)
@@ -251,6 +254,7 @@ defmodule Store.Subscriptions.SubscriptionPlan do
       ])
 
       change(&normalize_fields/2)
+      validate(&validate_billing_timezone/2)
       validate(&validate_anchor/2)
       validate(&validate_term/2)
       validate(&validate_retry_schedule/2)
@@ -352,6 +356,13 @@ defmodule Store.Subscriptions.SubscriptionPlan do
 
       _ ->
         changeset
+    end
+  end
+
+  defp validate_billing_timezone(changeset, _context) do
+    case BillingTimezone.validate(Ash.Changeset.get_attribute(changeset, :billing_timezone)) do
+      :ok -> :ok
+      {:error, error} -> {:error, field: :billing_timezone, message: error.message}
     end
   end
 
