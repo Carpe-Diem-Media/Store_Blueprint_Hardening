@@ -54,11 +54,13 @@ defmodule Store.Subscriptions.Facade do
     UserSubscriptionIndexQuery
   }
 
+  alias Store.Subscriptions.AccessVerificationDiagnostics
+
   alias Store.Subscriptions.{
-    AccessRepairDelivery,
     AccessEffect,
     AccessEffectCurrentnessFence,
     AccessEffectTargetOrder,
+    AccessRepairDelivery,
     ContractChange,
     PaymentMethodAuthorityGate,
     PlanRevision,
@@ -201,7 +203,13 @@ defmodule Store.Subscriptions.Facade do
           current_count: non_neg_integer(),
           stale_count: non_neg_integer(),
           healthy_count: non_neg_integer(),
-          repairs: [%{subscription_id: Ecto.UUID.t(), expected_access_effect_id: Ecto.UUID.t()}],
+          repairs: [
+            %{
+              subscription_id: Ecto.UUID.t(),
+              expected_access_effect_id: Ecto.UUID.t(),
+              diagnostics: AccessVerificationDiagnostics.t()
+            }
+          ],
           conflicts: [
             %{
               subscription_id: Ecto.UUID.t(),
@@ -210,10 +218,11 @@ defmodule Store.Subscriptions.Facade do
             }
           ],
           as_of: DateTime.t(),
+          observed_at: DateTime.t(),
           cursor: %{timestamp: DateTime.t(), id: Ecto.UUID.t()} | nil
         }
 
-  @doc "Checks one bounded APPLIED window against persisted active subscription grants."
+  @doc "Checks one bounded APPLIED window against active subscription grants and attaches bounded, read-only drift evidence."
   @spec verify_subscription_access_window_for_system(AppliedAccessVerificationQuery.t()) ::
           {:ok, access_verification_result()} | {:error, Error.t() | term()}
   def verify_subscription_access_window_for_system(%AppliedAccessVerificationQuery{} = query) do
@@ -224,6 +233,8 @@ defmodule Store.Subscriptions.Facade do
          {:ok, grants_query} <- SubscriptionSourceVerificationQuery.new(%{source_ids: ids}),
          {:ok, grants} <-
            EntitlementsFacade.list_active_subscription_source_grants_for_system(grants_query) do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
       initial = %{
         raw_count: length(rows),
         current_count: 0,
@@ -233,11 +244,13 @@ defmodule Store.Subscriptions.Facade do
         conflicts: []
       }
 
-      result = Enum.reduce(rows, initial, &verify_access_window_row(&1, &2, grants))
+      result =
+        Enum.reduce(rows, initial, &verify_access_window_row(&1, &2, grants, observed_at))
 
       {:ok,
        Map.merge(result, %{
          as_of: canonical.as_of,
+         observed_at: observed_at,
          repairs: Enum.reverse(result.repairs),
          conflicts: Enum.reverse(result.conflicts),
          cursor: access_verification_cursor(rows, canonical.limit)
@@ -249,10 +262,10 @@ defmodule Store.Subscriptions.Facade do
     {:error, Error.new("VALIDATION_ERROR", "typed APPLIED verification query is required")}
   end
 
-  defp verify_access_window_row(%{current?: false}, result, _grants),
+  defp verify_access_window_row(%{current?: false}, result, _grants, _observed_at),
     do: Map.update!(result, :stale_count, &(&1 + 1))
 
-  defp verify_access_window_row(row, result, grants) do
+  defp verify_access_window_row(row, result, grants, observed_at) do
     result = Map.update!(result, :current_count, &(&1 + 1))
 
     case verified_snapshot_input(row) do
@@ -270,13 +283,17 @@ defmodule Store.Subscriptions.Facade do
             Map.update!(result, :healthy_count, &(&1 + 1))
 
           {:error, _reason} ->
+            diagnostics =
+              AccessVerificationDiagnostics.classify(input, active_rows, observed_at)
+
             Map.update!(
               result,
               :repairs,
               &[
                 %{
                   subscription_id: row.source.subscription_id,
-                  expected_access_effect_id: row.effect.id
+                  expected_access_effect_id: row.effect.id,
+                  diagnostics: diagnostics
                 }
                 | &1
               ]
@@ -642,20 +659,24 @@ defmodule Store.Subscriptions.Facade do
 
   defp request_applied_source_repair_delivery(effect, recipient_user_ids, outcome) do
     if Repo.in_transaction?() do
-      requested_user_ids = BinaryUuidSort.sort_uuids(Enum.uniq(recipient_user_ids))
-
-      with {:ok, current} <- lock_access_repair_delivery(effect.id) do
-        case current do
-          nil ->
-            create_access_repair_delivery(effect.id, requested_user_ids)
-
-          %AccessRepairDelivery{} = delivery ->
-            update_access_repair_delivery_request(delivery, requested_user_ids, outcome)
-        end
-      end
+      persist_applied_source_repair_delivery(effect, recipient_user_ids, outcome)
     else
       {:error,
        Error.new("VALIDATION_ERROR", "repair delivery requests require the source transaction")}
+    end
+  end
+
+  defp persist_applied_source_repair_delivery(effect, recipient_user_ids, outcome) do
+    requested_user_ids = BinaryUuidSort.sort_uuids(Enum.uniq(recipient_user_ids))
+
+    with {:ok, current} <- lock_access_repair_delivery(effect.id) do
+      case current do
+        nil ->
+          create_access_repair_delivery(effect.id, requested_user_ids)
+
+        %AccessRepairDelivery{} = delivery ->
+          update_access_repair_delivery_request(delivery, requested_user_ids, outcome)
+      end
     end
   end
 

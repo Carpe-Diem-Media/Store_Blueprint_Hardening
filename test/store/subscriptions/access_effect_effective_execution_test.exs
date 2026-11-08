@@ -79,12 +79,183 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert result.current_count == 1
     assert result.healthy_count == 0
 
-    assert result.repairs == [
-             %{
-               subscription_id: fixture.subscription.id,
-               expected_access_effect_id: fixture.effect.id
-             }
-           ]
+    assert [repair] = result.repairs
+
+    assert Map.take(repair, [:subscription_id, :expected_access_effect_id]) == %{
+             subscription_id: fixture.subscription.id,
+             expected_access_effect_id: fixture.effect.id
+           }
+  end
+
+  test "JC248 verification classifies current overgrant and expired or future active cleanup at observation time" do
+    observations =
+      for {{label, temporal_state, expected_classification}, index} <-
+            Enum.with_index([
+              {"current", :current, :effective_overgrant},
+              {"expired", :expired, :expired_active_cleanup},
+              {"future", :future, :future_active_cleanup}
+            ]) do
+        fixture =
+          create_committed_effective_effect_fixture!("jc248_diagnostics_#{label}",
+            plan_overrides: %{access_on_cancel: :remove_immediately}
+          )
+
+        assert {:ok, :applied} =
+                 Sandbox.unboxed_run(Repo, fn ->
+                   Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+                 end)
+
+        assert {:ok, %{status: :canceled}} =
+                 Sandbox.unboxed_run(Repo, fn ->
+                   Facade.cancel_subscription_for_user(
+                     fixture.customer,
+                     fixture.subscription.id,
+                     :now
+                   )
+                 end)
+
+        current_effect =
+          Sandbox.unboxed_run(Repo, fn ->
+            current_effect_for_subscription!(fixture.subscription.id)
+          end)
+
+        assert current_effect.status == :applied
+        assert current_effect.disposition == :non_effective
+
+        historical_as_of = ~U[2020-01-02 00:00:00Z]
+        inserted_at = DateTime.add(~U[2020-01-01 00:00:00Z], index, :second)
+
+        temporal_base =
+          DateTime.utc_now()
+          |> DateTime.truncate(:microsecond)
+
+        {valid_from_at, valid_to_at} =
+          case temporal_state do
+            :current ->
+              {
+                DateTime.add(temporal_base, -3_600, :second),
+                DateTime.add(temporal_base, 3_600, :second)
+              }
+
+            :expired ->
+              {
+                DateTime.add(temporal_base, -7_200, :second),
+                DateTime.add(temporal_base, -3_600, :second)
+              }
+
+            :future ->
+              {
+                DateTime.add(temporal_base, 3_600, :second),
+                DateTime.add(temporal_base, 7_200, :second)
+              }
+          end
+
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.query!("UPDATE access_effects SET inserted_at = $2 WHERE id = $1", [
+            Ecto.UUID.dump!(current_effect.id),
+            inserted_at
+          ])
+
+          assert %{num_rows: 1} =
+                   Repo.query!(
+                     """
+                     UPDATE entitlement_grants
+                     SET status = 'active', valid_from_at = $4, valid_to_at = $5,
+                         revoked_at = NULL, revoked_reason = NULL, updated_at = $6
+                     WHERE user_id = $1 AND kind = 'membership_access' AND scope_key = $2
+                       AND source_kind = 'subscription' AND source_id = $3
+                     """,
+                     [
+                       Ecto.UUID.dump!(fixture.subscription.user_id),
+                       fixture.effect.entitlement_scope_key,
+                       Ecto.UUID.dump!(fixture.subscription.id),
+                       valid_from_at,
+                       valid_to_at,
+                       temporal_base
+                     ]
+                   )
+        end)
+
+        before =
+          Sandbox.unboxed_run(Repo, fn ->
+            effects =
+              AccessEffect
+              |> Ash.Query.filter(expr(subscription_id == ^fixture.subscription.id))
+              |> Ash.read!(
+                domain: Store.Subscriptions,
+                authorize?: false,
+                context: %{system?: true}
+              )
+              |> Enum.sort_by(& &1.source_version)
+
+            {effects, grants_for_source!(fixture.subscription.id)}
+          end)
+
+        assert {:ok, query} =
+                 AppliedAccessVerificationQuery.new(%{
+                   as_of: historical_as_of,
+                   after_inserted_at: DateTime.add(inserted_at, -1, :microsecond),
+                   after_id: "00000000-0000-0000-0000-000000000000",
+                   limit: 2
+                 })
+
+        call_started_at = DateTime.utc_now()
+
+        assert {:ok, result} = Facade.verify_subscription_access_window_for_system(query)
+
+        call_finished_at = DateTime.utc_now()
+
+        after_verification =
+          Sandbox.unboxed_run(Repo, fn ->
+            effects =
+              AccessEffect
+              |> Ash.Query.filter(expr(subscription_id == ^fixture.subscription.id))
+              |> Ash.read!(
+                domain: Store.Subscriptions,
+                authorize?: false,
+                context: %{system?: true}
+              )
+              |> Enum.sort_by(& &1.source_version)
+
+            {effects, grants_for_source!(fixture.subscription.id)}
+          end)
+
+        assert before == after_verification
+        assert DateTime.compare(result.as_of, historical_as_of) == :eq
+        assert %DateTime{} = result.observed_at
+        assert DateTime.compare(result.observed_at, historical_as_of) == :gt
+        assert DateTime.compare(call_started_at, result.observed_at) in [:lt, :eq]
+        assert DateTime.compare(result.observed_at, call_finished_at) in [:lt, :eq]
+
+        repair =
+          Enum.find(result.repairs, fn repair ->
+            repair.subscription_id == fixture.subscription.id and
+              repair.expected_access_effect_id == current_effect.id
+          end)
+
+        assert %{diagnostics: diagnostics} = repair
+        assert diagnostics.desired_target_effective? == false
+        assert diagnostics.observed_at == result.observed_at
+        assert diagnostics.sample_limit == 2
+        assert diagnostics.sample_count == 1
+        assert diagnostics.sample_complete? == true
+        assert expected_classification in diagnostics.classifications
+
+        if expected_classification == :effective_overgrant do
+          assert :effective_overgrant in diagnostics.classifications
+        else
+          refute :effective_overgrant in diagnostics.classifications
+        end
+
+        assert [sample] = diagnostics.samples
+        assert sample.grant_id == hd(elem(before, 1)).id
+        assert sample.temporal_state == temporal_state
+        assert sample.effective_at_observation? == (temporal_state == :current)
+
+        {label, result}
+      end
+
+    assert Enum.map(observations, &elem(&1, 0)) == ["current", "expired", "future"]
   end
 
   @tag :jc248_resource_evidence
@@ -387,8 +558,38 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
         }
       )
 
+      assert %{rows: [[repair_args]]} =
+               Store.DirectRepo.query!(
+                 """
+                 SELECT args FROM oban_jobs
+                 WHERE worker = $1 AND args->>'subscription_id' = $2
+                   AND args->>'expected_access_effect_id' = $3
+                 ORDER BY inserted_at DESC
+                 LIMIT 1
+                 """,
+                 [
+                   "Store.Workers.ReconcileSubscriptionAccessWorker",
+                   fixture.subscription.id,
+                   fixture.effect.id
+                 ]
+               )
+
+      assert repair_args == %{
+               "subscription_id" => fixture.subscription.id,
+               "expected_access_effect_id" => fixture.effect.id
+             }
+
       assert_receive {:verification_page, [:store, :subscriptions, :access_verification, :page],
-                      %{raw_count: 1, repair_count: 1}, _metadata}
+                      %{
+                        raw_count: 1,
+                        repair_count: 1,
+                        diagnostic_missing_required_target_count: 1,
+                        diagnostic_missing_current_access_count: 1
+                      }, metadata}
+
+      assert %DateTime{} = metadata.observed_at
+      refute Map.has_key?(metadata, :samples)
+      refute Map.has_key?(metadata, :grant_id)
     after
       :ok = :telemetry.detach(handler_id)
     end
@@ -2392,12 +2593,12 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     assert {:ok, second_result} = Facade.verify_subscription_access_window_for_system(second)
     assert second_result.current_count == 1
 
-    assert second_result.repairs == [
-             %{
-               subscription_id: current.subscription.id,
-               expected_access_effect_id: current.effect.id
-             }
-           ]
+    assert [repair] = second_result.repairs
+
+    assert Map.take(repair, [:subscription_id, :expected_access_effect_id]) == %{
+             subscription_id: current.subscription.id,
+             expected_access_effect_id: current.effect.id
+           }
 
     first_args = %{
       "as_of" => "2093-01-01T00:00:00Z",
@@ -2594,6 +2795,18 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
              end)
 
     assert cursor_stats.query_count == 0
+
+    assert {{:discard, _}, diagnostic_args_stats} =
+             RepoStats.capture(fn ->
+               VerifySubscriptionAccessWorker.perform(%Oban.Job{
+                 args: %{
+                   "as_of" => DateTime.to_iso8601(query.as_of),
+                   "diagnostics" => %{"samples" => [%{"grant_id" => Ecto.UUID.generate()}]}
+                 }
+               })
+             end)
+
+    assert diagnostic_args_stats.query_count == 0
 
     assert {:discard, _} =
              InventorySubscriptionAccessAuthorityWorker.perform(%Oban.Job{

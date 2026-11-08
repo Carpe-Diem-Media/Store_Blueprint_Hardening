@@ -55,81 +55,38 @@ defmodule Store.Workers.RunSubscriptionAccessEffectRecoveryWorker do
              repair_delivery_after_inserted_at,
              Map.get(args, "repair_delivery_after_id")
            ) do
-      opts = [
-        limit: limit,
-        skip_execution: Map.get(args, "skip_execution", false),
-        skip_effective_execution: Map.get(args, "skip_effective_execution", false),
-        skip_projection: Map.get(args, "skip_projection", false),
-        skip_repair_delivery: Map.get(args, "skip_repair_delivery", false)
-      ]
-
-      opts = if as_of, do: Keyword.put(opts, :as_of, as_of), else: opts
-
       opts =
-        if execution_after_updated_at,
-          do: Keyword.put(opts, :execution_after_updated_at, execution_after_updated_at),
-          else: opts
-
-      opts =
-        if Map.get(args, "execution_after_id"),
-          do: Keyword.put(opts, :execution_after_id, Map.get(args, "execution_after_id")),
-          else: opts
-
-      opts =
-        if effective_execution_after_updated_at,
-          do:
-            Keyword.put(
-              opts,
-              :effective_execution_after_updated_at,
-              effective_execution_after_updated_at
-            ),
-          else: opts
-
-      opts =
-        if Map.get(args, "effective_execution_after_id"),
-          do:
-            Keyword.put(
-              opts,
-              :effective_execution_after_id,
-              Map.get(args, "effective_execution_after_id")
-            ),
-          else: opts
-
-      opts =
-        if projection_after_inserted_at,
-          do: Keyword.put(opts, :projection_after_inserted_at, projection_after_inserted_at),
-          else: opts
-
-      opts =
-        if Map.get(args, "projection_after_id"),
-          do: Keyword.put(opts, :projection_after_id, Map.get(args, "projection_after_id")),
-          else: opts
-
-      opts =
-        if repair_delivery_after_inserted_at,
-          do:
-            Keyword.put(
-              opts,
-              :repair_delivery_after_inserted_at,
-              repair_delivery_after_inserted_at
-            ),
-          else: opts
-
-      opts =
-        if Map.get(args, "repair_delivery_after_id"),
-          do:
-            Keyword.put(
-              opts,
-              :repair_delivery_after_id,
-              Map.get(args, "repair_delivery_after_id")
-            ),
-          else: opts
+        [
+          limit: limit,
+          skip_execution: Map.get(args, "skip_execution", false),
+          skip_effective_execution: Map.get(args, "skip_effective_execution", false),
+          skip_projection: Map.get(args, "skip_projection", false),
+          skip_repair_delivery: Map.get(args, "skip_repair_delivery", false)
+        ]
+        |> put_optional(:as_of, as_of)
+        |> put_optional(:execution_after_updated_at, execution_after_updated_at)
+        |> put_optional(:execution_after_id, Map.get(args, "execution_after_id"))
+        |> put_optional(
+          :effective_execution_after_updated_at,
+          effective_execution_after_updated_at
+        )
+        |> put_optional(
+          :effective_execution_after_id,
+          Map.get(args, "effective_execution_after_id")
+        )
+        |> put_optional(:projection_after_inserted_at, projection_after_inserted_at)
+        |> put_optional(:projection_after_id, Map.get(args, "projection_after_id"))
+        |> put_optional(:repair_delivery_after_inserted_at, repair_delivery_after_inserted_at)
+        |> put_optional(:repair_delivery_after_id, Map.get(args, "repair_delivery_after_id"))
 
       {:ok, opts}
     else
       _ -> {:discard, "invalid AccessEffect recovery cursor"}
     end
   end
+
+  defp put_optional(opts, _key, nil), do: opts
+  defp put_optional(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp enqueue_next_page(
          %{

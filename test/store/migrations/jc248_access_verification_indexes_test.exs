@@ -101,15 +101,7 @@ defmodule Store.Migrations.Jc248AccessVerificationIndexesTest do
             assert String.starts_with?(wait_state.lock_relation, "virtualxid:")
             assert wait_state.table == table
 
-            with_worker(fn -> probe_read(repo, table) end, fn read_probe ->
-              assert {:ok, %{rows: []}} = await_worker(read_probe),
-                     "rollback wait state: #{inspect(wait_state)}, table: #{table}"
-
-              with_worker(fn -> probe_zero_row_update(repo, table) end, fn write_probe ->
-                assert {:ok, %{num_rows: 0}} = await_worker(write_probe),
-                       "rollback wait state: #{inspect(wait_state)}, table: #{table}"
-              end)
-            end)
+            assert_read_and_write_available(repo, table, wait_state)
 
             IO.puts(
               "JC248_CONCURRENT_INDEX_ROLLBACK " <>
@@ -136,6 +128,18 @@ defmodule Store.Migrations.Jc248AccessVerificationIndexesTest do
     assert :ok = migrate_up(repo)
     assert_index_state(repo, "access_effects_applied_verification_index", true)
     assert_index_state(repo, "entitlement_grants_active_subscription_source_index", true)
+  end
+
+  defp assert_read_and_write_available(repo, table, wait_state) do
+    with_worker(fn -> probe_read(repo, table) end, fn read_probe ->
+      assert {:ok, %{rows: []}} = await_worker(read_probe),
+             "rollback wait state: #{inspect(wait_state)}, table: #{table}"
+
+      with_worker(fn -> probe_zero_row_update(repo, table) end, fn write_probe ->
+        assert {:ok, %{num_rows: 0}} = await_worker(write_probe),
+               "rollback wait state: #{inspect(wait_state)}, table: #{table}"
+      end)
+    end)
   end
 
   defp with_reader(repo, table, callback) do
