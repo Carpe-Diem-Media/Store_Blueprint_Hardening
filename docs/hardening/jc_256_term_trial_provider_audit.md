@@ -4,7 +4,13 @@ JC-256 is an audit. Production code, commercial rules and deployed provider flag
 
 The candidate rows below record `PROVEN_GAP` evidence. `CANDIDATE` is their follow-up status, not a safety verdict. Missing commercial and provider decisions remain `INCONCLUSIVE`.
 
-The branch originally stacked on JC-248 head `e1f23d179560cffb073b750b08d1a684a2bb87c5` and now incorporates corrected parent `d3900b1670427696ec4c45bae37f7be6e1151903` append-only. Amendment `bccbc034a45a6f9d1cdbed2fdd908e22a838821d` remains identifiable. JC-219 and JC-220 are accepted on canonical main `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`. Historical readiness labels do not change the current repository workflow.
+The branch originally stacked on JC-248 head `e1f23d179560cffb073b750b08d1a684a2bb87c5` and now incorporates corrected parent `d4f021a8066c7603854276f6827b45d9b8b02ddf` append-only. Amendment `bccbc034a45a6f9d1cdbed2fdd908e22a838821d` remains identifiable. JC-219 and JC-220 are accepted on canonical main `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`. Historical readiness labels do not change the current repository workflow.
+
+## 2026-11-08 reconciliation correction propagation
+
+The five JC-248 corrections are inherited without changing this audit's commercial tests. The ten audit tests passed again. The sale/activation and configuration modules remain byte-identical to amendment `bccbc034`; the shared paid-order helper is unchanged. JC-362 through JC-364 remain open. Reconciliation cannot correct a commercially wrong authoritative target.
+
+The parent passed its full check with three properties, 1,683 tests, zero failures and 31 exclusions, plus types, migration alignment and 25 required connection tests twice. Those are parent results. This audit layer received a focused local run; its exact-head full CI and independent external re-verification remain pending. Earlier integration totals below describe their earlier heads.
 
 ## Executable verdicts
 

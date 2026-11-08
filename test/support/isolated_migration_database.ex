@@ -12,13 +12,15 @@ defmodule Store.TestSupport.IsolatedMigrationDatabase do
       adapter: Ecto.Adapters.Postgres
   end
 
-  @spec start!(String.t(), module()) :: %{
+  @spec start!(String.t(), module(), keyword()) :: %{
           repo: module(),
           repo_pid: pid(),
           database: String.t(),
           admin_pid: pid()
         }
-  def start!(tag, repo_module) when is_binary(tag) and is_atom(repo_module) do
+  def start!(tag, repo_module, opts \\ [])
+      when is_binary(tag) and is_atom(repo_module) and is_list(opts) do
+    pool_size = Keyword.get(opts, :pool_size, 2)
     database = isolated_database_name(tag)
     base_config = Store.Repo.config()
 
@@ -40,7 +42,7 @@ defmodule Store.TestSupport.IsolatedMigrationDatabase do
         name: repo_module,
         database: database,
         pool: DBConnection.ConnectionPool,
-        pool_size: 2
+        pool_size: pool_size
       )
 
     {:ok, repo_pid} = repo_module.start_link(repo_config)

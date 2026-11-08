@@ -16,5 +16,6 @@ defmodule Store.Subscriptions do
     resource(Store.Subscriptions.RenewalAttempt)
     resource(Store.Subscriptions.RenewalCollectionAttempt)
     resource(Store.Subscriptions.AccessEffect)
+    resource(Store.Subscriptions.AccessRepairDelivery)
   end
 end
