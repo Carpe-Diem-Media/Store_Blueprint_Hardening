@@ -754,7 +754,9 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
         recipient_user_ids: [user_id],
         generation: 1,
         delivered_generation: 0
-      }, context: %{system?: true})
+      },
+      context: %{system?: true}
+    )
     |> Ash.create!(domain: Subscriptions, authorize?: true, context: %{system?: true})
   end
 
