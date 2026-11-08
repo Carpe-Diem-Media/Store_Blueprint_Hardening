@@ -14,6 +14,19 @@ defmodule Store.Workers.VerifySubscriptionAccessWorker do
   alias Store.Workers.ReconcileSubscriptionAccessWorker
 
   @allowed_args ["as_of", "after_inserted_at", "after_id", "limit"]
+  @diagnostic_metrics [
+    diagnostic_effective_overgrant_count: :effective_overgrant,
+    diagnostic_expired_active_cleanup_count: :expired_active_cleanup,
+    diagnostic_future_active_cleanup_count: :future_active_cleanup,
+    diagnostic_wrong_owner_count: :wrong_owner,
+    diagnostic_wrong_kind_count: :wrong_kind,
+    diagnostic_wrong_scope_count: :wrong_scope,
+    diagnostic_validity_mismatch_count: :validity_mismatch,
+    diagnostic_invalid_revocation_metadata_count: :invalid_revocation_metadata,
+    diagnostic_missing_required_target_count: :missing_required_target,
+    diagnostic_missing_current_access_count: :missing_current_access,
+    diagnostic_incomplete_evidence_count: :incomplete_evidence
+  ]
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: args}) when is_map(args) do
@@ -87,6 +100,7 @@ defmodule Store.Workers.VerifySubscriptionAccessWorker do
   defp enqueue_repairs(repairs) do
     Enum.reduce_while(repairs, :ok, fn candidate, :ok ->
       candidate
+      |> Map.take([:subscription_id, :expected_access_effect_id])
       |> ReconcileSubscriptionAccessWorker.new()
       |> Oban.insert()
       |> case do
@@ -114,14 +128,25 @@ defmodule Store.Workers.VerifySubscriptionAccessWorker do
   end
 
   defp report(result) do
+    diagnostic_counts =
+      Map.new(@diagnostic_metrics, fn {metric, classification} ->
+        count =
+          Enum.count(result.repairs, fn repair ->
+            classification in repair.diagnostics.classifications
+          end)
+
+        {metric, count}
+      end)
+
     :telemetry.execute(
       [:store, :subscriptions, :access_verification, :page],
       Map.take(result, [:raw_count, :current_count, :stale_count, :healthy_count])
       |> Map.merge(%{
         repair_count: length(result.repairs),
         conflict_count: length(result.conflicts)
-      }),
-      %{}
+      })
+      |> Map.merge(diagnostic_counts),
+      %{observed_at: result.observed_at}
     )
 
     Enum.each(result.conflicts, fn conflict ->

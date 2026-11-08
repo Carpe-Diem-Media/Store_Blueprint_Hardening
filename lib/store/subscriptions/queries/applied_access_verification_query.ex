@@ -48,17 +48,19 @@ defmodule Store.Subscriptions.Queries.AppliedAccessVerificationQuery do
 
     window = maybe_after(window, query.after_inserted_at, query.after_id)
 
-    newer_effect =
-      from newer in AccessEffect,
-        where:
-          newer.subscription_id == parent_as(:effect).subscription_id and
-            newer.source_version > parent_as(:effect).source_version,
-        select: 1
+    latest_effect =
+      from latest in AccessEffect,
+        where: latest.subscription_id == parent_as(:effect).subscription_id,
+        order_by: [desc: latest.source_version],
+        limit: 1,
+        select: %{id: latest.id}
 
     from effect in subquery(window),
       as: :effect,
       join: source in Subscription,
       on: source.id == effect.subscription_id,
+      left_lateral_join: latest in subquery(latest_effect),
+      on: true,
       left_join: revision in PlanRevision,
       on: revision.id == source.current_plan_revision_id,
       left_join: reference in ContractChange,
@@ -66,7 +68,7 @@ defmodule Store.Subscriptions.Queries.AppliedAccessVerificationQuery do
       order_by: [asc: effect.inserted_at, asc: effect.id],
       select: %{
         effect: effect,
-        current?: not exists(subquery(newer_effect)),
+        current?: latest.id == effect.id,
         source: %{
           subscription_id: source.id,
           user_id: source.user_id,
@@ -94,8 +96,13 @@ defmodule Store.Subscriptions.Queries.AppliedAccessVerificationQuery do
     where(
       query,
       [effect],
-      effect.inserted_at > ^inserted_at or
-        (effect.inserted_at == ^inserted_at and effect.id > ^id)
+      fragment(
+        "(?, ?) > (?, ?)",
+        effect.inserted_at,
+        effect.id,
+        type(^inserted_at, :utc_datetime_usec),
+        type(^id, Ecto.UUID)
+      )
     )
   end
 

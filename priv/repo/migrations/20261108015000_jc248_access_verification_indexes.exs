@@ -26,11 +26,13 @@ defmodule Store.Repo.Migrations.Jc248AccessVerificationIndexes do
 
   def down do
     drop_if_exists index(:entitlement_grants, [:source_id, :id],
-                     name: "entitlement_grants_active_subscription_source_index"
+                     name: "entitlement_grants_active_subscription_source_index",
+                     concurrently: true
                    )
 
     drop_if_exists index(:access_effects, [:inserted_at, :id],
-                     name: "access_effects_applied_verification_index"
+                     name: "access_effects_applied_verification_index",
+                     concurrently: true
                    )
   end
 end
