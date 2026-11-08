@@ -1,5 +1,6 @@
 defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
   use Store.DataCase, async: false
+  use Oban.Testing, repo: Store.DirectRepo
 
   import Ash.Expr
   require Ash.Query
@@ -9,6 +10,7 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
   alias Store.Subscriptions.Inputs.QueueSubscriptionPlanChangeInput
   alias Store.Subscriptions.Inputs.QueueSubscriptionVariantChangeInput
   alias Store.Subscriptions.RenewalAttempt
+  alias Store.Subscriptions.Scheduler
   alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
   alias Store.TestFixtures
@@ -396,6 +398,79 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
     assert contract_change_ids(support_fixture.subscription.id) == before_support_changes
   end
 
+  test "support replay of an identical queued target follows current facade behavior" do
+    for state <- [:active, :past_due], kind <- [:plan, :variant] do
+      prefix = "jc258_support_replay_#{state}_#{kind}"
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      fixture =
+        subscription_fixture!(prefix, nil, %{
+          started_at: if(state == :past_due, do: DateTime.add(now, -62, :day), else: now)
+        })
+
+      target = replay_target!(fixture, kind)
+      input = replay_input!(fixture, kind, target)
+      admin = actor_with_role!(:admin, "#{prefix}_admin")
+
+      assert {:ok, seeded} =
+               queue_replay_target(kind, admin, fixture.subscription.id, input)
+
+      seeded_change_id = seeded.current_contract_change_id
+      assert is_binary(seeded_change_id)
+      seeded_change = fetch_contract_change!(seeded_change_id)
+      assert subscription_renewal_jobs(fixture.subscription.id) == []
+
+      if state == :past_due do
+        mark_replay_fixture_past_due!(fixture.subscription.id, now)
+        past_due = fetch_subscription!(fixture.subscription.id)
+        assert past_due.status == :past_due
+        assert DateTime.compare(past_due.current_period_end_at, now) in [:lt, :eq]
+        assert DateTime.compare(past_due.next_retry_at, now) == :lt
+        assert DateTime.compare(past_due.failed_payment_boundary_at, now) == :gt
+        assert is_nil(past_due.retry_suppressed_at)
+      end
+
+      before = fetch_subscription!(fixture.subscription.id)
+      assert subscription_renewal_jobs(fixture.subscription.id) == []
+      assert before.current_plan_revision_id == fixture.revision.id
+
+      assert {:ok, renewal_period} =
+               Scheduler.next_period(before.current_period_end_at, fixture.revision)
+
+      expected_key = Scheduler.renewal_key(before.id, renewal_period.current_period_end_at)
+      assert fetch_contract_change!(seeded_change_id).effective_at == seeded_change.effective_at
+      before_change_ids = contract_change_ids(fixture.subscription.id)
+      support = actor_with_role!(:support, "#{prefix}_support")
+
+      assert {:ok, replayed} = queue_replay_target(kind, support, fixture.subscription.id, input)
+      assert replayed.current_contract_change_id == seeded_change_id
+
+      after_first_replay = fetch_subscription!(fixture.subscription.id)
+      assert replayed_projection(after_first_replay, kind) == replayed_projection(before, kind)
+      assert after_first_replay.aggregate_version == before.aggregate_version
+      assert fetch_contract_change!(seeded_change_id).effective_at == seeded_change.effective_at
+      assert contract_change_ids(fixture.subscription.id) == before_change_ids
+      assert_replay_jobs!(state, fixture.subscription.id, expected_key)
+
+      assert {:ok, replayed_again} =
+               queue_replay_target(kind, support, fixture.subscription.id, input)
+
+      assert replayed_again.current_contract_change_id == seeded_change_id
+
+      assert replayed_projection(fetch_subscription!(fixture.subscription.id), kind) ==
+               replayed_projection(before, kind)
+
+      assert fetch_subscription!(fixture.subscription.id).aggregate_version ==
+               before.aggregate_version
+
+      assert fetch_contract_change!(seeded_change_id).effective_at == seeded_change.effective_at
+      assert contract_change_ids(fixture.subscription.id) == before_change_ids
+      assert_replay_jobs!(state, fixture.subscription.id, expected_key)
+    end
+
+    assert_support_distinct_target_denied!()
+  end
+
   defp authorization_actors!(prefix) do
     owner = SubscriptionsFixtures.create_customer!("#{prefix}_owner")
     non_owner = SubscriptionsFixtures.create_customer!("#{prefix}_non_owner")
@@ -425,7 +500,7 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
 
   defp assert_owner_context!(_label, _actor, _subscription_user_id), do: :ok
 
-  defp subscription_fixture!(prefix, customer \\ nil) do
+  defp subscription_fixture!(prefix, customer \\ nil, overrides \\ %{}) do
     customer = customer || SubscriptionsFixtures.create_customer!("#{prefix}_customer")
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
     plan = SubscriptionsFixtures.create_subscription_plan!()
@@ -435,7 +510,9 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
       SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
         provider: :stripe,
         provider_customer_ref: "cus_#{prefix}",
-        provider_billing_ref: "pm_#{prefix}"
+        provider_billing_ref: "pm_#{prefix}",
+        started_at:
+          Map.get(overrides, :started_at, DateTime.utc_now() |> DateTime.truncate(:microsecond))
       })
 
     Map.merge(fixture, %{customer: customer, plan: plan, variant: variant})
@@ -458,6 +535,82 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
       SubscriptionsFixtures.attach_variant_plan!(target_variant.id, fixture.plan.id)
 
     target_variant
+  end
+
+  defp replay_target!(fixture, :plan), do: attach_revision_to_plan!(fixture)
+  defp replay_target!(fixture, :variant), do: attach_target_variant!(fixture)
+
+  defp replay_input!(fixture, :plan, target),
+    do: plan_change_input!(fixture.subscription.id, target.plan.id)
+
+  defp replay_input!(fixture, :variant, target),
+    do: variant_change_input!(fixture.subscription.id, target.id)
+
+  defp queue_replay_target(:plan, actor, subscription_id, input),
+    do: Facade.queue_subscription_plan_change_for_admin(actor, subscription_id, input)
+
+  defp queue_replay_target(:variant, actor, subscription_id, input),
+    do: Facade.queue_subscription_variant_change_for_admin(actor, subscription_id, input)
+
+  defp replayed_projection(subscription, :plan),
+    do:
+      {subscription.status, subscription.pending_subscription_plan_id,
+       subscription.current_contract_change_id}
+
+  defp replayed_projection(subscription, :variant),
+    do:
+      {subscription.status, subscription.pending_variant_id,
+       subscription.current_contract_change_id}
+
+  defp mark_replay_fixture_past_due!(subscription_id, now) do
+    changeset =
+      fetch_subscription!(subscription_id)
+      |> Ash.Changeset.for_update(:mark_past_due_transition, %{
+        billing_status_reason: "payment_failed",
+        past_due_since_at: DateTime.add(now, -86_400, :second),
+        failed_payment_boundary_at: DateTime.add(now, 86_400, :second),
+        dunning_attempt_count: 1,
+        next_retry_at: DateTime.add(now, -1, :second),
+        retry_suppressed_at: nil
+      })
+
+    assert changeset.valid?
+
+    assert {:ok, _updated} =
+             Ash.update(changeset,
+               domain: Store.Subscriptions,
+               actor: nil,
+               context: @system_context
+             )
+  end
+
+  defp assert_support_distinct_target_denied! do
+    fixture = subscription_fixture!("jc258_support_replay_distinct")
+    first_target = attach_revision_to_plan!(fixture)
+    second_target = attach_revision_to_plan!(fixture)
+    admin = actor_with_role!(:admin, "jc258_support_replay_distinct_admin")
+    support = actor_with_role!(:support, "jc258_support_replay_distinct_support")
+
+    assert {:ok, _queued} =
+             Facade.queue_subscription_plan_change_for_admin(
+               admin,
+               fixture.subscription.id,
+               plan_change_input!(fixture.subscription.id, first_target.plan.id)
+             )
+
+    before = fetch_subscription!(fixture.subscription.id)
+    before_changes = contract_change_ids(fixture.subscription.id)
+
+    assert {:error, %{code: "FORBIDDEN"}} =
+             Facade.queue_subscription_plan_change_for_admin(
+               support,
+               fixture.subscription.id,
+               plan_change_input!(fixture.subscription.id, second_target.plan.id)
+             )
+
+    assert_unchanged_subscription!(before)
+    assert contract_change_ids(fixture.subscription.id) == before_changes
+    assert subscription_renewal_jobs(fixture.subscription.id) == []
   end
 
   defp assert_queued_plan_change!(result, target_plan_id, target_revision_id, fixture) do
@@ -596,5 +749,24 @@ defmodule Store.Governance.JC258DirectAuthorizationAuditTest do
     |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: @system_context)
     |> Enum.map(& &1.id)
     |> MapSet.new()
+  end
+
+  defp subscription_renewal_jobs(subscription_id) do
+    all_enqueued(worker: Store.Workers.ProcessSubscriptionRenewalWorker)
+    |> Enum.filter(&(&1.args["subscription_id"] == subscription_id))
+  end
+
+  defp assert_replay_jobs!(:active, subscription_id, _expected_key),
+    do: assert(subscription_renewal_jobs(subscription_id) == [])
+
+  defp assert_replay_jobs!(:past_due, subscription_id, expected_key) do
+    jobs = subscription_renewal_jobs(subscription_id)
+    assert length(jobs) == 1
+
+    assert [
+             %Oban.Job{
+               args: %{"subscription_id" => ^subscription_id, "renewal_key" => ^expected_key}
+             }
+           ] = jobs
   end
 end
