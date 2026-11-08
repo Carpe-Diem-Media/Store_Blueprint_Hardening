@@ -26,3 +26,11 @@ Document interruption recovery through catalog inspection and an explicit concur
 ## Evidence limits
 
 The tests establish reader and writer availability for these exact index drops on the local DevCore PostgreSQL version. They do not certify production latency, arbitrary load or all migration rollback paths.
+
+## Observed validation
+
+Root observed both table cases fail on ordinary rollback with PostgreSQL `57014` read timeouts. Both cases passed after concurrent drops, then passed again after stronger catalog-backed lock assertions. The final proof ties the exact concurrent drop to the held reader, verifies that reader's granted AccessShareLock on the target table, and observes the drop waiting on a virtual transaction ShareLock. New reads and zero-row updates completed before release for both tables. Each case also verified absent indexes after rollback and valid, ready indexes after rebuilding.
+
+Fresh specification and quality rechecks found no actionable R4 defect. An initial suggestion to assert a waiting index AccessExclusiveLock was corrected because concurrent drop waits on the reader's virtual transaction. The version-order warning is caused by deliberately rolling this older independent migration down and up while a later migration remains recorded. It does not demonstrate an implementation-order defect or require renumbering. The runbook makes rollback selection and the exact-version test limit explicit.
+
+Root observed TEST `mix ash_postgres.generate_migrations --check` exit with status zero. That successful command emits an empty log; the exit status came from the execution result, not inferred log content. Logs and review reports are under `/tmp/jc248-review-corrections/`. Full issue checks and exact-head CI follow after R3 and R5.

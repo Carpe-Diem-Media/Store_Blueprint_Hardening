@@ -84,6 +84,44 @@
   - inspect email outbox backlog
   - reconcile paid orders that arrived during the transition window
 
+### Interrupted verification-index operations
+
+The JC-248 verification-index migration uses concurrent index creation and removal. If creation or rollback is interrupted, inspect both named indexes and their PostgreSQL validity state before taking action.
+
+Inspect the applied `schema_migrations` history when selecting a rollback. Ecto's one-step rollback selects the highest applied version. The availability tests invoke version `20261107072703` explicitly; they do not certify which migration a deployment's rollback plan should select.
+
+```sql
+SELECT table_class.relname AS table_name,
+       index_class.relname AS index_name,
+       index_state.indisvalid,
+       index_state.indisready
+FROM pg_index AS index_state
+JOIN pg_class AS index_class ON index_class.oid = index_state.indexrelid
+JOIN pg_namespace AS namespace ON namespace.oid = index_class.relnamespace
+JOIN pg_class AS table_class ON table_class.oid = index_state.indrelid
+WHERE namespace.nspname = 'public' AND index_class.relname IN (
+  'access_effects_applied_verification_index',
+  'entitlement_grants_active_subscription_source_index'
+)
+ORDER BY index_class.relname;
+```
+
+When completing rollback, absent indexes are the intended state. When restoring verification, both indexes must exist and be valid and ready. Rebuild a missing index. If either exists with `indisvalid = false` or `indisready = false`, rerunning the migration does not repair it. Under the authorized recovery procedure, drop the affected invalid index concurrently and rebuild its original definition. Run only the affected index's statements below, each outside a transaction:
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS public.access_effects_applied_verification_index;
+CREATE INDEX CONCURRENTLY access_effects_applied_verification_index
+  ON public.access_effects (inserted_at, id)
+  WHERE status = 'applied';
+
+DROP INDEX CONCURRENTLY IF EXISTS public.entitlement_grants_active_subscription_source_index;
+CREATE INDEX CONCURRENTLY entitlement_grants_active_subscription_source_index
+  ON public.entitlement_grants (source_id, id)
+  WHERE source_kind = 'subscription' AND status = 'active';
+```
+
+Recheck `pg_index.indisvalid` and `pg_index.indisready` for both indexes after recovery. Do not run these commands as part of routine rollback without explicit operational authorization.
+
 ## Incident Response
 - Webhook failures:
   - inspect `webhook_receipts` backlog and failed rows
