@@ -88,7 +88,7 @@
 
 The JC-248 verification-index migration uses concurrent index creation and removal. If creation or rollback is interrupted, inspect both named indexes and their PostgreSQL validity state before taking action.
 
-Inspect the applied `schema_migrations` history when selecting a rollback. Ecto's one-step rollback selects the highest applied version. The availability tests invoke version `20261107072703` explicitly; they do not certify which migration a deployment's rollback plan should select.
+Inspect the applied `schema_migrations` history when selecting a rollback. Ecto's one-step rollback selects the highest applied version. The index migration is version `20261108015000`, after its parent's setup-generation migration. Availability tests invoke this version explicitly, and a separate staged test verifies its rollback order relative to that parent. Later migrations have their own rollback steps.
 
 ```sql
 SELECT table_class.relname AS table_name,

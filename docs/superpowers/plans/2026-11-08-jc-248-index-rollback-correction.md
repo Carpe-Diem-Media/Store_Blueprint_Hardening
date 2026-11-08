@@ -4,7 +4,7 @@ Use `subagent-driven-development`. Root owns Mix, DevCore, formatting, Git and e
 
 ## Files
 
-- `priv/repo/migrations/20261107072703_jc248_access_verification_indexes.exs`
+- `priv/repo/migrations/20261108015000_jc248_access_verification_indexes.exs`
 - New `test/store/migrations/jc248_access_verification_indexes_test.exs`
 - `test/support/isolated_migration_database.ex`, only if an optional test pool-size argument is needed. Preserve the default of two connections.
 - Existing JC-248 operations documentation for interrupted concurrent index recovery.
@@ -31,6 +31,8 @@ The tests establish reader and writer availability for these exact index drops o
 
 Root observed both table cases fail on ordinary rollback with PostgreSQL `57014` read timeouts. Both cases passed after concurrent drops, then passed again after stronger catalog-backed lock assertions. The final proof ties the exact concurrent drop to the held reader, verifies that reader's granted AccessShareLock on the target table, and observes the drop waiting on a virtual transaction ShareLock. New reads and zero-row updates completed before release for both tables. Each case also verified absent indexes after rollback and valid, ready indexes after rebuilding.
 
-Fresh specification and quality rechecks found no actionable R4 defect. An initial suggestion to assert a waiting index AccessExclusiveLock was corrected because concurrent drop waits on the reader's virtual transaction. The version-order warning is caused by deliberately rolling this older independent migration down and up while a later migration remains recorded. It does not demonstrate an implementation-order defect or require renumbering. The runbook makes rollback selection and the exact-version test limit explicit.
+Fresh specification and quality rechecks found no actionable R4 defect. An initial suggestion to assert a waiting index AccessExclusiveLock was corrected because concurrent drop waits on the reader's virtual transaction. The initial exact-version review did not exercise staged deployment. A new regression using the actual bulk migrator upgrade and one-step rollback reproduced selection of the already-applied #216 migration instead of the just-added older-numbered index migration. The unmerged index migration is renumbered after its parent to preserve staged upgrade and rollback order. Its former version was `20261107072703`; no accepted main migration or shared Git history was rewritten. The staged test isolates the parent/index prefix, while later migrations retain their own rollback steps.
 
 Root observed TEST `mix ash_postgres.generate_migrations --check` exit with status zero. That successful command emits an empty log; the exit status came from the execution result, not inferred log content. Logs and review reports are under `/tmp/jc248-review-corrections/`. Full issue checks and exact-head CI follow after R3 and R5.
+
+After renumbering, all three migration cases passed on a fresh private suffix. Fresh specification and quality reviews found no actionable staged-order defect. The initial red selector returned parent version `20261107174747`; the corrected selector returned index version `20261108015000` and retained the parent. This proof covers the parent/index stage, with later feature migrations handled by their own rollback steps.

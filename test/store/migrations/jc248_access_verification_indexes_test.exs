@@ -14,13 +14,22 @@ defmodule Store.Migrations.Jc248AccessVerificationIndexesTest do
 
   Code.require_file(
     Path.expand(
-      "../../../priv/repo/migrations/20261107072703_jc248_access_verification_indexes.exs",
+      "../../../priv/repo/migrations/20261108015000_jc248_access_verification_indexes.exs",
       __DIR__
     )
   )
 
-  @version 20_261_107_072_703
+  Code.require_file(
+    Path.expand(
+      "../../../priv/repo/migrations/20261107174747_add_subscription_setup_generations.exs",
+      __DIR__
+    )
+  )
+
+  @version 20_261_108_015_000
   @migration Store.Repo.Migrations.Jc248AccessVerificationIndexes
+  @parent_version 20_261_107_174_747
+  @parent_migration Store.Repo.Migrations.AddSubscriptionSetupGenerations
   setup_all do
     context =
       IsolatedMigrationDatabase.start!(
@@ -53,6 +62,28 @@ defmodule Store.Migrations.Jc248AccessVerificationIndexesTest do
       "access_effects",
       "access_effects_applied_verification_index"
     )
+  end
+
+  test "a staged index upgrade rolls back before the already-applied parent migration", %{
+    repo: repo
+  } do
+    # Restrict this stage to the parent and index migrations. Later migrations in
+    # this PR have their own rollback steps and do not change this ordering law.
+    source = [{@parent_version, @parent_migration}, {@version, @migration}]
+
+    try do
+      assert :ok = Migrator.down(repo, @version, @migration, log: false)
+      assert @parent_version in Migrator.migrated_versions(repo)
+      refute @version in Migrator.migrated_versions(repo)
+
+      assert [@version] = Migrator.run(repo, source, :up, all: true, log: false)
+      assert [@version] = Migrator.run(repo, source, :down, step: 1, log: false)
+      assert @parent_version in Migrator.migrated_versions(repo)
+      refute @version in Migrator.migrated_versions(repo)
+    after
+      Migrator.up(repo, @parent_version, @parent_migration, log: false)
+      migrate_up(repo)
+    end
   end
 
   defp rollback_index_while_readers_continue(repo, table, index) do
