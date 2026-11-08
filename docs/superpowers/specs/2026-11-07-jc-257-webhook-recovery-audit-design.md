@@ -2,7 +2,7 @@
 
 JC-257 requests evidence for duplicate and reordered webhooks, durable provider observation, missing events, unknown references and worker replay. It forbids remediation inside the audit. Current Linear prerequisites JC-228, JC-229 and JC-230 are Done and accepted on main. JC-282 and JC-287 are also Done; their current implementations supersede the issue's September descriptions of missing success correction and provider observation.
 
-The branch starts from JC-256 head `484e1bee231865f954cfab036c04aa377c39bc4b`. Its draft PR will target `jc-256-term-trial-provider-audit` as the sixth ticket layer. Canonical main at audit start is `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`. Human review and merge remain required.
+At design time, the branch started from JC-256 head `484e1bee231865f954cfab036c04aa377c39bc4b`, and its draft PR targeted `jc-256-term-trial-provider-audit` as the sixth ticket layer. Canonical main at audit start was `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`. Human review and merge remained required. These are historical design facts. The original independent review pair was `8708e06a7cbb397d4951feeca66acd2c3f426eef` / `484e1bee231865f954cfab036c04aa377c39bc4b`, with addendum head `73e530a84cd2e666c73346b5a6dc6b7516747eda`. The current corrected parent head is `7f231b42a773150749edda7e4b981b3344f901ec`; fresh CI and independent external re-verification remain pending.
 
 ## Evidence and scope
 

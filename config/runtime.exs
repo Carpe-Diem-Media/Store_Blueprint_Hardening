@@ -219,8 +219,38 @@ if config_env() == :prod do
   # bypasses PgBouncer. If unset, DirectRepo falls back to DATABASE_URL.
   direct_database_url = optional_env.("STORE_DIRECT_DATABASE_URL") || database_url
 
+  primary_pool_size = parse_positive_integer!.("POOL_SIZE", "10")
+
+  if primary_pool_size < 3 do
+    raise "POOL_SIZE must be at least 3 to reserve at least two primary connections outside subscription workers"
+  end
+
+  automatic_subscriptions_queue_limit = min(4, primary_pool_size - 2)
+
+  subscriptions_queue_limit =
+    case System.get_env("STORE_SUBSCRIPTIONS_QUEUE_LIMIT") do
+      nil ->
+        automatic_subscriptions_queue_limit
+
+      value ->
+        parsed =
+          case Integer.parse(value) do
+            {integer, ""} when integer > 0 ->
+              integer
+
+            _ ->
+              raise "STORE_SUBSCRIPTIONS_QUEUE_LIMIT must be a positive integer no greater than POOL_SIZE - 2 to reserve at least two primary connections"
+          end
+
+        if parsed > primary_pool_size - 2 do
+          raise "STORE_SUBSCRIPTIONS_QUEUE_LIMIT must be no greater than POOL_SIZE - 2 to reserve at least two primary connections"
+        end
+
+        parsed
+    end
+
   repo_common_opts = [
-    pool_size: parse_positive_integer!.("POOL_SIZE", "10"),
+    pool_size: primary_pool_size,
     socket_options: maybe_ipv6
   ]
 
@@ -243,6 +273,8 @@ if config_env() == :prod do
   config :store, Store.Repo, primary_repo_opts
 
   config :store, Store.DirectRepo, direct_repo_opts
+
+  config :store, Oban, queues: [subscriptions: subscriptions_queue_limit]
 
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you

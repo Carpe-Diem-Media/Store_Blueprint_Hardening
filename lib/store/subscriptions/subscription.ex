@@ -33,6 +33,14 @@ defmodule Store.Subscriptions.Subscription do
       public?(false)
     end
 
+    attribute :payment_method_setup_generation, :integer do
+      allow_nil?(false)
+      default(0)
+      constraints(min: 0)
+      public?(false)
+      description("Monotonic authority version that invalidates older payment method setups.")
+    end
+
     attribute :provider, Store.Payments.Types.Provider do
       allow_nil?(false)
       public?(true)
@@ -379,17 +387,32 @@ defmodule Store.Subscriptions.Subscription do
         constraints(min: 1, max: 500)
       end
 
+      argument :after_renewal_at, :utc_datetime_usec do
+        allow_nil?(true)
+      end
+
+      argument :after_id, :uuid do
+        allow_nil?(true)
+      end
+
       filter(
         expr(
           ((status == :active and not is_nil(next_renewal_at) and next_renewal_at <= ^arg(:now)) or
              (status == :past_due and not is_nil(failed_payment_boundary_at) and
                 is_nil(retry_suppressed_at) and
                 (is_nil(next_retry_at) or next_retry_at <= ^arg(:now)))) and
-            cancel_at_period_end == false
+            cancel_at_period_end == false and
+            (is_nil(^arg(:after_id)) or
+               (not is_nil(^arg(:after_renewal_at)) and
+                  (next_renewal_at > ^arg(:after_renewal_at) or
+                     (next_renewal_at == ^arg(:after_renewal_at) and id > ^arg(:after_id)) or
+                     is_nil(next_renewal_at))) or
+               (is_nil(^arg(:after_renewal_at)) and is_nil(next_renewal_at) and
+                  id > ^arg(:after_id)))
         )
       )
 
-      prepare(build(sort: [next_renewal_at: :asc, id: :asc], limit: arg(:limit)))
+      prepare(build(sort: [next_renewal_at: :asc_nils_last, id: :asc], limit: arg(:limit)))
     end
 
     read :read_due_failed_payment_boundary_for_system do
@@ -904,6 +927,37 @@ defmodule Store.Subscriptions.Subscription do
       ])
 
       change(Store.Subscriptions.Changes.AcquireSubscriptionBindingAuthority)
+
+      change(fn changeset, _context ->
+        Ash.Changeset.change_attribute(
+          changeset,
+          :payment_method_setup_generation,
+          changeset.data.payment_method_setup_generation + 1
+        )
+      end)
+
+      change(Store.Subscriptions.Changes.OptimisticAggregateLock)
+    end
+
+    update :advance_payment_method_setup_generation do
+      description(
+        "Supersedes older setups before provider creation, including if creation fails."
+      )
+
+      public?(false)
+      require_atomic?(false)
+      accept([])
+
+      change(Store.Subscriptions.Changes.AcquireSubscriptionBindingAuthority)
+
+      change(fn changeset, _context ->
+        Ash.Changeset.change_attribute(
+          changeset,
+          :payment_method_setup_generation,
+          changeset.data.payment_method_setup_generation + 1
+        )
+      end)
+
       change(Store.Subscriptions.Changes.OptimisticAggregateLock)
     end
   end
@@ -1072,6 +1126,11 @@ defmodule Store.Subscriptions.Subscription do
       access_type(:runtime)
       authorize_if(context_equals(:system?, true))
       authorize_if({Store.Admin.Checks.HasRole, roles: [:super_admin, :admin]})
+    end
+
+    policy action(:advance_payment_method_setup_generation) do
+      access_type(:runtime)
+      authorize_if(context_equals(:system?, true))
     end
   end
 end

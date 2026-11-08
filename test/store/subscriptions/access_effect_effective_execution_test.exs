@@ -2274,7 +2274,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
   end
 
   @tag :jc360_task08
-  test "F1 rejects source-line and plan-revision provenance mismatches" do
+  test "F1 rejects provenance mutations when the stored target fingerprint is retained" do
     fixture = create_committed_effective_effect_fixture!("jc360_wrong_provenance")
     foreign_fixture = create_committed_effective_effect_fixture!("jc360_foreign_provenance")
 
