@@ -1,6 +1,6 @@
 # JC-259 scheduler and worker recovery audit
 
-JC-259 is a structured audit. It permits executable evidence and separate CANDIDATE findings, while preserving the current occurrence identity, claim CAS, collection ownership and dispatch fences. The historical head `8ef4c70dcd5e725212dc0a2e40034d5cc715fbcf` used original JC-258 parent `523326e69a12213ed26f64d56be9d0070cf3b7a5`. The migration targets corrected JC-258 parent `72243c8eb117fd23774bfe3e7a27d5d862d9de14`; canonical main remains `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`. The live prerequisites JC-229, JC-230, JC-237, JC-238, JC-239, JC-242 and JC-252 are Done, and their implementation exists on main.
+JC-259 is a structured audit. It permits executable evidence and separate CANDIDATE findings, while preserving the current occurrence identity, claim CAS, collection ownership and dispatch fences. The historical head `8ef4c70dcd5e725212dc0a2e40034d5cc715fbcf` used original JC-258 parent `523326e69a12213ed26f64d56be9d0070cf3b7a5`. The migration targets corrected JC-258 parent `97ecad23b1ccc928ebeee1c930ea84b116f3712e`; canonical main remains `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`. The live prerequisites JC-229, JC-230, JC-237, JC-238, JC-239, JC-242 and JC-252 are Done, and their implementation exists on main.
 
 ## Current authority and corrections
 
@@ -25,3 +25,7 @@ Use the existing DevCore TEST database and Redis, strict unexpected-request guar
 3. Inspect the complete final diff, run required repository checks and relevant real-connection proofs, and obtain fresh final reviews of the exact head. The historical head's six-green CI result is historical evidence only. The migrated focused six-case run, full repository check, types, TEST migration alignment, 23 required connection tests twice and six other connection cases passed. Specification, quality and stack integration reviews passed for the code and audit package. Fresh CI and independent external re-verification remain pending. Human review and merge remain required.
 
 The audit changes two test modules, two documents and the two required CI command additions. Production, config, schema, shared helpers and inherited audits must remain identical to the corrected parent. Production resource measurements, capacity and convergence remain UNMEASURED. Any focused fixture counts describe those fixtures only.
+
+## Reconciliation correction propagation
+
+The five JC-248 corrections and JC-258 six-action delivery authorization refresh are inherited append-only. Both required physical-test commands preserve all earlier modules and include JC-248 effective execution. This audit's six cases remain unchanged and passed after propagation. The separate pending-delivery stream recovers sender work for APPLIED repairs; it does not create missing source authority or fix the retained completed-job retry gap. Cumulative checks and fresh CI remain required.

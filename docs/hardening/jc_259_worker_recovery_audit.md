@@ -4,9 +4,15 @@
 
 The current scheduler and recovery behavior is NOT_PROVEN_GOOD overall. [JC-370](https://linear.app/jc-dev/issue/JC-370/candidate-keep-governed-renewal-retries-executable-after-technical) records a reproduced defect: a retained completed technical job can suppress a later governed business retry and a permitted immediate retry after payment-method repair. This audit changes tests, documentation and required CI test coverage. It implements no production remediation.
 
-The historical JC-259 head `8ef4c70dcd5e725212dc0a2e40034d5cc715fbcf` was based on JC-258 parent `523326e69a12213ed26f64d56be9d0070cf3b7a5`. This integration uses corrected parent `72243c8eb117fd23774bfe3e7a27d5d862d9de14`; canonical main `12cb5ee4107ca465c9b773b258c1cbae4754b2c7` is unchanged. Live prerequisites JC-229, JC-230, JC-237, JC-238, JC-239, JC-242 and JC-252 are Done, and their relevant capabilities exist on main. September descriptions of absent collection fences, retry exhaustion, independent suspension and durable cancellation are historical. The current dependency is Oban 2.24.1, rather than the issue's old 2.20.3 pin.
+The historical JC-259 head `8ef4c70dcd5e725212dc0a2e40034d5cc715fbcf` was based on JC-258 parent `523326e69a12213ed26f64d56be9d0070cf3b7a5`. This integration uses corrected parent `97ecad23b1ccc928ebeee1c930ea84b116f3712e`; canonical main `12cb5ee4107ca465c9b773b258c1cbae4754b2c7` is unchanged. Live prerequisites JC-229, JC-230, JC-237, JC-238, JC-239, JC-242 and JC-252 are Done, and their relevant capabilities exist on main. September descriptions of absent collection fences, retry exhaustion, independent suspension and durable cancellation are historical. The current dependency is Oban 2.24.1, rather than the issue's old 2.20.3 pin.
 
 The overlap and death proofs use actual worker callbacks, local PostgreSQL and strict unexpected-request guards. The repair fixture permits a local setup-intent response before processing its locally verified receipt. They do not certify live-provider behavior, every crash point or production capacity.
+
+## 2026-11-08 reconciliation correction propagation
+
+This layer inherits all five JC-248 corrections and the refreshed JC-258 inventory append-only. All six worker audit cases passed again, including both physical cases. The two audit modules remain unchanged. Both required CI repetitions retain the original four contention modules and this audit's overlap module, and now also include the JC-248 effective-execution module. No required proof was removed.
+
+APPLIED repair now has a fourth, independently bounded pending-delivery recovery stream. It preserves sender invalidation/PubSub obligations after grant repair, without reopening APPLIED or inventing source authority. JC-248 owns its crash, exhaustion, generation and continuation proofs; this audit does not duplicate them or claim that they resolve JC-370. Remote receiver cache behavior remains separate in JC-374. Cumulative repository checks and exact-head CI are pending. Earlier validation totals below describe their earlier heads.
 
 ## Reproduced retry defect
 
