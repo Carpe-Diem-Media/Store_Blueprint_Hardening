@@ -45,3 +45,15 @@ Old pending notifications remain deliverable after newer authority commits. They
 - Rollback refuses pending obligations and succeeds after delivery. Root checks generated migration and snapshot alignment.
 
 Run targeted tests through a fresh DevCore test suffix before the whole issue's required checks. Obtain fresh specification and quality reviews of the complete R3 diff. Report query counts, cleanup and repeated bounded measurements. Do not certify arbitrary grant-history fanout, memory convergence, remote receipt or production capacity.
+
+## Observed implementation checks
+
+The original actual five-attempt Oban regression failed before the durable obligation existed. The implementation then passed that recovery case and the atomic grant/request rollback case. Five additional fault cases passed after correcting the test's fetched-job `attempted_at` metadata. They cover Cachex failure, process death after commit, process death after publication, an old acknowledgement after a newer generation, and partial recipient delivery.
+
+The execution module passed 67 tests, including real connections, before the final pagination and simultaneous-repair tests were added. This run also includes recovery of an old delivery after a real immediate cancellation, system-action authorization checks and cursor validation. Its bounded resource observations remain limited to the recorded fixtures and do not certify arbitrary source history or production capacity.
+
+The new table rollback regression failed when the generated migration dropped a pending obligation. With the transactional lock and pending check, both isolated cases pass, including a concurrent writer. A quality review found an early readiness assertion outside task cleanup; root moved it inside cleanup and reran both cases successfully. TEST migration alignment passes.
+
+The final two integration cases also pass. Recovery advances a tied cursor past two failed deliveries, reaches later work, excludes a genuinely later insertion from the original sweep, and rediscovers the failed prefix on a fresh sweep. Concurrent repairs prove distinct backends and a PostgreSQL blocker while the first real obligation insert remains uncommitted, then retain one pending generation and the complete recipient union. Root corrected the test's Oban worker-name lookup before the green run. Both required real-connection CI repetitions now include the execution module.
+
+The complete focused run passed 74 tests, including real connections and both migration modules. Types passed with the repository's existing warning filters. Fresh specification and quality reviews found no actionable R3 defect. R5 and final issue-wide checks remain pending; this local result is not exact-head CI certification or merge approval.

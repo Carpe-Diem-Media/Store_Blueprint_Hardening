@@ -49,11 +49,13 @@ defmodule Store.Subscriptions.Facade do
   alias Store.Subscriptions.Queries.{
     AdminSubscriptionIndexQuery,
     AppliedAccessVerificationQuery,
+    PendingAccessRepairDeliveryQuery,
     SubscriptionAccessInventoryQuery,
     UserSubscriptionIndexQuery
   }
 
   alias Store.Subscriptions.{
+    AccessRepairDelivery,
     AccessEffect,
     AccessEffectCurrentnessFence,
     AccessEffectTargetOrder,
@@ -74,6 +76,7 @@ defmodule Store.Subscriptions.Facade do
 
   alias Store.Support.AshNotifications
   alias Store.Support.Errors.{Error, Normalize}
+  alias Store.Support.ID.BinaryUuidSort
   alias Store.Workers.ProcessSubscriptionRenewalWorker
 
   @default_due_limit 100
@@ -551,8 +554,10 @@ defmodule Store.Subscriptions.Facade do
   @doc """
   Repairs subscription grants from a current APPLIED AccessEffect in an owned transaction.
 
-  The repair leaves the AccessEffect unchanged and retries cache and PubSub invalidation after
-  commit, including when the source grants already match the effect.
+  Grant convergence and a sender-side delivery obligation commit together. The complete APPLIED
+  AccessEffect remains unchanged. After commit, invalidation and PubSub publication acknowledge
+  only the delivered generation and recipient snapshot. Periodic recovery can find pending delivery
+  even when the grants already match. Acknowledgement does not prove receipt on every node.
   """
   def repair_applied_access_effect_for_system(effect_id) when is_binary(effect_id) do
     if Repo.in_transaction?() do
@@ -573,7 +578,7 @@ defmodule Store.Subscriptions.Facade do
 
   defp handle_applied_access_effect_repair_transaction({:ok, :stale}), do: {:ok, :stale}
 
-  defp handle_applied_access_effect_repair_transaction({:ok, {outcome, effect, user_ids}}) do
+  defp handle_applied_access_effect_repair_transaction({:ok, {outcome, effect, delivery}}) do
     :ok =
       AshNotifications.notify_post_commit([],
         context: %{
@@ -583,10 +588,7 @@ defmodule Store.Subscriptions.Facade do
         }
       )
 
-    case EntitlementsFacade.invalidate_subscription_source_users_after_commit_for_system(
-           user_ids,
-           "subscription_source_reconciliation"
-         ) do
+    case deliver_applied_source_repair(delivery) do
       :ok -> {:ok, outcome}
       {:error, reason} -> {:error, Normalize.normalize(reason)}
     end
@@ -625,10 +627,188 @@ defmodule Store.Subscriptions.Facade do
     with :ok <- validate_current_access_effect_provenance(effect, subscription_id),
          {:ok, input} <- applied_source_reconciliation_input(effect, subscription_id, user_id),
          {:ok, {outcome, convergence}} <-
-           EntitlementsFacade.reconcile_subscription_source_grants_for_system(input) do
-      {outcome, effect, convergence.projection_user_ids}
+           EntitlementsFacade.reconcile_subscription_source_grants_for_system(input),
+         {:ok, delivery} <-
+           request_applied_source_repair_delivery(
+             effect,
+             convergence.projection_user_ids,
+             outcome
+           ) do
+      {outcome, effect, delivery}
     else
       {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp request_applied_source_repair_delivery(effect, recipient_user_ids, outcome) do
+    if Repo.in_transaction?() do
+      requested_user_ids = BinaryUuidSort.sort_uuids(Enum.uniq(recipient_user_ids))
+
+      with {:ok, current} <- lock_access_repair_delivery(effect.id) do
+        case current do
+          nil ->
+            create_access_repair_delivery(effect.id, requested_user_ids)
+
+          %AccessRepairDelivery{} = delivery ->
+            update_access_repair_delivery_request(delivery, requested_user_ids, outcome)
+        end
+      end
+    else
+      {:error,
+       Error.new("VALIDATION_ERROR", "repair delivery requests require the source transaction")}
+    end
+  end
+
+  defp lock_access_repair_delivery(effect_id) do
+    query =
+      AccessRepairDelivery
+      |> Ash.Query.for_read(:read_for_access_effect, %{access_effect_id: effect_id})
+      |> Ash.Query.lock("FOR UPDATE")
+
+    case Ash.read_one(query,
+           domain: Subscriptions,
+           authorize?: true,
+           context: %{system?: true}
+         ) do
+      {:ok, delivery} -> {:ok, delivery}
+      {:error, reason} -> {:error, Normalize.normalize(reason)}
+    end
+  end
+
+  defp create_access_repair_delivery(effect_id, recipient_user_ids) do
+    changeset =
+      AccessRepairDelivery
+      |> Ash.Changeset.for_create(
+        :create_for_system,
+        %{
+          access_effect_id: effect_id,
+          recipient_user_ids: recipient_user_ids,
+          generation: 1,
+          delivered_generation: 0
+        },
+        context: %{system?: true}
+      )
+
+    case Ash.create(changeset,
+           domain: Subscriptions,
+           authorize?: true,
+           context: %{system?: true}
+         ) do
+      {:ok, %AccessRepairDelivery{} = delivery} -> {:ok, delivery}
+      {:error, reason} -> {:error, Normalize.normalize(reason)}
+    end
+  end
+
+  defp update_access_repair_delivery_request(delivery, requested_user_ids, outcome) do
+    pending? = delivery.delivered_generation < delivery.generation
+
+    recipient_user_ids =
+      if pending? do
+        BinaryUuidSort.sort_uuids(Enum.uniq(delivery.recipient_user_ids ++ requested_user_ids))
+      else
+        requested_user_ids
+      end
+
+    advance_generation? =
+      not pending? or outcome == :repaired or recipient_user_ids != delivery.recipient_user_ids
+
+    if advance_generation? do
+      changeset =
+        Ash.Changeset.for_update(
+          delivery,
+          :request_for_system,
+          %{recipient_user_ids: recipient_user_ids, generation: delivery.generation + 1},
+          context: %{system?: true}
+        )
+
+      case Ash.update(changeset,
+             domain: Subscriptions,
+             authorize?: true,
+             context: %{system?: true}
+           ) do
+        {:ok, %AccessRepairDelivery{} = updated} -> {:ok, updated}
+        {:error, reason} -> {:error, Normalize.normalize(reason)}
+      end
+    else
+      {:ok, delivery}
+    end
+  end
+
+  defp deliver_applied_source_repair(%AccessRepairDelivery{} = delivery) do
+    case EntitlementsFacade.invalidate_subscription_source_users_after_commit_for_system(
+           delivery.recipient_user_ids,
+           "subscription_source_reconciliation"
+         ) do
+      :ok -> acknowledge_applied_source_repair_delivery(delivery)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp acknowledge_applied_source_repair_delivery(delivery) do
+    with {:ok, delivered_at} <- database_wall_clock_now() do
+      query = AccessRepairDelivery |> Ash.Query.filter(expr(id == ^delivery.id))
+
+      result =
+        Ash.bulk_update(
+          query,
+          :acknowledge_for_system,
+          %{
+            generation: delivery.generation,
+            recipient_user_ids: delivery.recipient_user_ids,
+            delivered_at: delivered_at
+          },
+          strategy: [:atomic],
+          return_records?: true,
+          return_errors?: true,
+          notify?: false,
+          authorize?: true,
+          domain: Subscriptions,
+          context: %{system?: true}
+        )
+
+      case result do
+        %Ash.BulkResult{status: :success, records: [_record]} ->
+          :ok
+
+        %Ash.BulkResult{status: :success, records: []} ->
+          verify_repair_delivery_acknowledged(delivery)
+
+        %Ash.BulkResult{status: :success, records: nil, errors: []} ->
+          verify_repair_delivery_acknowledged(delivery)
+
+        %Ash.BulkResult{status: status, errors: errors} ->
+          {:error,
+           Error.new("INTERNAL_ERROR", "repair delivery acknowledgement did not complete", %{
+             bulk_status: status,
+             errors: errors
+           })}
+      end
+    end
+  end
+
+  defp verify_repair_delivery_acknowledged(delivery) do
+    with {:ok, current} <- lock_access_repair_delivery(delivery.access_effect_id),
+         true <-
+           match?(
+             %AccessRepairDelivery{
+               generation: generation,
+               recipient_user_ids: recipient_user_ids,
+               delivered_generation: delivered_generation,
+               delivered_at: delivered_at
+             }
+             when generation == delivery.generation and
+                    recipient_user_ids == delivery.recipient_user_ids and
+                    delivered_generation == generation and not is_nil(delivered_at),
+             current
+           ) do
+      :ok
+    else
+      _ ->
+        {:error,
+         Error.new(
+           "INTERNAL_ERROR",
+           "repair delivery acknowledgement matched no current pending generation"
+         )}
     end
   end
 
@@ -739,17 +919,25 @@ defmodule Store.Subscriptions.Facade do
     {:error, Error.new("VALIDATION_ERROR", "AccessEffect id must be a UUID")}
   end
 
+  @doc """
+  Recovers independently bounded execution, original projection and repair-delivery pages.
+
+  Each stream carries its own cursor under a fixed sweep time. Failed repair deliveries remain
+  pending while their page cursor advances, so later obligations can still be visited.
+  """
   @spec run_subscription_access_effect_recovery_for_system(keyword()) ::
           {:ok,
            %{
              execution_count: non_neg_integer(),
              effective_execution_count: non_neg_integer(),
              projection_count: non_neg_integer(),
+             repair_delivery_count: non_neg_integer(),
              failed_count: non_neg_integer(),
              as_of: DateTime.t(),
              execution_cursor: %{timestamp: DateTime.t(), id: Ecto.UUID.t()} | nil,
              effective_execution_cursor: %{timestamp: DateTime.t(), id: Ecto.UUID.t()} | nil,
-             projection_cursor: %{timestamp: DateTime.t(), id: Ecto.UUID.t()} | nil
+             projection_cursor: %{timestamp: DateTime.t(), id: Ecto.UUID.t()} | nil,
+             repair_delivery_cursor: %{timestamp: DateTime.t(), id: Ecto.UUID.t()} | nil
            }}
           | {:error, Error.t() | term()}
   def run_subscription_access_effect_recovery_for_system(opts \\ [])
@@ -759,9 +947,11 @@ defmodule Store.Subscriptions.Facade do
 
     with :ok <- validate_effective_execution_cursor(opts),
          {:ok, as_of} <- recovery_as_of(opts),
+         :ok <- validate_repair_delivery_cursor(opts, as_of),
          {:ok, projection_effects} <- recovery_effects(opts, :projection, as_of, limit),
          {:ok, recoverable_effects} <- recovery_effects(opts, :execution, as_of, limit),
-         {:ok, effective_effects} <- recovery_effects(opts, :effective_execution, as_of, limit) do
+         {:ok, effective_effects} <- recovery_effects(opts, :effective_execution, as_of, limit),
+         {:ok, repair_deliveries} <- recovery_repair_deliveries(opts, as_of, limit) do
       execution =
         Enum.reduce(recoverable_effects, %{completed: 0, failed: 0}, &execute_effect_result/2)
 
@@ -775,12 +965,18 @@ defmodule Store.Subscriptions.Facade do
           &repair_effect_projection_result/2
         )
 
+      repair_delivery =
+        Enum.reduce(repair_deliveries, %{completed: 0, failed: 0}, &repair_delivery_result/2)
+
       {:ok,
        %{
          execution_count: execution.completed,
          effective_execution_count: effective_execution.completed,
          projection_count: projection.completed,
-         failed_count: execution.failed + effective_execution.failed + projection.failed,
+         repair_delivery_count: repair_delivery.completed,
+         failed_count:
+           execution.failed + effective_execution.failed + projection.failed +
+             repair_delivery.failed,
          as_of: as_of,
          execution_cursor:
            if(Keyword.get(opts, :skip_execution, false),
@@ -796,6 +992,11 @@ defmodule Store.Subscriptions.Facade do
            if(Keyword.get(opts, :skip_projection, false),
              do: nil,
              else: recovery_cursor(projection_effects, limit, :inserted_at)
+           ),
+         repair_delivery_cursor:
+           if(Keyword.get(opts, :skip_repair_delivery, false),
+             do: nil,
+             else: recovery_cursor(repair_deliveries, limit, :inserted_at)
            )
        }}
     end
@@ -10364,6 +10565,34 @@ defmodule Store.Subscriptions.Facade do
     end
   end
 
+  defp recovery_repair_deliveries(opts, as_of, limit) do
+    if Keyword.get(opts, :skip_repair_delivery, false) do
+      {:ok, []}
+    else
+      args = %{
+        as_of: as_of,
+        after_inserted_at: Keyword.get(opts, :repair_delivery_after_inserted_at),
+        after_id: Keyword.get(opts, :repair_delivery_after_id),
+        limit: limit
+      }
+
+      with {:ok, query} <- PendingAccessRepairDeliveryQuery.new(args),
+           input <-
+             Ash.ActionInput.for_action(
+               AccessRepairDelivery,
+               :read_pending_for_system,
+               Map.from_struct(query),
+               domain: Subscriptions,
+               context: %{system?: true}
+             ),
+           {:ok, deliveries} <- Ash.run_action(input, domain: Subscriptions, authorize?: true) do
+        {:ok, deliveries}
+      else
+        {:error, reason} -> {:error, Normalize.normalize(reason)}
+      end
+    end
+  end
+
   defp recovery_as_of(opts) do
     case Keyword.get(opts, :as_of) do
       %DateTime{} = as_of -> {:ok, as_of}
@@ -10429,6 +10658,31 @@ defmodule Store.Subscriptions.Facade do
         {:error,
          Error.new("VALIDATION_ERROR", "EFFECTIVE AccessEffect recovery cursor is invalid")}
     end
+  end
+
+  defp validate_repair_delivery_cursor(opts, as_of) do
+    case {
+      Keyword.get(opts, :repair_delivery_after_inserted_at),
+      Keyword.get(opts, :repair_delivery_after_id)
+    } do
+      {nil, nil} ->
+        :ok
+
+      {%DateTime{} = inserted_at, id} when is_binary(id) ->
+        with {:ok, _canonical_id} <- Ecto.UUID.cast(id),
+             true <- DateTime.compare(inserted_at, as_of) != :gt do
+          :ok
+        else
+          _ -> invalid_repair_delivery_cursor()
+        end
+
+      _ ->
+        invalid_repair_delivery_cursor()
+    end
+  end
+
+  defp invalid_repair_delivery_cursor do
+    {:error, Error.new("VALIDATION_ERROR", "repair delivery recovery cursor is invalid")}
   end
 
   defp target_order_candidates(opts, as_of, limit) do
@@ -10677,6 +10931,13 @@ defmodule Store.Subscriptions.Facade do
 
   defp repair_effect_projection_result(effect, counts) do
     case repair_suspension_access_effect_projection_for_system(effect.id) do
+      :ok -> %{counts | completed: counts.completed + 1}
+      {:error, _reason} -> %{counts | failed: counts.failed + 1}
+    end
+  end
+
+  defp repair_delivery_result(%AccessRepairDelivery{} = delivery, counts) do
+    case deliver_applied_source_repair(delivery) do
       :ok -> %{counts | completed: counts.completed + 1}
       {:error, _reason} -> %{counts | failed: counts.failed + 1}
     end

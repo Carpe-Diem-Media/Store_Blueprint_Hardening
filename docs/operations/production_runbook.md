@@ -122,6 +122,20 @@ CREATE INDEX CONCURRENTLY entitlement_grants_active_subscription_source_index
 
 Recheck `pg_index.indisvalid` and `pg_index.indisready` for both indexes after recovery. Do not run these commands as part of routine rollback without explicit operational authorization.
 
+### Pending access-repair delivery
+
+The later JC-248 migration `20261108015229` stores post-commit repair delivery obligations separately from APPLIED AccessEffects. Periodic access-effect recovery retries pending generations even when grants already match. Completion records successful sender-local cache invalidation and PubSub publication for every stored recipient. It does not prove receiving-node delivery or cache eviction.
+
+Before a schema rollback, inspect the pending count:
+
+```sql
+SELECT count(*) AS pending_repair_deliveries
+FROM public.access_repair_deliveries
+WHERE delivered_generation < generation;
+```
+
+The migration refuses rollback while any generation remains pending. Its transactional table lock also prevents a new request from committing between the check and the drop. Restore the failing cache or publication service and run the existing access-effect recovery worker with compatible application code. Recheck the count after recovery. Do not delete obligations, fabricate acknowledgements, or alter APPLIED effects to bypass the fence. Application rollback can retain this table for later recovery; table removal discards completed operational records only after the pending check succeeds.
+
 ## Incident Response
 - Webhook failures:
   - inspect `webhook_receipts` backlog and failed rows
