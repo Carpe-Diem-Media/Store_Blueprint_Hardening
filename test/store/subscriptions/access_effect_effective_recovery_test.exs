@@ -4,11 +4,14 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
   import Ash.Expr
   require Ash.Query
 
+  alias Store.Entitlements.Cache
   alias Store.Repo
   alias Store.Subscriptions.AccessEffect
   alias Store.Subscriptions.Facade
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
+  alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
+  alias Store.Support.Telemetry.RepoStats
   alias Store.TestSupport.StripeAPIStub
 
   @through_updated_at ~U[2026-10-20 12:00:00.000000Z]
@@ -17,22 +20,25 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     StripeAPIStub.setup_default(context)
   end
 
+  @tag :jc360_task07
   test "EFFECTIVE recovery includes only required, pending, and retryable EFFECTIVE rows" do
     required = create_effect!(:effective)
     pending = create_effect!(:effective) |> transition_to!(:pending)
     failed = create_effect!(:effective) |> transition_to!(:failed_retryable)
     applied = create_effect!(:effective) |> transition_to!(:applied)
-    superseded = create_effect!(:effective)
+
+    superseded_fixture = create_subscription_fixture!()
+    superseded = create_effect!(superseded_fixture, :effective)
+    superseding = supersede_with_newer_effect!(superseded_fixture)
     non_effective = create_effect!(:non_effective)
 
     set_updated_at!(
-      [required, pending, failed, applied, superseded, non_effective],
+      [required, pending, failed, applied, superseded, superseding, non_effective],
       ~U[2026-10-20 11:00:00.000000Z]
     )
 
-    Repo.query!("UPDATE access_effects SET status = 'superseded' WHERE id = $1", [
-      Ecto.UUID.dump!(superseded.id)
-    ])
+    assert fetch_effect!(superseded.id).status == :superseded
+    assert fetch_effect!(superseding.id).status == :applied
 
     ids =
       read_effects!(
@@ -48,6 +54,18 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     refute non_effective.id in ids
   end
 
+  @tag :jc360_task07
+  test "EFFECTIVE recovery read uses its default page limit of 100" do
+    query =
+      AccessEffect
+      |> Ash.Query.for_read(:read_recoverable_effective_for_system, %{
+        through_updated_at: @through_updated_at
+      })
+
+    assert query.arguments.limit == 100
+  end
+
+  @tag :jc360_task07
   test "the through timestamp includes equality and excludes newer updates" do
     eligible = create_effect!(:effective)
     later = create_effect!(:effective)
@@ -68,6 +86,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert selected.id == eligible.id
   end
 
+  @tag :jc360_task07
   test "the updated_at and id cursor paginates tied timestamps without gaps or duplicates" do
     effects = Enum.map(1..4, fn _ -> create_effect!(:effective) end)
     tied_at = ~U[2026-10-20 10:30:00.123456Z]
@@ -104,6 +123,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert_binary_uuid_order!(first_page ++ second_page)
   end
 
+  @tag :jc360_task07
   test "the selector accepts limits 1 and 500 and rejects limits outside that range" do
     first = create_effect!(:effective)
     second = create_effect!(:effective)
@@ -164,6 +184,124 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
              "disposition='effective'andstatusin'required','pending','failed_retryable'"
   end
 
+  @tag :jc360_task11
+  test "recovery, terminal sweep, and selector costs emit bounded measurements" do
+    measured_executions =
+      for status <- [:required, :failed_retryable], sample <- 1..4 do
+        effect = create_effect!(:effective)
+        effect = if status == :failed_retryable, do: transition_to!(effect, status), else: effect
+        recovery_started_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+        {result, stats, duration_us} =
+          measured_operation(fn ->
+            Facade.run_subscription_access_effect_recovery_for_system(
+              limit: 1,
+              as_of: recovery_started_at
+            )
+          end)
+
+        assert {:ok, recovery} = result
+        assert recovery.effective_execution_count == 1
+        assert recovery.effective_execution_cursor.id == effect.id
+        assert fetch_effect!(effect.id).status == :applied
+        assert length(grant_ids_for_source!(effect.subscription_id)) == 1
+
+        print_measurement!("#{status}_recovery", sample, 1, duration_us, stats, %{
+          effect_id: effect.id,
+          source_rows: 1,
+          eligibility_lag_us: DateTime.diff(recovery_started_at, effect.updated_at, :microsecond),
+          items_per_second: 1_000_000 / max(duration_us, 1),
+          lag_clock:
+            "recovery start wall clock minus persisted updated_at; may be nonpositive at timestamp granularity"
+        })
+
+        duration_us
+      end
+
+    terminal_effect = create_effect!(:effective) |> transition_to!(:applied)
+
+    terminal_sweep_durations =
+      for sample <- 1..4 do
+        {result, stats, duration_us} =
+          measured_operation(fn ->
+            Facade.run_subscription_access_effect_recovery_for_system(
+              limit: 10,
+              as_of: ~U[2099-01-01 00:00:00.000000Z]
+            )
+          end)
+
+        assert {:ok, recovery} = result
+        assert recovery.effective_execution_count == 0
+        assert fetch_effect!(terminal_effect.id).status == :applied
+        print_measurement!("terminal_recovery_sweep", sample, 0, duration_us, stats, %{})
+        duration_us
+      end
+
+    selected = Enum.map(1..4, fn _ -> create_effect!(:effective) end)
+    set_updated_at!(selected, ~U[2026-10-20 11:00:00.000000Z])
+
+    selector_durations =
+      for sample <- 1..6 do
+        {rows, stats, duration_us} =
+          measured_operation(fn ->
+            read_effects!(limit: 2, through_updated_at: @through_updated_at)
+          end)
+
+        assert length(rows) == 2
+
+        print_measurement!("recovery_selector_page", sample, 2, duration_us, stats, %{
+          page_limit: 2,
+          selected_ids: Enum.map(rows, & &1.id)
+        })
+
+        duration_us
+      end
+
+    indexes = measured_index_definitions!()
+
+    assert indexes["subscriptions_unique_source_order_line_item_id_index"] =~
+             "UNIQUE INDEX"
+
+    assert indexes["access_effects_unique_subscription_source_version_index"] =~
+             "UNIQUE INDEX"
+
+    assert indexes["entitlement_grants_source_index"] =~
+             "(source_kind, source_id)"
+
+    assert indexes["access_effects_effective_recovery_index"] =~
+             "(updated_at, id)"
+
+    assert indexes["access_effects_effective_recovery_index"] =~
+             "WHERE"
+
+    %{rows: selector_plan_rows} =
+      Repo.query!(
+        "EXPLAIN SELECT id FROM access_effects WHERE disposition = 'effective' AND status IN ('required', 'pending', 'failed_retryable') AND updated_at <= $1 ORDER BY updated_at, id LIMIT 2",
+        [@through_updated_at]
+      )
+
+    selector_plan = Enum.map_join(selector_plan_rows, "\n", fn [line] -> line end)
+
+    IO.puts(
+      Jason.encode!(%{
+        tag: "JC360_MEASUREMENTS",
+        operation: "recovery_summaries",
+        workload_class: "recovery_warm",
+        required_and_failed_retryable_sample_count: length(measured_executions),
+        terminal_sweep_sample_count: length(terminal_sweep_durations),
+        selector_page_sample_count: length(selector_durations),
+        required_and_failed_retryable_latency_us: latency_summary(measured_executions),
+        terminal_sweep_latency_us: latency_summary(terminal_sweep_durations),
+        selector_page_latency_us: latency_summary(selector_durations),
+        index_definitions: indexes,
+        bounded_selector_explain_plan: selector_plan,
+        planner_index_use_claim: "UNMEASURED at fixture volume",
+        limits: "fixture-scoped descriptive observations; no capacity claim"
+      })
+    )
+  end
+
+  @tag :jc360_task07
   test "EFFECTIVE recovery returns its own count and keyset cursor" do
     effect = create_effect!(:effective)
     set_updated_at!([effect], ~U[2026-10-20 11:00:00.000000Z])
@@ -189,6 +327,7 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert fetch_effect!(effect.id).status == :applied
   end
 
+  @tag :jc360_task07
   test "EFFECTIVE recovery rejects either half of its timestamp and id cursor" do
     assert {:error, _error} =
              Facade.run_subscription_access_effect_recovery_for_system(
@@ -205,21 +344,37 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
              )
   end
 
+  @tag :jc360_task08
   test "an exhausted EFFECTIVE stream does not suppress NON_EFFECTIVE or projection work" do
     effective = create_effect!(:effective)
     non_effective = create_effect!(:non_effective)
     projection = create_effect!(:effective)
+    projection_user_id = subscription_user_id!(projection.subscription_id)
 
     Repo.query!("UPDATE subscriptions SET status = 'suspended' WHERE id = $1", [
       Ecto.UUID.dump!(non_effective.subscription_id)
     ])
 
+    assert {:ok, pending_projection} = Facade.mark_access_effect_pending_for_system(projection)
+
+    assert {:ok, applied_projection} =
+             Facade.mark_access_effect_applied_for_system(pending_projection)
+
     Repo.query!(
-      "UPDATE access_effects SET status = 'applied', projection_user_ids = ARRAY[$2]::uuid[] WHERE id = $1",
-      [Ecto.UUID.dump!(projection.id), Ecto.UUID.dump!(projection.subscription_id)]
+      "UPDATE access_effects SET projection_user_ids = ARRAY[$2]::uuid[] WHERE id = $1",
+      [Ecto.UUID.dump!(projection.id), Ecto.UUID.dump!(projection_user_id)]
     )
 
-    set_updated_at!([effective, non_effective, projection], ~U[2026-10-20 11:00:00.000000Z])
+    Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(projection_user_id))
+    cache_value = {:jc360_projection_recovery, projection_user_id}
+    assert {:ok, true} = Cachex.put(Cache, Cache.cache_key(projection_user_id), cache_value)
+
+    projection_grants_before = grant_ids_for_source!(projection.subscription_id)
+
+    set_updated_at!(
+      [effective, non_effective, applied_projection],
+      ~U[2026-10-20 11:00:00.000000Z]
+    )
 
     assert {:ok, result} =
              Facade.run_subscription_access_effect_recovery_for_system(
@@ -246,11 +401,24 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert result.projection_cursor == %{timestamp: projection.inserted_at, id: projection.id}
     assert fetch_effect!(effective.id).status == :required
     assert fetch_effect!(non_effective.id).status == :applied
-    assert %DateTime{} = fetch_effect!(projection.id).projection_delivered_at
+
+    repaired_projection = fetch_effect!(projection.id)
+    assert repaired_projection.status == :applied
+    assert repaired_projection.projection_user_ids == [projection_user_id]
+    assert %DateTime{} = repaired_projection.projection_delivered_at
+    assert grant_ids_for_source!(projection.subscription_id) == projection_grants_before
+    assert {:ok, nil} = Cachex.get(Cache, Cache.cache_key(projection_user_id))
+
+    assert_receive {:entitlements_invalidated, user_id, "effective_access_effect_applied", _at}
+    assert user_id == projection_user_id
   end
 
   defp create_effect!(disposition) do
     fixture = create_subscription_fixture!()
+    create_effect!(fixture, disposition)
+  end
+
+  defp create_effect!(fixture, disposition) do
     subscription = fixture.subscription
     revision = fixture.revision
 
@@ -270,6 +438,22 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     assert {:ok, input} = EstablishAccessEffectInput.new(attrs)
     assert {:ok, effect} = Facade.establish_access_effect_for_system(input)
     effect
+  end
+
+  defp supersede_with_newer_effect!(fixture) do
+    assert %{num_rows: 1} =
+             Repo.query!(
+               "UPDATE subscriptions SET aggregate_version = aggregate_version + 1 WHERE id = $1",
+               [Ecto.UUID.dump!(fixture.subscription.id)]
+             )
+
+    subscription =
+      Subscription
+      |> Ash.Query.filter(expr(id == ^fixture.subscription.id))
+      |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+
+    newer = create_effect!(%{fixture | subscription: subscription}, :effective)
+    transition_to!(newer, :applied)
   end
 
   defp create_subscription_fixture! do
@@ -328,9 +512,85 @@ defmodule Store.Subscriptions.AccessEffectEffectiveRecoveryTest do
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 
+  defp subscription_user_id!(subscription_id) do
+    assert {:ok, %{rows: [[user_id]]}} =
+             Repo.query("SELECT user_id FROM subscriptions WHERE id = $1", [
+               Ecto.UUID.dump!(subscription_id)
+             ])
+
+    Ecto.UUID.load!(user_id)
+  end
+
+  defp grant_ids_for_source!(subscription_id) do
+    assert {:ok, %{rows: rows}} =
+             Repo.query(
+               "SELECT id FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1 ORDER BY id",
+               [Ecto.UUID.dump!(subscription_id)]
+             )
+
+    Enum.map(rows, fn [id] -> Ecto.UUID.load!(id) end)
+  end
+
   defp read_effects!(opts) do
     assert {:ok, effects} = read_effects(opts)
     effects
+  end
+
+  defp measured_operation(fun) do
+    started_at = System.monotonic_time(:microsecond)
+    {result, stats} = RepoStats.capture(fun)
+    {result, stats, System.monotonic_time(:microsecond) - started_at}
+  end
+
+  defp print_measurement!(operation, sample, row_count, duration_us, stats, extra) do
+    IO.puts(
+      Jason.encode!(
+        Map.merge(stats, extra)
+        |> Map.merge(%{
+          tag: "JC360_MEASUREMENTS",
+          operation: operation,
+          sample: sample,
+          sample_count: if(operation == "recovery_selector_page", do: 6, else: 4),
+          row_count: row_count,
+          wall_duration_us: duration_us,
+          queue_time_unit: "native telemetry units",
+          query_time_unit: "native telemetry units",
+          decode_time_unit: "native telemetry units",
+          workload_class: "recovery_warm"
+        })
+      )
+    )
+  end
+
+  defp measured_index_definitions! do
+    assert {:ok, %{rows: rows}} =
+             Repo.query(
+               "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ANY($1)",
+               [
+                 [
+                   "subscriptions_unique_source_order_line_item_id_index",
+                   "access_effects_unique_subscription_source_version_index",
+                   "entitlement_grants_source_index",
+                   "access_effects_effective_recovery_index"
+                 ]
+               ]
+             )
+
+    Map.new(rows, fn [name, definition] -> {name, definition} end)
+  end
+
+  defp percentile(values, fraction) do
+    sorted = Enum.sort(values)
+    index = max(1, ceil(length(sorted) * fraction))
+    Enum.at(sorted, index - 1)
+  end
+
+  defp latency_summary(values) do
+    %{
+      p50_us: percentile(values, 0.50),
+      p95_us: percentile(values, 0.95),
+      p99_us: percentile(values, 0.99)
+    }
   end
 
   defp read_effects(opts) do

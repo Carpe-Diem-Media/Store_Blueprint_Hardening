@@ -5,9 +5,14 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
   @tag timeout: 60_000
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Store.Entitlements.Cache
   alias Store.Entitlements.EntitlementGrant
+  alias Store.Entitlements.Facade, as: EntitlementsFacade
+  alias Store.Entitlements.Types.EntitlementSet
+  alias Store.Orders.{Order, OrderLineItem}
+  alias Store.Payments.PaymentIntent
   alias Store.Repo
-  alias Store.Subscriptions.AccessEffect
+  alias Store.Subscriptions.{AccessEffect, PlanRevision, Subscription, SubscriptionItem}
   alias Store.Subscriptions.Facade
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
   alias Store.SubscriptionsFixtures
@@ -64,6 +69,613 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     after
       cleanup_owned_source!(reconciler_first)
     end
+  end
+
+  @tag :jc360_followup
+  test "concurrent paid-order activation rolls back the losing creator and retries as replay",
+       context do
+    fixture = create_paid_order_activation_source!("jc360_followup_concurrent", 2)
+    run_ref = make_ref()
+    parent = self()
+    handler_id = {__MODULE__, :jc360_followup_source_read, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :repo, :query],
+        fn event, _measurements, metadata, _config ->
+          capture_empty_source_read(event, metadata, parent, run_ref, fixture.line_item.id)
+        end,
+        nil
+      )
+
+    tasks =
+      for _ <- 1..2 do
+        start_paid_order_activation_task(
+          run_ref,
+          fixture.order.id,
+          fixture.line_item.id,
+          context.direct_repo_owner
+        )
+      end
+
+    try do
+      assert_receive {^run_ref, :activation_waiting, pid_a, backend_a}, @task_timeout
+      assert_receive {^run_ref, :activation_waiting, pid_b, backend_b}, @task_timeout
+      refute pid_a == pid_b
+      refute backend_a == backend_b
+      Enum.each(tasks, &send(&1.pid, {run_ref, :run}))
+
+      assert_receive {^run_ref, :source_read_empty, caller_a, read_backend_a}, @task_timeout
+      assert_receive {^run_ref, :source_read_empty, caller_b, read_backend_b}, @task_timeout
+      assert caller_a != caller_b
+      assert Enum.sort([read_backend_a, read_backend_b]) == Enum.sort([backend_a, backend_b])
+      refute_received {^run_ref, :gate_timeout, _, _}
+
+      Enum.each(tasks, &send(&1.pid, {run_ref, :release}))
+
+      results = Enum.map(tasks, &await_activation_result!(&1, run_ref))
+      refute_received {^run_ref, :gate_timeout, _, _}
+      IO.puts("JC360_FOLLOWUP_CONCURRENT raw_results=#{inspect(results)}")
+
+      {successful_results, failed_results} =
+        Enum.split_with(results, &match?({:ok, _result}, &1))
+
+      assert [
+               {:ok,
+                %{
+                  order_id: order_id,
+                  subscription_line_count: 2,
+                  created_count: 2,
+                  skipped_count: 0,
+                  entitlement_issued_count: 2
+                }}
+             ] = successful_results
+
+      assert order_id == fixture.order.id
+      assert [{:error, %{code: "RESERVATION_CONFLICT"}}] = failed_results
+
+      pairs = assert_activation_pairs!(fixture)
+
+      assert {:ok, replay} =
+               Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+      assert replay.order_id == fixture.order.id
+      assert replay.subscription_line_count == 2
+      assert replay.created_count == 0
+      assert replay.skipped_count == 2
+      assert replay.entitlement_issued_count == 0
+
+      replayed_pairs = assert_activation_pairs!(fixture)
+
+      assert Enum.map(replayed_pairs, &activation_pair_ids/1) ==
+               Enum.map(pairs, &activation_pair_ids/1)
+    after
+      try do
+        Enum.each(tasks, &send(&1.pid, {run_ref, :release}))
+        settle_paid_activation_tasks!(tasks, run_ref)
+      after
+        try do
+          :telemetry.detach(handler_id)
+        after
+          cleanup_paid_order_activation_source!(fixture)
+        end
+      end
+    end
+  end
+
+  @tag :jc360_followup
+  @tag :jc360_followup_exact_id
+  test "paid-order dispatch executes the exact returned access effect ID", context do
+    fixture = create_paid_order_activation_source!("jc360_followup_exact_id")
+    run_ref = make_ref()
+    parent = self()
+    handler_id = {__MODULE__, :jc360_followup_effect_commit, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:store, :repo, :query],
+        fn event, _measurements, metadata, _config ->
+          capture_returned_effect_commit(event, metadata, parent, run_ref)
+        end,
+        nil
+      )
+
+    task =
+      start_paid_order_activation_task(
+        run_ref,
+        fixture.order.id,
+        fixture.line_item.id,
+        context.direct_repo_owner
+      )
+
+    try do
+      assert_receive {^run_ref, :activation_waiting, task_pid, caller_backend_pid}, @task_timeout
+      assert task_pid == task.pid
+      send(task.pid, {run_ref, :run})
+
+      assert_receive {^run_ref, :returned_effect_committed, caller_pid, captured_effect_id},
+                     @task_timeout
+
+      assert caller_pid == task.pid
+
+      observer_result =
+        Repo.checkout(fn ->
+          observer_backend_pid = backend_pid!()
+          assert observer_backend_pid != caller_backend_pid
+
+          Repo.transaction(fn ->
+            order = fetch_order!(fixture.order.id)
+            line_item = fetch_order_line_item!(fixture.line_item.id)
+            assert order.state == :paid
+            assert order.user_id == fixture.customer.id
+            assert line_item.order_id == order.id
+            assert line_item.subscription_plan_id_snapshot == fixture.plan.id
+            assert line_item.subscription_plan_revision_id_snapshot == fixture.revision.id
+
+            [subscription] = subscriptions_for_source!(fixture.line_item.id)
+            [item] = subscription_items_for_source!(fixture.line_item.id)
+            assert subscription.source_order_id == order.id
+
+            initial =
+              fetch_effect_for_source_version!(subscription.id, subscription.aggregate_version)
+
+            assert initial.id == captured_effect_id
+            assert initial.status == :required
+            assert initial.subscription_id == subscription.id
+            assert initial.source_version == subscription.aggregate_version
+            assert initial.source_order_line_item_id == fixture.line_item.id
+            assert initial.plan_revision_id == fixture.revision.id
+            assert initial.entitlement_kind == fixture.revision.entitlement_kind
+            assert initial.entitlement_scope_key == fixture.revision.entitlement_scope_key
+            assert initial.valid_from_at == subscription.current_period_start_at
+            assert initial.valid_until_at == subscription.current_period_end_at
+            assert item.subscription_id == subscription.id
+            assert item.source_order_line_item_id == fixture.line_item.id
+
+            assert %{num_rows: 1} =
+                     Repo.query!(
+                       "UPDATE subscriptions SET aggregate_version = aggregate_version + 1 WHERE id = $1",
+                       [
+                         Ecto.UUID.dump!(subscription.id)
+                       ]
+                     )
+
+            {:ok, newer_input} =
+              EstablishAccessEffectInput.new(%{
+                subscription_id: subscription.id,
+                source_version: subscription.aggregate_version + 1,
+                disposition: :effective,
+                entitlement_kind: initial.entitlement_kind,
+                entitlement_scope_key: initial.entitlement_scope_key,
+                valid_from_at: initial.valid_from_at,
+                valid_until_at: initial.valid_until_at,
+                source_order_line_item_id: initial.source_order_line_item_id,
+                contract_change_id: initial.contract_change_id,
+                plan_revision_id: initial.plan_revision_id
+              })
+
+            {:ok, newer} = Facade.establish_access_effect_for_system(newer_input)
+            {subscription, fetch_access_effect!(initial.id), newer}
+          end)
+        end)
+
+      assert {:ok, {subscription, old_effect, newer_effect}} = observer_result
+      assert old_effect.id == captured_effect_id
+      assert old_effect.status == :superseded
+      assert newer_effect.id != old_effect.id
+      assert newer_effect.source_version > old_effect.source_version
+      assert {:ok, current_effect} = Facade.get_current_access_effect_for_system(subscription)
+      assert current_effect.id == newer_effect.id
+      assert grants_for_source!(subscription.id) == []
+
+      send(task.pid, {run_ref, :release})
+      result = await_activation_result!(task, run_ref)
+      refute_received {^run_ref, :gate_timeout, _, _}
+
+      assert result ==
+               {:ok,
+                %{
+                  order_id: fixture.order.id,
+                  subscription_line_count: 1,
+                  created_count: 1,
+                  skipped_count: 0,
+                  entitlement_issued_count: 0
+                }}
+
+      assert fetch_access_effect!(old_effect.id).status == :superseded
+      assert fetch_access_effect!(newer_effect.id).status == :required
+      assert grants_for_source!(subscription.id) == []
+
+      assert {:ok, :applied} =
+               Sandbox.unboxed_run(Repo, fn ->
+                 Facade.execute_effective_access_effect_for_system(newer_effect.id)
+               end)
+
+      assert_effective_grant_for_effect!(newer_effect)
+    after
+      send(task.pid, {run_ref, :release})
+
+      try do
+        settle_paid_activation_task!(task, run_ref)
+      after
+        try do
+          :telemetry.detach(handler_id)
+        after
+          cleanup_paid_order_activation_source!(fixture)
+        end
+      end
+    end
+  end
+
+  @tag :jc360_task09
+  test "cancel now commits a newer target before delayed initial F1 returns terminal noop",
+       context do
+    # This controls the committed-fixture F1 boundary, not the public paid-order facade dispatch.
+    fixture = create_committed_initial_activation_source!("jc360_task09_cancel_first")
+
+    try do
+      assert_committed_initial_activation_source!(fixture)
+
+      :ok = Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(fixture.customer.id))
+      cache_key = Cache.cache_key(fixture.customer.id)
+      assert {:ok, true} = Cachex.put(Cache, cache_key, :jc360_task09_before_cancel)
+
+      run_ref = make_ref()
+      task_a = start_initial_effect_task(run_ref, fixture.effect.id, context.direct_repo_owner)
+
+      try do
+        assert_receive {^run_ref, :initial_f1_waiting, initial_backend_pid, false}, @task_timeout
+
+        assert effect_identity_snapshot!(fixture.subscription.id) == [
+                 {fixture.effect.id, fixture.effect.source_version, :required}
+               ]
+
+        task_b = start_cancel_now_task(run_ref, fixture, context.direct_repo_owner)
+
+        try do
+          assert_receive {^run_ref, :cancel_now_started, cancellation_backend_pid, false},
+                         @task_timeout
+
+          assert initial_backend_pid != cancellation_backend_pid
+          send(task_b.pid, {run_ref, :run_cancel_now})
+
+          assert_receive {^run_ref, :cancel_now_completed, cancel_result, false}, @task_timeout
+          assert_task_exit!(task_b, @task_timeout)
+
+          assert {:ok, %Subscription{status: :canceled} = canceled_result} = cancel_result
+          canceled = fetch_subscription!(fixture.subscription.id)
+          assert cancellation_summary(canceled_result) == cancellation_summary(canceled)
+          assert canceled.status == :canceled
+          assert canceled.canceled_reason == "user_request"
+          assert canceled.aggregate_version > fixture.subscription.aggregate_version
+          assert current_effect_count!(canceled.id, canceled.aggregate_version) == 1
+
+          cancellation_effect =
+            fetch_effect_for_source_version!(canceled.id, canceled.aggregate_version)
+
+          assert cancellation_effect.id != fixture.effect.id
+          assert cancellation_effect.status == :applied
+          assert cancellation_effect.disposition == :non_effective
+          assert cancellation_effect.source_version == canceled.aggregate_version
+          assert cancellation_effect.source_order_line_item_id == fixture.line_item.id
+          assert cancellation_effect.contract_change_id == canceled.current_contract_change_id
+          assert cancellation_effect.plan_revision_id == fixture.revision.id
+          assert cancellation_effect.entitlement_kind == nil
+          assert cancellation_effect.entitlement_scope_key == nil
+          assert cancellation_effect.valid_from_at == nil
+          assert cancellation_effect.valid_until_at == nil
+          assert cancellation_effect.projection_user_ids == [fixture.customer.id]
+          assert %DateTime{} = cancellation_effect.projection_delivered_at
+
+          superseded_before_f1 = fetch_access_effect!(fixture.effect.id)
+          assert superseded_before_f1.status == :superseded
+          effects_before_f1 = effect_identity_snapshot!(fixture.subscription.id)
+
+          assert effects_before_f1 == [
+                   {fixture.effect.id, fixture.effect.source_version, :superseded},
+                   {cancellation_effect.id, canceled.aggregate_version, :applied}
+                 ]
+
+          assert_receive {:entitlements_invalidated, invalidated_user_id,
+                          "non_effective_access_effect_applied", _at},
+                         @task_timeout
+
+          assert invalidated_user_id == fixture.customer.id
+          assert {:ok, nil} = Cachex.get(Cache, cache_key)
+
+          grants_before_f1 = grants_for_source!(fixture.subscription.id)
+          assert grants_before_f1 == []
+
+          assert {:ok, %EntitlementSet{} = projection_before_f1} =
+                   EntitlementsFacade.entitlement_set_for_user(fixture.customer)
+
+          assert projection_before_f1.user_id == fixture.customer.id
+          assert projection_before_f1.grants == []
+
+          send(task_a.pid, {run_ref, :execute_initial_f1})
+
+          assert_receive {^run_ref, :initial_f1_completed, {:ok, :noop}, false}, @task_timeout
+          assert_task_exit!(task_a, @task_timeout)
+
+          superseded_after_f1 = fetch_access_effect!(fixture.effect.id)
+          assert superseded_after_f1.status == :superseded
+          assert fetch_access_effect!(cancellation_effect.id).status == :applied
+          assert effect_identity_snapshot!(fixture.subscription.id) == effects_before_f1
+
+          grants_after_f1 = grants_for_source!(fixture.subscription.id)
+          assert Enum.map(grants_after_f1, & &1.id) == Enum.map(grants_before_f1, & &1.id)
+          assert grants_after_f1 == grants_before_f1
+
+          assert {:ok, ^projection_before_f1} =
+                   EntitlementsFacade.entitlement_set_for_user(fixture.customer)
+
+          assert {:ok, ^projection_before_f1} = Cachex.get(Cache, cache_key)
+
+          IO.puts(
+            "JC360_TASK09 cancellation_first initial_backend_pid=#{initial_backend_pid} " <>
+              "cancellation_backend_pid=#{cancellation_backend_pid} " <>
+              "initial_status_before_f1=#{superseded_before_f1.status} " <>
+              "initial_f1_result=noop grants_unchanged=true"
+          )
+        after
+          send(task_b.pid, {run_ref, :run_cancel_now})
+          await_task_exit!(task_b, @task_timeout)
+        end
+      after
+        send(task_a.pid, {run_ref, :execute_initial_f1})
+        await_task_exit!(task_a, @task_timeout)
+      end
+    after
+      cleanup_owned_source!(fixture)
+      Cachex.del(Cache, Cache.cache_key(fixture.customer.id))
+    end
+  end
+
+  @tag :jc360_task10
+  test "initial F1 locks the source before cancel now and cancellation wins", context do
+    fixture = create_committed_initial_activation_source!("jc360_task10_activation_first")
+
+    try do
+      assert_committed_initial_activation_source!(fixture)
+
+      :ok = Phoenix.PubSub.subscribe(Store.PubSub, Cache.topic(fixture.customer.id))
+      cache_key = Cache.cache_key(fixture.customer.id)
+      assert {:ok, true} = Cachex.put(Cache, cache_key, :jc360_task10_before_activation)
+
+      :ok = Sandbox.checkin(Repo)
+      race = run_activation_locks_first_race!(fixture, context)
+      assert_task10_final_state!(fixture, cache_key, race.cancel_result)
+
+      IO.puts(
+        "JC360_TASK10 activation_first pool_size=#{context.effective_repo_pool_size} " <>
+          "A=#{race.backend_a} B=#{race.backend_b} C=#{race.backend_c} " <>
+          "candidate=#{fixture.effect.id} " <>
+          "C_blocks_A_before_B=#{inspect(race.candidate_blockers_before_cancel)} " <>
+          "C_blocks_A=#{inspect(race.candidate_blockers_before_release)} " <>
+          "A_blocks_B=#{inspect(race.cancellation_blockers)} " <>
+          "C_reconfirmed_blocks_A=true initial=applied cancellation=applied " <>
+          "final_grants=one_revoked projection=empty"
+      )
+    after
+      cleanup_owned_source!(fixture)
+      Cachex.del(Cache, Cache.cache_key(fixture.customer.id))
+    end
+  end
+
+  defp run_activation_locks_first_race!(fixture, context) do
+    run_ref = make_ref()
+
+    barrier =
+      start_candidate_effect_lock_barrier!(
+        run_ref,
+        fixture.effect.id,
+        context.direct_repo_owner
+      )
+
+    try do
+      assert barrier.access_effect_id == fixture.effect.id
+
+      race =
+        run_initial_f1_while_candidate_is_locked!(
+          fixture,
+          context.direct_repo_owner,
+          run_ref,
+          barrier
+        )
+
+      Map.merge(race, %{backend_c: barrier.backend_pid})
+    after
+      release_candidate_effect_barrier!(barrier, run_ref)
+    end
+  end
+
+  defp run_initial_f1_while_candidate_is_locked!(fixture, direct_repo_owner, run_ref, barrier) do
+    task_a = start_initial_effect_task(run_ref, fixture.effect.id, direct_repo_owner)
+
+    try do
+      assert_receive {^run_ref, :initial_f1_waiting, backend_a, false}, @task_timeout
+      assert backend_a != barrier.backend_pid
+
+      send(task_a.pid, {run_ref, :execute_initial_f1})
+
+      candidate_blockers_before_cancel =
+        assert_candidate_effect_blocked_by_barrier!(
+          barrier,
+          run_ref,
+          backend_a,
+          barrier.backend_pid,
+          :initial_f1_waiting_on_candidate
+        )
+
+      cancellation_race =
+        run_cancel_now_while_f1_waits!(
+          fixture,
+          direct_repo_owner,
+          run_ref,
+          barrier,
+          task_a,
+          backend_a
+        )
+
+      Map.merge(cancellation_race, %{
+        backend_a: backend_a,
+        candidate_blockers_before_cancel: candidate_blockers_before_cancel
+      })
+    after
+      send(task_a.pid, {run_ref, :execute_initial_f1})
+      release_candidate_effect_barrier!(barrier, run_ref)
+      await_task_exit!(task_a, @task_timeout)
+    end
+  end
+
+  defp run_cancel_now_while_f1_waits!(
+         fixture,
+         direct_repo_owner,
+         run_ref,
+         barrier,
+         task_a,
+         backend_a
+       ) do
+    task_b = start_cancel_now_task(run_ref, fixture, direct_repo_owner)
+
+    try do
+      assert_receive {^run_ref, :cancel_now_started, backend_b, false}, @task_timeout
+      assert length(Enum.uniq([backend_a, backend_b, barrier.backend_pid])) == 3
+
+      send(task_b.pid, {run_ref, :run_cancel_now})
+
+      cancellation_blockers =
+        assert_candidate_effect_blocked_by_barrier!(
+          barrier,
+          run_ref,
+          backend_b,
+          backend_a,
+          :cancel_now_waiting_on_subscription
+        )
+
+      candidate_blockers_before_release =
+        assert_candidate_effect_blocked_by_barrier!(
+          barrier,
+          run_ref,
+          backend_a,
+          barrier.backend_pid,
+          :initial_f1_still_waiting_on_candidate
+        )
+
+      assert backend_a in cancellation_blockers
+      assert barrier.backend_pid in candidate_blockers_before_release
+      assert {:ok, :released} = release_candidate_effect_barrier!(barrier, run_ref)
+
+      assert_receive {^run_ref, :initial_f1_completed, f1_result, false}, @task_timeout
+      assert_task_exit!(task_a, @task_timeout)
+      assert f1_result == {:ok, :applied}
+      assert fetch_access_effect!(fixture.effect.id).status == :applied
+
+      assert_receive {^run_ref, :cancel_now_completed, cancel_result, false}, @task_timeout
+      assert_task_exit!(task_b, @task_timeout)
+
+      %{
+        backend_b: backend_b,
+        cancellation_blockers: cancellation_blockers,
+        candidate_blockers_before_release: candidate_blockers_before_release,
+        cancel_result: cancel_result
+      }
+    after
+      send(task_b.pid, {run_ref, :run_cancel_now})
+      release_candidate_effect_barrier!(barrier, run_ref)
+      send(task_a.pid, {run_ref, :execute_initial_f1})
+      await_task_exit!(task_b, @task_timeout)
+    end
+  end
+
+  defp assert_task10_final_state!(fixture, cache_key, cancel_response) do
+    assert {:ok, %Subscription{status: :canceled} = cancel_result} = cancel_response
+    canceled = fetch_subscription!(fixture.subscription.id)
+    assert cancellation_summary(cancel_result) == cancellation_summary(canceled)
+    assert canceled.status == :canceled
+    assert canceled.canceled_reason == "user_request"
+    assert canceled.aggregate_version > fixture.subscription.aggregate_version
+
+    initial_effect = fetch_access_effect!(fixture.effect.id)
+    assert initial_effect.status == :applied
+    assert initial_effect.disposition == :effective
+    assert initial_effect.source_order_line_item_id == fixture.line_item.id
+    assert initial_effect.source_version == fixture.subscription.aggregate_version
+
+    assert current_effect_count!(canceled.id, canceled.aggregate_version) == 1
+
+    cancellation_effect =
+      fetch_effect_for_source_version!(canceled.id, canceled.aggregate_version)
+
+    assert cancellation_effect.id != initial_effect.id
+    assert cancellation_effect.source_version > initial_effect.source_version
+    assert cancellation_effect.status == :applied
+    assert cancellation_effect.disposition == :non_effective
+    assert cancellation_effect.source_order_line_item_id == fixture.line_item.id
+    assert cancellation_effect.contract_change_id == canceled.current_contract_change_id
+    assert cancellation_effect.plan_revision_id == fixture.revision.id
+    assert is_nil(cancellation_effect.entitlement_kind)
+    assert is_nil(cancellation_effect.entitlement_scope_key)
+    assert is_nil(cancellation_effect.valid_from_at)
+    assert is_nil(cancellation_effect.valid_until_at)
+    assert cancellation_effect.projection_user_ids == [fixture.customer.id]
+    assert %DateTime{} = cancellation_effect.projection_delivered_at
+
+    assert effect_identity_snapshot!(fixture.subscription.id) == [
+             {initial_effect.id, initial_effect.source_version, :applied},
+             {cancellation_effect.id, canceled.aggregate_version, :applied}
+           ]
+
+    assert_receive {:entitlements_invalidated, user_id, "effective_access_effect_applied", _at},
+                   @task_timeout
+
+    assert_receive {:entitlements_invalidated, cancellation_user_id,
+                    "non_effective_access_effect_applied", _at},
+                   @task_timeout
+
+    assert user_id == fixture.customer.id
+    assert cancellation_user_id == fixture.customer.id
+    assert {:ok, nil} = Cachex.get(Cache, cache_key)
+
+    assert [%EntitlementGrant{} = grant] = grants_for_source!(fixture.subscription.id)
+    assert grant.status == :revoked
+    assert grant.revoked_reason == "canceled_now"
+    assert %DateTime{} = grant.revoked_at
+    assert grant.user_id == fixture.customer.id
+    assert grant.source_kind == :subscription
+    assert grant.source_id == fixture.subscription.id
+    assert grant.kind == fixture.revision.entitlement_kind
+    assert grant.scope_key == fixture.revision.entitlement_scope_key
+    assert grant.valid_from_at == initial_effect.valid_from_at
+    assert grant.valid_to_at == initial_effect.valid_until_at
+    assert active_grants_for!(fixture.subscription.id) == []
+
+    assert %{rows: [[1]]} =
+             Repo.query!(
+               "SELECT count(*) FROM subscriptions WHERE source_order_line_item_id = $1",
+               [Ecto.UUID.dump!(fixture.line_item.id)]
+             )
+
+    assert %{rows: [[1]]} =
+             Repo.query!(
+               "SELECT count(*) FROM subscription_items WHERE source_order_line_item_id = $1",
+               [Ecto.UUID.dump!(fixture.line_item.id)]
+             )
+
+    assert %{rows: [[2]]} =
+             Repo.query!(
+               "SELECT count(*) FROM access_effects WHERE subscription_id = $1",
+               [Ecto.UUID.dump!(fixture.subscription.id)]
+             )
+
+    assert {:ok, %EntitlementSet{} = projection} =
+             EntitlementsFacade.entitlement_set_for_user(fixture.customer)
+
+    assert projection.user_id == fixture.customer.id
+    assert projection.grants == []
+    assert {:ok, ^projection} = Cachex.get(Cache, cache_key)
   end
 
   defp run_race!(fixture, order, direct_repo_owner) do
@@ -237,6 +849,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
         Map.merge(fixture, %{
           customer: customer,
           product: product,
+          variant: variant,
           plan: plan,
           variant_plan: variant_plan,
           candidate: candidate,
@@ -253,6 +866,750 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
 
       {:error, reason} ->
         raise "unable to create target-order contention source: #{inspect(reason)}"
+    end
+  end
+
+  defp create_committed_initial_activation_source!(label) do
+    Repo.transaction(
+      fn ->
+        unique = Ecto.UUID.generate()
+        customer = SubscriptionsFixtures.create_customer!("#{label}_#{unique}")
+
+        %{product: product, variant: variant} =
+          SubscriptionsFixtures.create_subscription_sellable!()
+
+        plan =
+          SubscriptionsFixtures.create_subscription_plan!(%{
+            access_on_cancel: :remove_immediately,
+            entitlement_kind: :digital_library,
+            entitlement_scope_key: "#{label}:#{unique}"
+          })
+
+        variant_plan = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
+
+        fixture =
+          SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
+            create_payment_intent?: true
+          })
+
+        effect =
+          input!(%{
+            subscription_id: fixture.subscription.id,
+            source_version: fixture.subscription.aggregate_version,
+            disposition: :effective,
+            entitlement_kind: fixture.revision.entitlement_kind,
+            entitlement_scope_key: fixture.revision.entitlement_scope_key,
+            valid_from_at: fixture.subscription.current_period_start_at,
+            valid_until_at: fixture.subscription.current_period_end_at,
+            source_order_line_item_id: fixture.line_item.id,
+            contract_change_id: fixture.subscription.current_contract_change_id,
+            plan_revision_id: fixture.revision.id
+          })
+          |> establish_initial_access_effect!()
+
+        Map.merge(fixture, %{
+          customer: customer,
+          product: product,
+          variant: variant,
+          plan: plan,
+          variant_plan: variant_plan,
+          effect: effect
+        })
+      end,
+      timeout: @transaction_timeout
+    )
+    |> case do
+      {:ok, fixture} ->
+        fixture
+
+      {:error, reason} ->
+        raise "unable to create committed initial activation fixture: #{inspect(reason)}"
+    end
+  end
+
+  defp create_paid_order_activation_source!(label, line_count \\ 1) do
+    # Seed activation preconditions without claiming checkout or payment-application evidence.
+    Repo.transaction(
+      fn ->
+        unique = Ecto.UUID.generate()
+        customer = SubscriptionsFixtures.create_customer!("#{label}_#{unique}")
+
+        %{product: product, variant: variant} =
+          SubscriptionsFixtures.create_subscription_sellable!()
+
+        plan =
+          SubscriptionsFixtures.create_subscription_plan!(%{
+            access_on_cancel: :remove_immediately,
+            entitlement_kind: :digital_library,
+            entitlement_scope_key: "#{label}:#{unique}"
+          })
+
+        variant_plan = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
+
+        %{order: order, line_item: line_item, revision: revision} =
+          SubscriptionsFixtures.create_paid_order_with_subscription_line!(
+            customer.id,
+            variant,
+            plan,
+            %{provider_customer_ref: nil, provider_billing_ref: nil}
+          )
+
+        line_items =
+          case line_count do
+            1 -> [line_item]
+            2 -> [line_item, create_additional_subscription_line!(order, line_item, 2)]
+          end
+
+        %{
+          customer: customer,
+          product: product,
+          variant: variant,
+          plan: plan,
+          variant_plan: variant_plan,
+          order: order,
+          line_item: line_item,
+          line_items: line_items,
+          revision: revision
+        }
+      end,
+      timeout: @transaction_timeout
+    )
+    |> case do
+      {:ok, fixture} ->
+        fixture
+
+      {:error, reason} ->
+        raise "unable to create paid-order activation fixture: #{inspect(reason)}"
+    end
+  end
+
+  defp create_additional_subscription_line!(order, source_line_item, line_no) do
+    source_line_item
+    |> Map.from_struct()
+    |> Map.take([
+      :currency,
+      :quantity,
+      :unit_price_minor,
+      :line_total_minor,
+      :sku_snapshot,
+      :product_title_snapshot,
+      :variant_title_snapshot,
+      :variant_id_snapshot,
+      :subscription_plan_id_snapshot,
+      :subscription_plan_revision_id_snapshot,
+      :subscription_plan_key_snapshot,
+      :subscription_interval_unit_snapshot,
+      :subscription_interval_count_snapshot,
+      :discount_allocated_minor,
+      :net_line_total_minor,
+      :tax_category_snapshot,
+      :tax_minor
+    ])
+    |> Map.merge(%{order_id: order.id, line_no: line_no})
+    |> then(fn attributes ->
+      OrderLineItem
+      |> Ash.Changeset.for_create(:create, attributes, context: %{system?: true})
+      |> Ash.create!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+    end)
+  end
+
+  defp start_paid_order_activation_task(run_ref, order_id, line_item_id, direct_repo_owner) do
+    parent = self()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        :ok = Sandbox.allow(Store.DirectRepo, direct_repo_owner, self())
+
+        Repo.checkout(fn ->
+          backend_pid = backend_pid!()
+          Process.put(:jc360_followup_backend_pid, backend_pid)
+          Process.put(:jc360_followup_role, {:activation, order_id, line_item_id})
+          send(parent, {run_ref, :activation_waiting, self(), backend_pid})
+
+          receive do
+            {^run_ref, :run} ->
+              result = Facade.create_subscriptions_from_paid_order_for_system(order_id)
+              send(parent, {run_ref, :activation_result, self(), result})
+              result
+
+            {^run_ref, :release} ->
+              :ok
+          after
+            @task_timeout ->
+              send(parent, {run_ref, :gate_timeout, self(), backend_pid})
+              :ok
+          end
+        end)
+      end)
+
+    %{pid: pid, monitor_ref: monitor_ref}
+  end
+
+  defp capture_empty_source_read(_event, metadata, parent, run_ref, line_item_id) do
+    if match?({:activation, _, ^line_item_id}, Process.get(:jc360_followup_role)) and
+         Process.get(:jc360_followup_source_read_seen) != true and
+         activation_source_read?(metadata, line_item_id) do
+      case metadata[:result] do
+        {:ok, %Postgrex.Result{rows: [], num_rows: 0}} ->
+          Process.put(:jc360_followup_source_read_seen, true)
+          backend_pid = Process.get(:jc360_followup_backend_pid)
+          send(parent, {run_ref, :source_read_empty, self(), backend_pid})
+
+          receive do
+            {^run_ref, :release} -> :ok
+          after
+            @task_timeout -> send(parent, {run_ref, :gate_timeout, self(), backend_pid})
+          end
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defp activation_source_read?(metadata, line_item_id) do
+    query = metadata[:query] |> to_string() |> String.downcase() |> String.replace("\"", "")
+    params = List.wrap(metadata[:params])
+
+    String.contains?(query, "from subscriptions") and
+      String.contains?(query, "source_order_line_item_id") and
+      Enum.any?(params, &(&1 == Ecto.UUID.dump!(line_item_id)))
+  end
+
+  defp capture_returned_effect_commit(_event, metadata, parent, run_ref) do
+    query = metadata[:query] |> to_string() |> String.downcase() |> String.replace("\"", "")
+
+    case metadata[:result] do
+      {:ok, %Postgrex.Result{rows: [row], columns: columns, num_rows: 1}}
+      when is_list(columns) ->
+        capture_effect_insert(query, row, columns)
+
+      {:ok, %Postgrex.Result{command: :commit}} ->
+        gate_returned_effect_commit(parent, run_ref)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp capture_effect_insert(query, row, columns) do
+    if activation_role?() and String.contains?(query, "insert into access_effects") and
+         String.contains?(query, "returning") do
+      case Enum.find_index(columns, &(String.downcase(&1) == "id")) do
+        index when is_integer(index) ->
+          effect_id = normalize_uuid(Enum.at(row, index))
+          Process.put(:jc360_followup_effect_id, effect_id)
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defp gate_returned_effect_commit(parent, run_ref) do
+    if activation_role?() do
+      case Process.delete(:jc360_followup_effect_id) do
+        nil ->
+          :ok
+
+        effect_id ->
+          send(parent, {run_ref, :returned_effect_committed, self(), effect_id})
+
+          receive do
+            {^run_ref, :release} -> :ok
+          after
+            @task_timeout ->
+              send(
+                parent,
+                {run_ref, :gate_timeout, self(), Process.get(:jc360_followup_backend_pid)}
+              )
+          end
+      end
+    end
+  end
+
+  defp activation_role?,
+    do: match?({:activation, _, _}, Process.get(:jc360_followup_role))
+
+  defp normalize_uuid(<<_::128>> = uuid), do: Ecto.UUID.load!(uuid)
+  defp normalize_uuid(uuid), do: Ecto.UUID.cast!(uuid)
+
+  defp await_activation_result!(task, run_ref) do
+    pid = task.pid
+    assert_receive {^run_ref, :activation_result, ^pid, result}, @task_timeout
+    assert_task_exit!(task, @task_timeout)
+    result
+  end
+
+  defp settle_paid_activation_task!(%{pid: pid} = task, run_ref) do
+    send(pid, {run_ref, :release})
+
+    if Process.alive?(pid) do
+      monitor_ref = task.monitor_ref
+
+      receive do
+        {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+      after
+        @task_timeout ->
+          Process.exit(pid, :kill)
+          assert_receive {:DOWN, ^monitor_ref, :process, ^pid, _reason}, 1_000
+      end
+    end
+
+    Process.demonitor(task.monitor_ref, [:flush])
+    :ok
+  end
+
+  defp settle_paid_activation_tasks!([], _run_ref), do: :ok
+
+  defp settle_paid_activation_tasks!([task | tasks], run_ref) do
+    settle_paid_activation_task!(task, run_ref)
+  after
+    settle_paid_activation_tasks!(tasks, run_ref)
+  end
+
+  defp subscriptions_for_source!(line_item_id) do
+    Subscription
+    |> Ash.Query.filter(expr(source_order_line_item_id == ^line_item_id))
+    |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp subscription_items_for_source!(line_item_id) do
+    SubscriptionItem
+    |> Ash.Query.filter(expr(source_order_line_item_id == ^line_item_id))
+    |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp assert_activation_pair!(fixture) do
+    assert [subscription] = subscriptions_for_source!(fixture.line_item.id)
+    assert [item] = subscription_items_for_source!(fixture.line_item.id)
+    assert subscription.source_order_id == fixture.order.id
+    assert subscription.source_order_line_item_id == fixture.line_item.id
+    assert subscription.current_plan_revision_id == fixture.revision.id
+    assert item.subscription_id == subscription.id
+    assert item.source_order_line_item_id == fixture.line_item.id
+    assert [%AccessEffect{} = effect] = effects_for_line!(fixture.line_item.id)
+    assert effect.status == :applied
+    assert effect.disposition == :effective
+    assert effect.subscription_id == subscription.id
+    assert effect.source_order_line_item_id == fixture.line_item.id
+    assert effect.plan_revision_id == fixture.revision.id
+    assert effect.source_version == subscription.aggregate_version
+    assert effect.contract_change_id == nil
+    assert effect.entitlement_kind == fixture.revision.entitlement_kind
+    assert effect.entitlement_scope_key == fixture.revision.entitlement_scope_key
+    assert effect.valid_from_at == subscription.current_period_start_at
+    assert effect.valid_until_at == subscription.current_period_end_at
+    assert AccessEffect.persisted_fingerprint_status(effect) == :v2_match
+    assert [%EntitlementGrant{status: :active} = grant] = grants_for_source!(subscription.id)
+    assert grant.user_id == fixture.customer.id
+    assert grant.kind == effect.entitlement_kind
+    assert grant.scope_key == effect.entitlement_scope_key
+    assert grant.valid_from_at == effect.valid_from_at
+    assert grant.valid_to_at == effect.valid_until_at
+    {subscription, item, effect, grant}
+  end
+
+  defp assert_activation_pairs!(fixture) do
+    Enum.map(fixture.line_items, fn line_item ->
+      fixture
+      |> Map.put(:line_item, line_item)
+      |> assert_activation_pair!()
+    end)
+  end
+
+  defp activation_pair_ids({subscription, item, effect, grant}) do
+    {subscription.id, item.id, effect.id, grant.id}
+  end
+
+  defp effects_for_line!(line_item_id) do
+    AccessEffect
+    |> Ash.Query.filter(expr(source_order_line_item_id == ^line_item_id))
+    |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp assert_effective_grant_for_effect!(effect) do
+    assert [%EntitlementGrant{} = grant] = grants_for_source!(effect.subscription_id)
+    assert grant.status == :active
+    assert grant.kind == effect.entitlement_kind
+    assert grant.scope_key == effect.entitlement_scope_key
+    assert grant.valid_from_at == effect.valid_from_at
+    assert grant.valid_to_at == effect.valid_until_at
+  end
+
+  defp cleanup_paid_order_activation_source!(fixture) do
+    assert {:ok, subscription_ids} =
+             Repo.transaction(
+               fn ->
+                 line_items = Map.get(fixture, :line_items, [fixture.line_item])
+                 line_item_ids = Enum.map(line_items, & &1.id)
+                 order_id = Ecto.UUID.dump!(fixture.order.id)
+                 variant_plan_id = Ecto.UUID.dump!(fixture.variant_plan.id)
+                 revision_id = Ecto.UUID.dump!(fixture.revision.id)
+                 plan_id = Ecto.UUID.dump!(fixture.plan.id)
+                 product_id = Ecto.UUID.dump!(fixture.product.id)
+                 customer_id = Ecto.UUID.dump!(fixture.customer.id)
+                 subscriptions = Enum.flat_map(line_items, &subscriptions_for_source!(&1.id))
+                 subscription_ids = Enum.map(subscriptions, &Ecto.UUID.dump!(&1.id))
+
+                 Enum.each(line_item_ids, fn line_item_id ->
+                   Repo.query!(
+                     "DELETE FROM access_effects WHERE source_order_line_item_id = $1",
+                     [
+                       Ecto.UUID.dump!(line_item_id)
+                     ]
+                   )
+                 end)
+
+                 Enum.each(subscription_ids, fn id ->
+                   Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [id])
+
+                   Repo.query!(
+                     "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+                     [id]
+                   )
+
+                   Repo.query!("DELETE FROM email_outboxes WHERE subscription_id = $1", [id])
+                   Repo.query!("DELETE FROM subscription_items WHERE subscription_id = $1", [id])
+                   Repo.query!("DELETE FROM subscriptions WHERE id = $1", [id])
+                 end)
+
+                 Repo.query!("DELETE FROM email_outboxes WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
+
+                 Enum.each(line_item_ids, fn line_item_id ->
+                   Repo.query!("DELETE FROM order_line_items WHERE id = $1", [
+                     Ecto.UUID.dump!(line_item_id)
+                   ])
+                 end)
+
+                 Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
+
+                 Repo.query!("DELETE FROM variant_subscription_plans WHERE id = $1", [
+                   variant_plan_id
+                 ])
+
+                 Repo.query!("DELETE FROM plan_revisions WHERE id = $1", [revision_id])
+                 Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [plan_id])
+                 Repo.query!("SET CONSTRAINTS products_default_variant_id_fkey DEFERRED")
+                 Repo.query!("DELETE FROM products WHERE id = $1", [product_id])
+                 Repo.query!("DELETE FROM users WHERE id = $1", [customer_id])
+
+                 Enum.each(line_item_ids, fn line_item_id ->
+                   uuid = Ecto.UUID.dump!(line_item_id)
+
+                   assert %{rows: [[0]]} =
+                            Repo.query!(
+                              "SELECT count(*) FROM access_effects WHERE source_order_line_item_id = $1",
+                              [uuid]
+                            )
+
+                   assert %{rows: [[0]]} =
+                            Repo.query!(
+                              "SELECT count(*) FROM subscription_items WHERE source_order_line_item_id = $1",
+                              [uuid]
+                            )
+
+                   assert %{rows: [[0]]} =
+                            Repo.query!(
+                              "SELECT count(*) FROM subscriptions WHERE source_order_line_item_id = $1",
+                              [uuid]
+                            )
+                 end)
+
+                 Enum.map(subscriptions, & &1.id)
+               end,
+               timeout: @transaction_timeout
+             )
+
+    owned_rows = [
+      {"access_effects", "source_order_line_item_id", fixture.line_item.id},
+      {"subscription_items", "source_order_line_item_id", fixture.line_item.id},
+      {"subscriptions", "source_order_line_item_id", fixture.line_item.id},
+      {"email_outboxes", "order_id", fixture.order.id},
+      {"payment_intents", "order_id", fixture.order.id},
+      {"fulfillment_orders", "order_id", fixture.order.id},
+      {"order_adjustments", "order_id", fixture.order.id},
+      {"orders", "id", fixture.order.id},
+      {"variant_subscription_plans", "id", fixture.variant_plan.id},
+      {"plan_revisions", "id", fixture.revision.id},
+      {"subscription_plans", "id", fixture.plan.id},
+      {"variants", "id", fixture.variant.id},
+      {"products", "id", fixture.product.id},
+      {"users", "id", fixture.customer.id}
+    ]
+
+    Enum.each(owned_rows, fn {table, column, id} ->
+      assert %{rows: [[0]]} =
+               Repo.query!("SELECT count(*) FROM #{table} WHERE #{column} = $1", [
+                 Ecto.UUID.dump!(id)
+               ])
+    end)
+
+    Enum.each(Map.get(fixture, :line_items, [fixture.line_item]), fn line_item ->
+      assert %{rows: [[0]]} =
+               Repo.query!("SELECT count(*) FROM order_line_items WHERE id = $1", [
+                 Ecto.UUID.dump!(line_item.id)
+               ])
+    end)
+
+    Enum.each(subscription_ids, fn id ->
+      uuid = Ecto.UUID.dump!(id)
+
+      Enum.each(
+        [
+          {"access_effects", "subscription_id"},
+          {"entitlement_grants", "source_id"},
+          {"subscription_items", "subscription_id"},
+          {"subscriptions", "id"},
+          {"email_outboxes", "subscription_id"}
+        ],
+        fn {table, column} ->
+          assert %{rows: [[0]]} =
+                   Repo.query!("SELECT count(*) FROM #{table} WHERE #{column} = $1", [uuid])
+        end
+      )
+    end)
+
+    Cachex.del(Cache, Cache.cache_key(fixture.customer.id))
+    :ok
+  end
+
+  defp establish_initial_access_effect!(input) do
+    case Facade.establish_access_effect_for_system(input) do
+      {:ok, access_effect} -> access_effect
+      other -> Repo.rollback({:initial_effect_establishment_failed, other})
+    end
+  end
+
+  defp assert_committed_initial_activation_source!(fixture) do
+    order = fetch_order!(fixture.order.id)
+    line_item = fetch_order_line_item!(fixture.line_item.id)
+    payment_intent = fetch_succeeded_payment_intent!(order.id)
+    subscription = fetch_subscription!(fixture.subscription.id)
+    item = fetch_subscription_item!(fixture.item.id)
+    revision = fetch_plan_revision!(fixture.revision.id)
+    effect = fetch_access_effect!(fixture.effect.id)
+
+    assert order.state == :paid
+    assert order.user_id == fixture.customer.id
+    assert payment_intent.order_id == order.id
+    assert line_item.order_id == order.id
+    assert line_item.subscription_plan_id_snapshot == fixture.plan.id
+    assert line_item.subscription_plan_revision_id_snapshot == revision.id
+
+    assert revision.subscription_plan_id == fixture.plan.id
+    assert revision.status in [:effective, :retired]
+    assert revision.access_on_cancel == :remove_immediately
+    assert revision.entitlement_kind == :digital_library
+    assert is_binary(revision.entitlement_scope_key)
+
+    assert subscription.status == :active
+    assert subscription.source_order_id == order.id
+    assert subscription.source_order_line_item_id == line_item.id
+    assert subscription.subscription_plan_id == revision.subscription_plan_id
+    assert subscription.current_plan_revision_id == revision.id
+    assert subscription.aggregate_version == fixture.subscription.aggregate_version
+    assert %DateTime{} = subscription.current_period_start_at
+    assert %DateTime{} = subscription.current_period_end_at
+
+    assert DateTime.compare(
+             subscription.current_period_start_at,
+             subscription.current_period_end_at
+           ) == :lt
+
+    assert item.subscription_id == subscription.id
+    assert item.source_order_line_item_id == line_item.id
+
+    assert %{rows: [[1]]} =
+             Repo.query!(
+               "SELECT count(*) FROM subscriptions WHERE source_order_line_item_id = $1",
+               [Ecto.UUID.dump!(line_item.id)]
+             )
+
+    assert %{rows: [[1]]} =
+             Repo.query!(
+               "SELECT count(*) FROM subscription_items WHERE source_order_line_item_id = $1",
+               [Ecto.UUID.dump!(line_item.id)]
+             )
+
+    assert effect.status == :required
+    assert effect.disposition == :effective
+    assert effect.subscription_id == subscription.id
+    assert effect.source_version == subscription.aggregate_version
+    assert effect.source_order_line_item_id == line_item.id
+    assert effect.contract_change_id == subscription.current_contract_change_id
+    assert effect.plan_revision_id == revision.id
+    assert effect.entitlement_kind == revision.entitlement_kind
+    assert effect.entitlement_scope_key == revision.entitlement_scope_key
+    assert effect.valid_from_at == subscription.current_period_start_at
+    assert effect.valid_until_at == subscription.current_period_end_at
+    assert AccessEffect.persisted_fingerprint_status(effect) == :v2_match
+    assert current_effect_count!(subscription.id, subscription.aggregate_version) == 1
+    assert grants_for_source!(subscription.id) == []
+  end
+
+  defp start_initial_effect_task(run_ref, effect_id, direct_repo_owner) do
+    parent = self()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        :ok = Sandbox.allow(Store.DirectRepo, direct_repo_owner, self())
+
+        Repo.checkout(fn ->
+          backend_pid = backend_pid!()
+          send(parent, {run_ref, :initial_f1_waiting, backend_pid, Repo.in_transaction?()})
+
+          f1_result =
+            receive do
+              {^run_ref, :execute_initial_f1} ->
+                Facade.execute_effective_access_effect_for_system(effect_id)
+            after
+              @task_timeout -> {:error, :initial_f1_release_timeout}
+            end
+
+          send(parent, {run_ref, :initial_f1_completed, f1_result, Repo.in_transaction?()})
+          f1_result
+        end)
+      end)
+
+    %{pid: pid, monitor_ref: monitor_ref}
+  end
+
+  defp start_cancel_now_task(run_ref, fixture, direct_repo_owner) do
+    parent = self()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        :ok = Sandbox.allow(Store.DirectRepo, direct_repo_owner, self())
+
+        Repo.checkout(fn ->
+          backend_pid = backend_pid!()
+          send(parent, {run_ref, :cancel_now_started, backend_pid, Repo.in_transaction?()})
+
+          :ok =
+            receive do
+              {^run_ref, :run_cancel_now} -> :ok
+            after
+              @task_timeout -> {:error, :cancel_now_start_timeout}
+            end
+
+          cancel_result =
+            Facade.cancel_subscription_for_user(
+              fixture.customer,
+              fixture.subscription.id,
+              :now
+            )
+
+          send(parent, {run_ref, :cancel_now_completed, cancel_result, Repo.in_transaction?()})
+          cancel_result
+        end)
+      end)
+
+    %{pid: pid, monitor_ref: monitor_ref}
+  end
+
+  defp start_candidate_effect_lock_barrier!(run_ref, access_effect_id, direct_repo_owner) do
+    parent = self()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        :ok = Sandbox.allow(Store.DirectRepo, direct_repo_owner, self())
+
+        transaction_result =
+          Repo.transaction(
+            fn ->
+              backend_pid = backend_pid!()
+
+              %{rows: [[locked_effect_id]]} =
+                Repo.query!(
+                  "SELECT id FROM access_effects WHERE id = $1 FOR UPDATE",
+                  [Ecto.UUID.dump!(access_effect_id)],
+                  timeout: @task_timeout
+                )
+
+              locked_effect_id = Ecto.UUID.cast!(locked_effect_id)
+
+              send(
+                parent,
+                {run_ref, :candidate_effect_barrier_locked, backend_pid, locked_effect_id}
+              )
+
+              await_candidate_effect_barrier!(run_ref)
+            end,
+            timeout: @transaction_timeout
+          )
+
+        send(parent, {run_ref, :candidate_effect_barrier_completed, transaction_result})
+      end)
+
+    receive do
+      {^run_ref, :candidate_effect_barrier_locked, backend_pid, ^access_effect_id} ->
+        %{
+          pid: pid,
+          monitor_ref: monitor_ref,
+          backend_pid: backend_pid,
+          access_effect_id: access_effect_id
+        }
+    after
+      @task_timeout -> flunk("timed out acquiring the exact candidate AccessEffect row lock")
+    end
+  end
+
+  defp await_candidate_effect_barrier!(run_ref) do
+    receive do
+      {^run_ref, :observe_blockers, blocked_pid, expected_blocker_pid, observer, label} ->
+        blockers = await_blocking_pid!(blocked_pid, expected_blocker_pid)
+
+        send(observer, {run_ref, {:candidate_effect_blockers, label}, blockers})
+        await_candidate_effect_barrier!(run_ref)
+
+      {^run_ref, :release_candidate_effect} ->
+        :released
+    after
+      @transaction_timeout -> Repo.rollback(:candidate_effect_lock_release_timeout)
+    end
+  end
+
+  defp assert_candidate_effect_blocked_by_barrier!(
+         barrier,
+         run_ref,
+         blocked_pid,
+         expected_blocker_pid,
+         label
+       ) do
+    send(
+      barrier.pid,
+      {run_ref, :observe_blockers, blocked_pid, expected_blocker_pid, self(), label}
+    )
+
+    receive do
+      {^run_ref, {:candidate_effect_blockers, ^label}, blockers} ->
+        assert expected_blocker_pid in blockers
+        blockers
+    after
+      @task_timeout -> flunk("timed out observing PostgreSQL blocker evidence for #{label}")
+    end
+  end
+
+  defp release_candidate_effect_barrier!(barrier, run_ref) do
+    if Process.alive?(barrier.pid) do
+      send(barrier.pid, {run_ref, :release_candidate_effect})
+
+      receive do
+        {^run_ref, :candidate_effect_barrier_completed, transaction_result} ->
+          await_task_exit!(barrier, @task_timeout)
+          transaction_result
+      after
+        @task_timeout ->
+          Process.exit(barrier.pid, :kill)
+          flunk("candidate AccessEffect barrier did not finish after release")
+      end
+    else
+      Process.demonitor(barrier.monitor_ref, [:flush])
+      :already_released
     end
   end
 
@@ -340,6 +1697,91 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 
+  defp fetch_order!(order_id) do
+    Ash.get!(Order, order_id, domain: Store.Orders, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_order_line_item!(line_item_id) do
+    Ash.get!(OrderLineItem, line_item_id,
+      domain: Store.Orders,
+      authorize?: false,
+      context: %{system?: true}
+    )
+  end
+
+  defp fetch_succeeded_payment_intent!(order_id) do
+    PaymentIntent
+    |> Ash.Query.filter(expr(order_id == ^order_id and state == :succeeded))
+    |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_plan_revision!(revision_id) do
+    Ash.get!(PlanRevision, revision_id,
+      domain: Store.Subscriptions,
+      authorize?: false,
+      context: %{system?: true}
+    )
+  end
+
+  defp fetch_subscription_item!(item_id) do
+    Ash.get!(SubscriptionItem, item_id,
+      domain: Store.Subscriptions,
+      authorize?: false,
+      context: %{system?: true}
+    )
+  end
+
+  defp cancellation_summary(subscription) do
+    Map.take(subscription, [
+      :id,
+      :status,
+      :aggregate_version,
+      :canceled_at,
+      :ended_at,
+      :canceled_reason,
+      :current_plan_revision_id,
+      :current_period_start_at,
+      :current_period_end_at
+    ])
+  end
+
+  defp grants_for_source!(subscription_id) do
+    EntitlementGrant
+    |> Ash.Query.filter(expr(source_kind == :subscription and source_id == ^subscription_id))
+    |> Ash.Query.sort(id: :asc)
+    |> Ash.read!(domain: Store.Entitlements, authorize?: false, context: %{system?: true})
+  end
+
+  defp effect_identity_snapshot!(subscription_id) do
+    AccessEffect
+    |> Ash.Query.filter(expr(subscription_id == ^subscription_id))
+    |> Ash.Query.sort(source_version: :asc)
+    |> Ash.read!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+    |> Enum.map(&{&1.id, &1.source_version, &1.status})
+  end
+
+  defp assert_task_exit!(%{pid: pid, monitor_ref: monitor_ref}, timeout) do
+    assert_receive {:DOWN, ^monitor_ref, :process, ^pid, :normal}, timeout
+    Process.demonitor(monitor_ref, [:flush])
+    :ok
+  end
+
+  defp await_task_exit!(%{pid: pid, monitor_ref: monitor_ref}, timeout) do
+    if Process.alive?(pid) do
+      receive do
+        {:DOWN, ^monitor_ref, :process, ^pid, :normal} -> :ok
+        {:DOWN, ^monitor_ref, :process, ^pid, reason} -> flunk("task exited: #{inspect(reason)}")
+      after
+        timeout ->
+          Process.exit(pid, :kill)
+          flunk("contention task did not stop after release")
+      end
+    end
+
+    Process.demonitor(monitor_ref, [:flush])
+    :ok
+  end
+
   defp fetch_effect_for_source_version!(subscription_id, source_version) do
     AccessEffect
     |> Ash.Query.filter(
@@ -393,39 +1835,85 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
   end
 
   defp cleanup_owned_source!(fixture) do
-    Repo.transaction(
-      fn ->
-        subscription_id = Ecto.UUID.dump!(fixture.subscription.id)
-        item_id = Ecto.UUID.dump!(fixture.item.id)
-        line_item_id = Ecto.UUID.dump!(fixture.line_item.id)
-        order_id = Ecto.UUID.dump!(fixture.order.id)
-        variant_plan_id = Ecto.UUID.dump!(fixture.variant_plan.id)
-        revision_id = Ecto.UUID.dump!(fixture.revision.id)
-        plan_id = Ecto.UUID.dump!(fixture.plan.id)
-        product_id = Ecto.UUID.dump!(fixture.product.id)
-        customer_id = Ecto.UUID.dump!(fixture.customer.id)
+    assert {:ok, _cleanup_result} =
+             Repo.transaction(
+               fn ->
+                 subscription_id = Ecto.UUID.dump!(fixture.subscription.id)
+                 item_id = Ecto.UUID.dump!(fixture.item.id)
+                 line_item_id = Ecto.UUID.dump!(fixture.line_item.id)
+                 order_id = Ecto.UUID.dump!(fixture.order.id)
+                 variant_plan_id = Ecto.UUID.dump!(fixture.variant_plan.id)
+                 revision_id = Ecto.UUID.dump!(fixture.revision.id)
+                 plan_id = Ecto.UUID.dump!(fixture.plan.id)
+                 product_id = Ecto.UUID.dump!(fixture.product.id)
+                 customer_id = Ecto.UUID.dump!(fixture.customer.id)
 
-        Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [subscription_id])
-        Repo.query!("DELETE FROM entitlement_grants WHERE source_id = $1", [subscription_id])
-        Repo.query!("DELETE FROM subscription_items WHERE id = $1", [item_id])
-        Repo.query!("DELETE FROM subscriptions WHERE id = $1", [subscription_id])
-        Repo.query!("DELETE FROM email_outboxes WHERE order_id = $1", [order_id])
-        Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
-        Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
-        Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
-        Repo.query!("DELETE FROM order_line_items WHERE id = $1", [line_item_id])
-        Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
-        Repo.query!("DELETE FROM variant_subscription_plans WHERE id = $1", [variant_plan_id])
-        Repo.query!("DELETE FROM plan_revisions WHERE id = $1", [revision_id])
-        Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [plan_id])
-        Repo.query!("SET CONSTRAINTS products_default_variant_id_fkey DEFERRED")
-        Repo.query!("DELETE FROM products WHERE id = $1", [product_id])
-        Repo.query!("DELETE FROM users WHERE id = $1", [customer_id])
-      end,
-      timeout: @transaction_timeout
-    )
+                 Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [
+                   subscription_id
+                 ])
 
+                 Repo.query!(
+                   "DELETE FROM entitlement_grants WHERE source_kind = 'subscription' AND source_id = $1",
+                   [subscription_id]
+                 )
+
+                 Repo.query!("DELETE FROM email_outboxes WHERE subscription_id = $1", [
+                   subscription_id
+                 ])
+
+                 Repo.query!("DELETE FROM subscription_items WHERE id = $1", [item_id])
+                 Repo.query!("DELETE FROM subscriptions WHERE id = $1", [subscription_id])
+                 Repo.query!("DELETE FROM email_outboxes WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM order_line_items WHERE id = $1", [line_item_id])
+                 Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
+
+                 Repo.query!("DELETE FROM variant_subscription_plans WHERE id = $1", [
+                   variant_plan_id
+                 ])
+
+                 Repo.query!("DELETE FROM plan_revisions WHERE id = $1", [revision_id])
+                 Repo.query!("DELETE FROM subscription_plans WHERE id = $1", [plan_id])
+                 Repo.query!("SET CONSTRAINTS products_default_variant_id_fkey DEFERRED")
+                 Repo.query!("DELETE FROM products WHERE id = $1", [product_id])
+                 Repo.query!("DELETE FROM users WHERE id = $1", [customer_id])
+               end,
+               timeout: @transaction_timeout
+             )
+
+    assert_owned_fixture_rows_absent!(fixture)
     :ok
+  end
+
+  defp assert_owned_fixture_rows_absent!(fixture) do
+    owned_rows = [
+      {"access_effects", "subscription_id", fixture.subscription.id},
+      {"entitlement_grants", "source_id", fixture.subscription.id},
+      {"subscription_items", "id", fixture.item.id},
+      {"subscriptions", "id", fixture.subscription.id},
+      {"email_outboxes", "subscription_id", fixture.subscription.id},
+      {"email_outboxes", "order_id", fixture.order.id},
+      {"payment_intents", "order_id", fixture.order.id},
+      {"fulfillment_orders", "order_id", fixture.order.id},
+      {"order_adjustments", "order_id", fixture.order.id},
+      {"order_line_items", "id", fixture.line_item.id},
+      {"orders", "id", fixture.order.id},
+      {"variant_subscription_plans", "id", fixture.variant_plan.id},
+      {"plan_revisions", "id", fixture.revision.id},
+      {"subscription_plans", "id", fixture.plan.id},
+      {"variants", "id", fixture.variant.id},
+      {"products", "id", fixture.product.id},
+      {"users", "id", fixture.customer.id}
+    ]
+
+    Enum.each(owned_rows, fn {table, column, id} ->
+      assert %{rows: [[0]]} =
+               Repo.query!("SELECT count(*) FROM #{table} WHERE #{column} = $1", [
+                 Ecto.UUID.dump!(id)
+               ])
+    end)
   end
 
   defp assert_test_database! do
