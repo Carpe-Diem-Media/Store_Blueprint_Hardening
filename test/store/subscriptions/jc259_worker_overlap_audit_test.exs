@@ -29,11 +29,12 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
     :ok
   end
 
-  test "a fresh reader claims while the first pending claim is paused and one collection is submitted" do
+  test "fresh readers claim independently while the same unclaimed collection stays unavailable" do
     fixture = fixture!("staggered")
+    subscription_before = subscription_state!(fixture)
     ref = make_ref()
     parent = self()
-    posts = install_provider_stub!(fixture, ref)
+    StripeAPIStub.stub_unexpected!("unfenced renewal must not contact Stripe")
     handler = attach_claim_barrier!(ref, parent)
     first = start_worker(fixture, ref, :first)
     second_key = {ref, :second}
@@ -66,37 +67,48 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
                      10_000
 
       assert second_stamp != first_stamp
-      assert :ok = Task.await(second, 15_000)
+
+      assert {:cancel,
+              %{
+                code: "RENEWAL_DISPATCH_UNAVAILABLE",
+                meta: %{reason: :provider_revocation_fencing_unsupported}
+              }} = Task.await(second, 15_000)
+
       before_release = identity!(fixture)
       assert before_release.attempt_id == attempt_id
       assert before_release.attempt_count == 1
       assert before_release.collection_count == 1
       assert before_release.payment_intent_count == 1
       assert before_release.collection_ordinal == 1
-      assert before_release.collection_payment_intent_id == before_release.payment_intent_id
-      assert before_release.dispatch_state == "may_have_been_reached"
+      assert is_nil(before_release.collection_payment_intent_id)
+      assert before_release.dispatch_state == "not_started"
       assert before_release.financial_outcome == "unresolved"
-      assert :atomics.get(posts, 1) == 1
-      assert_receive {^ref, :post, params, headers}, 5_000
-      assert_request_identity!(fixture, before_release, params, headers)
+      assert before_release.payment_intent_state == "created"
+      assert before_release.dispatch_epoch == 1
+      assert is_nil(before_release.reservation_generation_id)
+      assert before_release.reservation_count == 0
+      assert before_release.payment_application_count == 0
+      assert is_nil(before_release.provider_payment_id)
+      assert is_nil(before_release.provider_payment_method_ref)
 
       send(first.pid, {ref, :release_claim})
 
-      assert {:error,
-              %{code: "PAYMENT_OUTCOME_UNRESOLVED", meta: %{existing_collection_replay?: true}}} =
-               Task.await(first, 15_000)
+      assert {:cancel,
+              %{
+                code: "RENEWAL_DISPATCH_UNAVAILABLE",
+                meta: %{reason: :provider_revocation_fencing_unsupported}
+              }} = Task.await(first, 15_000)
 
       after_release = identity!(fixture)
       assert after_release == before_release
-      assert :atomics.get(posts, 1) == 1
+      assert after_release.dispatch_state == "not_started"
+      assert subscription_state!(fixture) == subscription_before
 
       assert [["active", 0]] ==
                Repo.query!(
                  "SELECT status, dunning_attempt_count FROM subscriptions WHERE id=$1",
                  [Ecto.UUID.dump!(fixture.subscription.id)]
                ).rows
-
-      refute_receive {^ref, :post, _, _}, 0
     after
       send(first.pid, {ref, :release_claim})
       if second = Process.get(second_key), do: send(second.pid, {ref, :release_claim})
@@ -107,11 +119,12 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
     end
   end
 
-  test "death after persisted checkout preparation resumes the same processing occurrence before dispatch" do
+  test "death after persisted checkout preparation preserves the same unavailable occurrence" do
     fixture = fixture!("prepared_crash")
+    subscription_before = subscription_state!(fixture)
     ref = make_ref()
     parent = self()
-    posts = install_provider_stub!(fixture, ref)
+    StripeAPIStub.stub_unexpected!("unfenced renewal must not contact Stripe")
     handler = {__MODULE__, ref, :prepared}
 
     :ok =
@@ -147,10 +160,16 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
       assert prepared.dispatch_state == "not_started"
       assert prepared.financial_outcome == "unresolved"
       assert prepared.collection_payment_intent_id == nil
+      assert prepared.payment_intent_state == "created"
+      assert prepared.dispatch_epoch == 1
+      assert is_nil(prepared.reservation_generation_id)
+      assert prepared.reservation_count == 0
+      assert prepared.payment_application_count == 0
+      assert is_nil(prepared.provider_payment_id)
+      assert is_nil(prepared.provider_payment_method_ref)
       assert prepared.attempt_count == 1
       assert prepared.collection_count == 1
       assert prepared.payment_intent_count == 1
-      assert :atomics.get(posts, 1) == 0
       Process.unlink(worker.pid)
       Process.exit(worker.pid, :kill)
       assert_receive {:DOWN, monitor, :process, pid, :killed}, 5_000
@@ -158,7 +177,11 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
       assert pid == worker.pid
       :telemetry.detach(handler)
 
-      assert :ok =
+      assert {:cancel,
+              %{
+                code: "RENEWAL_DISPATCH_UNAVAILABLE",
+                meta: %{reason: :provider_revocation_fencing_unsupported}
+              }} =
                ProcessSubscriptionRenewalWorker.perform(%Oban.Job{
                  args: %{"subscription_id" => fixture.subscription.id}
                })
@@ -178,14 +201,17 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
       ]
 
       assert Map.take(recovered, keys) == Map.take(prepared, keys)
-      assert recovered.collection_payment_intent_id == prepared.payment_intent_id
+      assert is_nil(recovered.collection_payment_intent_id)
       assert recovered.attempt_status == "processing"
-      assert recovered.dispatch_state == "may_have_been_reached"
+      assert recovered.dispatch_state == "not_started"
       assert recovered.financial_outcome == "unresolved"
-      assert :atomics.get(posts, 1) == 1
-      assert_receive {^ref, :post, params, headers}, 5_000
-      assert_request_identity!(fixture, recovered, params, headers)
-      refute_receive {^ref, :post, _, _}, 0
+      assert recovered.payment_intent_state == "created"
+      assert recovered.dispatch_epoch == 1
+      assert is_nil(recovered.reservation_generation_id)
+      assert recovered.reservation_count == 0
+      assert recovered.payment_application_count == 0
+      assert recovered == prepared
+      assert subscription_state!(fixture) == subscription_before
     after
       send(worker.pid, {ref, :release_prepared})
       :telemetry.detach(handler)
@@ -263,71 +289,16 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
 
   defp await_claim_release(_ref, _role), do: :ok
 
-  defp install_provider_stub!(fixture, ref) do
-    parent = self()
-    posts = :atomics.new(1, [])
-    cache = start_supervised!({Agent, fn -> nil end})
-
-    StripeAPIStub.stub_observation(fn conn ->
-      observe_provider_request(conn, fixture, ref, parent, posts, cache)
-    end)
-
-    posts
-  end
-
-  defp observe_provider_request(
-         %Plug.Conn{method: "POST", request_path: "/v1/payment_intents"} = conn,
-         fixture,
-         ref,
-         parent,
-         posts,
-         cache
-       ) do
-    params = StripeAPIStub.form_params(conn)
-    assert params["customer"] == fixture.refs.provider_customer
-    assert params["payment_method"] == fixture.refs.old_method
-    body = StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-    :atomics.add(posts, 1, 1)
-    Agent.update(cache, fn _ -> body end)
-    send(parent, {ref, :post, params, Plug.Conn.get_req_header(conn, "idempotency-key")})
-    StripeAPIStub.json_response(conn, body)
-  end
-
-  defp observe_provider_request(
-         %Plug.Conn{method: "GET", request_path: path} = conn,
-         _fixture,
-         _ref,
-         _parent,
-         _posts,
-         cache
-       ) do
-    body = Agent.get(cache, & &1)
-    assert is_map(body)
-    assert path == "/v1/payment_intents/#{body["id"]}"
-    assert Plug.Conn.get_req_header(conn, "idempotency-key") == []
-    StripeAPIStub.json_response(conn, body)
-  end
-
-  defp observe_provider_request(conn, _fixture, _ref, _parent, _posts, _cache) do
-    flunk("unexpected JC259 provider request: #{inspect({conn.method, conn.request_path})}")
-  end
-
-  defp assert_request_identity!(fixture, identity, params, headers) do
-    assert params["metadata[local_intent_id]"] == identity.payment_intent_id
-    assert params["metadata[renewal_attempt_id]"] == identity.attempt_id
-    assert params["metadata[collection_attempt_id]"] == identity.collection_id
-    assert params["metadata[subscription_id]"] == fixture.subscription.id
-    assert params["metadata[renewal_key]"] == identity.renewal_key
-    assert params["metadata[order_id]"] == identity.order_id
-    assert headers == [identity.request_reference]
-  end
-
   defp identity!(fixture) do
     sql = """
     SELECT a.id::text, a.order_id::text, a.renewal_key, a.status,
            c.id::text, c.collection_ordinal, c.payment_intent_id::text,
            c.dispatch_state, c.financial_outcome,
-           p.id::text, p.provider_request_reference,
+           p.id::text, p.provider_request_reference, p.state::text,
+           p.provider_payment_id, p.provider_payment_method_ref,
+           c.dispatch_epoch, c.reservation_generation_id::text,
+           (SELECT count(*) FROM inventory_reservations r WHERE r.order_id=a.order_id AND position(':renewal_collection:' in r.reservation_key)>0),
+           (SELECT count(*) FROM payment_applications pa WHERE pa.order_id=a.order_id),
            (SELECT count(*) FROM renewal_attempts x WHERE x.subscription_id=a.subscription_id),
            (SELECT count(*) FROM renewal_collection_attempts x WHERE x.renewal_attempt_id=a.id),
            (SELECT count(*) FROM payment_intents x WHERE x.order_id=a.order_id)
@@ -352,12 +323,36 @@ defmodule Store.Subscriptions.JC259WorkerOverlapAuditTest do
       :financial_outcome,
       :payment_intent_id,
       :request_reference,
+      :payment_intent_state,
+      :provider_payment_id,
+      :provider_payment_method_ref,
+      :dispatch_epoch,
+      :reservation_generation_id,
+      :reservation_count,
+      :payment_application_count,
       :attempt_count,
       :collection_count,
       :payment_intent_count
     ]
 
     Map.new(Enum.zip(keys, row))
+  end
+
+  defp subscription_state!(fixture) do
+    [state] =
+      Repo.query!(
+        """
+        SELECT status, billing_status_reason, past_due_since_at, failed_payment_boundary_at,
+               dunning_attempt_count, next_retry_at, retry_suppressed_at,
+               current_period_start_at, current_period_end_at, next_renewal_at,
+               provider_customer_ref, provider_billing_ref, stored_payment_method_id,
+               payment_method_setup_generation
+        FROM subscriptions WHERE id=$1
+        """,
+        [Ecto.UUID.dump!(fixture.subscription.id)]
+      ).rows
+
+    state
   end
 
   defp fixture!(label) do

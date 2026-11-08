@@ -7,8 +7,9 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Store.Catalog.Variant
+  alias Store.Payments.Facade, as: PaymentsFacade
+  alias Store.Payments.Inputs.ObservePaymentIntentInput
   alias Store.Payments.PaymentIntent
-  alias Store.Payments.Types.ProviderObservation
   alias Store.Repo
 
   alias Store.Subscriptions.{
@@ -24,6 +25,7 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
   alias Store.Subscriptions.Inputs.QueueSubscriptionPlanChangeInput
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
   alias Store.Workers.ProcessSubscriptionRenewalWorker
 
@@ -168,7 +170,7 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
     assert current_contract_change(fixture.subscription_id).id == rescinded_change.id
   end
 
-  test "B commits before scheduled cancellation and the same occurrence reaches C" do
+  test "B commits before scheduled cancellation and preserves the unclaimed occurrence" do
     # INVARIANT=B commits before scheduling, so cancellation binds to and preserves that occurrence.
     # PRODUCTION_MUTATION_THAT_WOULD_BREAK_THIS_TEST=replace the B-bound attempt or collection after scheduling.
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
@@ -242,24 +244,25 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
     assert :atomics.get(post_count, 1) == 0
 
     send(task_pid, {:release_dispatch_barrier, barrier})
-    assert {:ok, :processed} = Task.await(task, 10_000)
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} = Task.await(task, 10_000)
 
     [attempt_after] = renewal_attempts(fixture.subscription_id)
     collection_after = fetch_collection!(collection_before.id)
     assert attempt_after.id == attempt_before.id
     assert collection_after.id == collection_before.id
     assert collection_after.renewal_attempt_id == attempt_before.id
-    assert collection_after.dispatch_state == :may_have_been_reached
+    assert collection_after.dispatch_state == :not_started
+    assert collection_after.financial_outcome == :unresolved
     assert count_collections(fixture.subscription_id) == 1
-    assert :atomics.get(post_count, 1) == 1
+    assert :atomics.get(post_count, 1) == 0
 
     current = fetch_subscription!(fixture.subscription_id)
     assert current.cancel_after_renewal_attempt_id == attempt_before.id
     assert is_nil(current.cancel_at_period_end_at)
   end
 
-  test "immediate cancellation after B fences the exact collection before C" do
-    # INVARIANT=immediate cancellation wins before C and fences the exact not-started collection.
+  test "immediate cancellation after B withdraws authority from the unclaimed collection" do
+    # INVARIANT=immediate cancellation withdraws renewal authority while the collection stays unclaimed.
     # PRODUCTION_MUTATION_THAT_WOULD_BREAK_THIS_TEST=allow a provider claim after immediate cancellation.
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
@@ -325,17 +328,32 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
     assert :atomics.get(post_count, 1) == 0
 
     send(task_pid, {:release_dispatch_barrier, barrier})
-    assert {:ok, :processed} = Task.await(task, 10_000)
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} = Task.await(task, 10_000)
 
     [attempt_after] = renewal_attempts(fixture.subscription_id)
     collection_after = fetch_collection!(collection_before.id)
     assert attempt_after.id == attempt_before.id
     assert attempt_after.failure_code == "RENEWAL_AUTHORITY_WITHDRAWN"
     assert collection_after.id == collection_before.id
-    assert collection_after.dispatch_state == :not_submitted
+    assert collection_after.dispatch_state == :not_started
+    assert collection_after.financial_outcome == :unresolved
+    assert collection_after.reservation_generation_id == nil
     assert count_collections(fixture.subscription_id) == 1
     assert :atomics.get(post_count, 1) == 0
     assert fetch_subscription!(fixture.subscription_id).status == :canceled
+
+    assert {:ok, :noop} =
+             unboxed(fn ->
+               Facade.process_due_subscription_renewal_for_system(fixture.subscription_id,
+                 now: DateTime.add(now, 86_400, :second)
+               )
+             end)
+
+    assert [same_attempt] = renewal_attempts(fixture.subscription_id)
+    assert same_attempt.id == attempt_before.id
+    assert fetch_collection!(collection_before.id) == collection_after
+    assert count_collections(fixture.subscription_id) == 1
+    assert :atomics.get(post_count, 1) == 0
   end
 
   test "an unpaid B-bound occurrence stays awaiting until exact commercial reconciliation" do
@@ -349,19 +367,14 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
       )
 
     on_exit(fn -> cleanup_committed_subscription_fixture!(fixture) end)
-    enable_stripe!()
-    StripeAPIStub.stub_payment_intent(&processing_payment_response/2)
+    StripeAPIStub.stub_unexpected!("reached renewal must not submit another charge")
 
-    assert {:ok, :processed} =
-             unboxed(fn ->
-               Facade.process_due_subscription_renewal_for_system(fixture.subscription_id,
-                 now: now
-               )
-             end)
+    reached =
+      unboxed(fn -> ReachedRenewalFixtures.prepare_reached!(fixture.subscription_id, now) end)
 
-    [attempt] = renewal_attempts(fixture.subscription_id)
+    attempt = reached.attempt
     assert DateTime.compare(attempt.period_end_at, now) == :lt
-    collection = fetch_collection_for_attempt!(attempt.id)
+    collection = reached.collection
 
     assert {:ok, scheduled} =
              unboxed(fn ->
@@ -409,15 +422,24 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
     assert_receive {:repo_query_barrier, ^barrier, ^task_pid, query}, 5_000
     assert scheduled_selector_query?(query)
 
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
+    payment_intent = reached.payment_intent
 
-    assert {:ok, %{outcome: :authoritative_success}} =
+    StripeAPIStub.stub_payment_observation(
+      payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "succeeded")
+    )
+
+    assert {:ok, observed} =
              unboxed(fn ->
-               Store.Payments.record_and_apply_payment_observation_for_system(
-                 payment_intent,
-                 authoritative_success_observation(payment_intent)
-               )
+               PaymentsFacade.observe_payment_intent_for_system(%ObservePaymentIntentInput{
+                 payment_intent_id: payment_intent.id
+               })
              end)
+
+    assert {:ok, %{outcome: outcome}} =
+             unboxed(fn -> PaymentsFacade.apply_observed_payment_outcome_for_system(observed) end)
+
+    assert outcome in [:authoritative_success, :already_applied_success]
 
     assert fetch_collection!(collection.id).financial_outcome == :verified_success
     assert count_payment_applications(attempt.order_id) == 1
@@ -867,23 +889,27 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
       )
 
     on_exit(fn -> cleanup_committed_subscription_fixture!(fixture) end)
-    enable_stripe!()
     owner = self()
-    post_count = :atomics.new(1, [])
-    barrier = :provider_post_after_c
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      :atomics.add(post_count, 1, 1)
-      send(owner, {:provider_post, self(), params})
+    reached =
+      unboxed(fn -> ReachedRenewalFixtures.prepare_reached!(fixture.subscription_id, now) end)
+
+    barrier = :provider_observation_after_c
+    observation = ReachedRenewalFixtures.observation_body(reached, "succeeded")
+
+    StripeAPIStub.stub_observation(fn conn ->
+      assert conn.method == "GET"
+
+      assert conn.request_path ==
+               "/v1/payment_intents/#{reached.payment_intent.provider_payment_id}"
+
+      send(owner, {:provider_observation, self()})
 
       receive do
-        {:release_provider_post, ^barrier} ->
-          StripeAPIStub.json_response(
-            conn,
-            StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-          )
+        {:release_provider_observation, ^barrier} ->
+          StripeAPIStub.json_response(conn, observation)
       after
-        10_000 -> raise "timed out at provider POST barrier after C"
+        10_000 -> raise "timed out at exact-ID observation barrier after cancellation"
       end
     end)
 
@@ -896,10 +922,9 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
         end)
       end)
 
-    assert_receive {:provider_post, provider_pid, _params}, 5_000
-    assert :atomics.get(post_count, 1) == 1
-    [attempt_before] = renewal_attempts(fixture.subscription_id)
-    collection_before = fetch_collection_for_attempt!(attempt_before.id)
+    assert_receive {:provider_observation, provider_pid}, 5_000
+    attempt_before = reached.attempt
+    collection_before = reached.collection
 
     assert collection_before.dispatch_state == :may_have_been_reached
 
@@ -917,17 +942,9 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
     assert fetch_collection!(collection_before.id).dispatch_state == :may_have_been_reached
     assert count_collections(fixture.subscription_id) == 1
 
-    send(provider_pid, {:release_provider_post, barrier})
+    send(provider_pid, {:release_provider_observation, barrier})
     assert {:ok, :processed} = Task.await(task, 10_000)
-    payment_intent = fetch_payment_intent!(attempt_before.payment_intent_id)
-
-    assert {:ok, %{outcome: :authoritative_success}} =
-             unboxed(fn ->
-               Store.Payments.record_and_apply_payment_observation_for_system(
-                 payment_intent,
-                 authoritative_success_observation(payment_intent)
-               )
-             end)
+    payment_intent = fetch_payment_intent!(reached.payment_intent.id)
 
     assert fetch_collection!(collection_before.id).financial_outcome == :verified_success
     assert fetch_payment_intent!(payment_intent.id).state == :succeeded
@@ -954,7 +971,7 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
     assert count_collections(fixture.subscription_id) == 1
     assert count_payment_applications(attempt_before.order_id) == 1
     assert count_refunds_for(attempt_before.order_id, payment_intent.id) == 1
-    assert :atomics.get(post_count, 1) == 1
+    assert payment_intent.state == :succeeded
 
     assert {:ok, :noop} =
              unboxed(fn ->
@@ -964,7 +981,7 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
              end)
 
     assert count_collections(fixture.subscription_id) == 1
-    assert :atomics.get(post_count, 1) == 1
+    assert fetch_payment_intent!(payment_intent.id).state == :succeeded
   end
 
   test "immediate cancellation after C blocks a future collection after verified non-success" do
@@ -979,23 +996,27 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
       )
 
     on_exit(fn -> cleanup_committed_subscription_fixture!(fixture) end)
-    enable_stripe!()
     owner = self()
-    post_count = :atomics.new(1, [])
-    barrier = :provider_post_after_c_failure
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      :atomics.add(post_count, 1, 1)
-      send(owner, {:provider_post, self(), params})
+    reached =
+      unboxed(fn -> ReachedRenewalFixtures.prepare_reached!(fixture.subscription_id, now) end)
+
+    barrier = :provider_observation_after_c_failure
+    observation = ReachedRenewalFixtures.observation_body(reached, "canceled")
+
+    StripeAPIStub.stub_observation(fn conn ->
+      assert conn.method == "GET"
+
+      assert conn.request_path ==
+               "/v1/payment_intents/#{reached.payment_intent.provider_payment_id}"
+
+      send(owner, {:provider_observation, self()})
 
       receive do
-        {:release_provider_post, ^barrier} ->
-          StripeAPIStub.json_response(
-            conn,
-            StripeAPIStub.payment_intent_response(params, %{"status" => "canceled"})
-          )
+        {:release_provider_observation, ^barrier} ->
+          StripeAPIStub.json_response(conn, observation)
       after
-        10_000 -> raise "timed out at provider POST barrier after C"
+        10_000 -> raise "timed out at exact-ID observation barrier after cancellation"
       end
     end)
 
@@ -1008,9 +1029,9 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
         end)
       end)
 
-    assert_receive {:provider_post, provider_pid, _params}, 5_000
-    [attempt_before] = renewal_attempts(fixture.subscription_id)
-    collection_before = fetch_collection_for_attempt!(attempt_before.id)
+    assert_receive {:provider_observation, provider_pid}, 5_000
+    attempt_before = reached.attempt
+    collection_before = reached.collection
     assert collection_before.dispatch_state == :may_have_been_reached
 
     assert {:ok, canceled} =
@@ -1025,18 +1046,10 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
     assert canceled.status == :canceled
     assert fetch_collection!(collection_before.id).id == collection_before.id
 
-    send(provider_pid, {:release_provider_post, barrier})
+    send(provider_pid, {:release_provider_observation, barrier})
     assert {:ok, :processed} = Task.await(task, 10_000)
 
-    payment_intent = fetch_payment_intent!(attempt_before.payment_intent_id)
-
-    assert {:ok, %{outcome: :verified_terminal_non_success}} =
-             unboxed(fn ->
-               Store.Payments.record_and_apply_payment_observation_for_system(
-                 payment_intent,
-                 terminal_failure_observation(payment_intent)
-               )
-             end)
+    payment_intent = fetch_payment_intent!(reached.payment_intent.id)
 
     terminal_collection = fetch_collection!(collection_before.id)
     [attempt_after] = renewal_attempts(fixture.subscription_id)
@@ -1044,6 +1057,7 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
     assert terminal_collection.id == collection_before.id
     assert terminal_collection.dispatch_state == :may_have_been_reached
     assert terminal_collection.financial_outcome == :verified_terminal_financial_non_success
+    assert payment_intent.state == :failed
     assert count_collections(fixture.subscription_id) == 1
     assert count_payment_applications(attempt_before.order_id) == 0
 
@@ -1056,7 +1070,6 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
 
     assert fetch_subscription!(fixture.subscription_id).status == :canceled
     assert count_collections(fixture.subscription_id) == 1
-    assert :atomics.get(post_count, 1) == 1
   end
 
   defp telemetry_handler_id(prefix) do
@@ -1141,13 +1154,6 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
   end
 
   defp scheduled_selector_query?(_query), do: false
-
-  defp processing_payment_response(conn, params) do
-    StripeAPIStub.json_response(
-      conn,
-      StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-    )
-  end
 
   defp unboxed(fun) when is_function(fun, 0) do
     Sandbox.unboxed_run(Repo, fn ->
@@ -1406,12 +1412,6 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
   end
 
-  defp fetch_collection_for_attempt!(attempt_id) do
-    RenewalCollectionAttempt
-    |> Ash.Query.filter(expr(renewal_attempt_id == ^attempt_id))
-    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-  end
-
   defp fetch_contract_change!(id) do
     ContractChange
     |> Ash.Query.filter(expr(id == ^id))
@@ -1434,40 +1434,6 @@ defmodule Store.Subscriptions.Sbh4003ScheduledCancellationRaceTest do
 
   defp count_contract_changes(subscription_id) do
     length(contract_changes(subscription_id))
-  end
-
-  defp authoritative_success_observation(%PaymentIntent{} = payment_intent) do
-    %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: payment_intent.provider_payment_id,
-      provider_reference_kind: :payment_intent,
-      provider_transaction_id: payment_intent.provider_payment_id,
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :authoritative_success,
-      raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    }
-  end
-
-  defp terminal_failure_observation(%PaymentIntent{} = payment_intent) do
-    %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: payment_intent.provider_payment_id,
-      provider_reference_kind: :payment_intent,
-      provider_transaction_id: payment_intent.provider_payment_id,
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :failure_observation,
-      raw_provider_status: "canceled",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    }
   end
 
   defp db_uuid(value) when is_binary(value) and byte_size(value) == 16, do: value

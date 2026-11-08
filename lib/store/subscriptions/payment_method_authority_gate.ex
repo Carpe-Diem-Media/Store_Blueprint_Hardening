@@ -2,126 +2,17 @@ defmodule Store.Subscriptions.PaymentMethodAuthorityGate do
   @moduledoc """
   Coordinates Subscription payment-method binding and StoredPaymentMethod writes.
 
-  Advisory locks serialize callers. Subscription and StoredPaymentMethod rows remain
-  authoritative, so callers re-read them after acquiring the matching gates.
+  Advisory transaction locks serialize cooperating writers. Subscription and
+  StoredPaymentMethod rows remain authoritative, so callers re-read them after
+  acquiring the matching gates.
   """
 
   alias Store.Repo
 
   @namespace "store:subscription-payment-method-authority:v1"
   @mutation_query_timeout_ms 5_000
-  @session_query_timeout_ms 1_000
-  @dispatch_checkout_timeout_ms 60_000
 
   @type lock_error :: :transaction_required | :lock_unavailable
-  @type session_proof :: %{
-          required(:backend_pid) => pos_integer(),
-          required(:binding_key) => integer(),
-          required(:method_key) => integer()
-        }
-
-  @doc """
-  Serializes a dispatch with cooperating binding and method writers.
-
-  The resolver runs after the binding gate is held. The callback runs outside a
-  Repo transaction and must confirm the proof immediately before adapter invocation.
-  The checkout deadline bounds the database checkout. It does not prove remote
-  receipt or bound the lifetime of a synchronous HTTP callback after disconnection.
-  An uncertain acquisition or release terminates only the checkout owner so its
-  connection cannot return to the pool with unknown session locks. Resolver and
-  callback exceptions propagate after their acquired locks are released.
-  """
-  @spec with_dispatch_session_gates(
-          Ecto.UUID.t(),
-          atom(),
-          (-> {:ok, map()} | {:error, term()}),
-          (map(), session_proof() -> result)
-        ) :: result | {:error, term()}
-        when result: var
-  def with_dispatch_session_gates(user_id, provider, resolve_identity, fun) do
-    dispatch_ref = make_ref()
-
-    try do
-      Repo.checkout(
-        fn ->
-          if Repo.in_transaction?() do
-            {:error, :lock_unavailable}
-          else
-            binding = binding_key(user_id, provider)
-
-            case Repo.query("SELECT pg_backend_pid()", [], timeout: @session_query_timeout_ms) do
-              {:ok, %{rows: [[backend_pid]]}} ->
-                with_session_key(binding, fn ->
-                  with {:ok, identity} <-
-                         invoke_dispatch_callback(dispatch_ref, resolve_identity, []) do
-                    method =
-                      method_key(identity.provider, identity.customer_ref, identity.method_ref)
-
-                    with_session_key(method, fn ->
-                      invoke_dispatch_callback(dispatch_ref, fun, [
-                        identity,
-                        %{
-                          backend_pid: backend_pid,
-                          binding_key: binding,
-                          method_key: method
-                        }
-                      ])
-                    end)
-                  end
-                end)
-
-              _ ->
-                {:error, :lock_unavailable}
-            end
-          end
-        end,
-        timeout: @dispatch_checkout_timeout_ms
-      )
-    rescue
-      _error in [DBConnection.ConnectionError, Postgrex.Error] -> {:error, :lock_unavailable}
-    catch
-      :throw, {^dispatch_ref, :throw, reason, stacktrace} ->
-        :erlang.raise(:throw, reason, stacktrace)
-
-      :throw, {^dispatch_ref, :exit, reason, stacktrace} ->
-        :erlang.raise(:exit, reason, stacktrace)
-
-      :throw, {^dispatch_ref, :error, reason, stacktrace} ->
-        :erlang.raise(:error, reason, stacktrace)
-    end
-  end
-
-  @doc """
-  Confirms that the original checked-out backend still holds both session gates.
-
-  Call this after observing the committed-claim event and immediately before
-  adapter invocation. It detects an observed lost session, but cannot make
-  PostgreSQL and a remote provider one atomic system.
-  """
-  @spec confirm_dispatch_session(session_proof()) :: :ok | {:error, :lock_unavailable}
-  def confirm_dispatch_session(proof) do
-    {binding_high, binding_low} = advisory_key_parts(proof.binding_key)
-    {method_high, method_low} = advisory_key_parts(proof.method_key)
-
-    query = """
-    SELECT pg_backend_pid() = $1::integer
-    AND EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND pid = $1::integer
-    AND granted AND objsubid = 1 AND classid::bigint = $2::bigint AND objid::bigint = $3::bigint)
-    AND EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND pid = $1::integer
-    AND granted AND objsubid = 1 AND classid::bigint = $4::bigint AND objid::bigint = $5::bigint)
-    """
-
-    case Repo.query(
-           query,
-           [proof.backend_pid, binding_high, binding_low, method_high, method_low],
-           timeout: @session_query_timeout_ms
-         ) do
-      {:ok, %{rows: [[true]]}} -> :ok
-      _ -> {:error, :lock_unavailable}
-    end
-  rescue
-    _error in [DBConnection.ConnectionError, Postgrex.Error] -> {:error, :lock_unavailable}
-  end
 
   @doc "Returns the binding gate key using raw UUID bytes and the provider namespace."
   @spec binding_key(Ecto.UUID.t(), atom()) :: integer()
@@ -204,56 +95,5 @@ defmodule Store.Subscriptions.PaymentMethodAuthorityGate do
     end
   rescue
     _error in [DBConnection.ConnectionError, Postgrex.Error] -> {:error, :lock_unavailable}
-  end
-
-  defp with_session_key(key, fun) do
-    case acquire_session_key_or_discard_owner!(key) do
-      true ->
-        try do
-          fun.()
-        after
-          release_session_key_or_discard_owner!(key)
-        end
-
-      false ->
-        {:error, :lock_unavailable}
-    end
-  end
-
-  defp acquire_session_key_or_discard_owner!(key) do
-    case Repo.query("SELECT pg_try_advisory_lock($1)", [key], timeout: @session_query_timeout_ms) do
-      {:ok, %{rows: [[true]]}} -> true
-      {:ok, %{rows: [[false]]}} -> false
-      _ -> Process.exit(self(), :kill)
-    end
-  rescue
-    _error in [DBConnection.ConnectionError, Postgrex.Error] -> Process.exit(self(), :kill)
-  catch
-    :exit, _reason -> Process.exit(self(), :kill)
-  end
-
-  defp invoke_dispatch_callback(dispatch_ref, fun, args) do
-    apply(fun, args)
-  rescue
-    error -> throw({dispatch_ref, :error, error, __STACKTRACE__})
-  catch
-    :throw, reason -> throw({dispatch_ref, :throw, reason, __STACKTRACE__})
-    :exit, reason -> throw({dispatch_ref, :exit, reason, __STACKTRACE__})
-  end
-
-  defp release_session_key_or_discard_owner!(key) do
-    case Repo.query("SELECT pg_advisory_unlock($1)", [key], timeout: @session_query_timeout_ms) do
-      {:ok, %{rows: [[true]]}} -> :ok
-      _ -> Process.exit(self(), :kill)
-    end
-  rescue
-    _error in [DBConnection.ConnectionError, Postgrex.Error] -> Process.exit(self(), :kill)
-  catch
-    :exit, _reason -> Process.exit(self(), :kill)
-  end
-
-  defp advisory_key_parts(key) do
-    <<high::unsigned-big-32, low::unsigned-big-32>> = <<key::signed-big-64>>
-    {high, low}
   end
 end

@@ -7,11 +7,17 @@ defmodule Store.Workers.JC259RenewalRetryAuditTest do
 
   alias Oban.Queues.Executor
   alias Store.DirectRepo
-  alias Store.Payments.PaymentIntent
+  alias Store.Payments.{PaymentIntent, WebhookReceipt}
   alias Store.Subscriptions.{Facade, RenewalAttempt, Subscription}
+  alias Store.Subscriptions.Inputs.StartSubscriptionPaymentMethodUpdateInput
   alias Store.SubscriptionsFixtures
   alias Store.TestSupport.StripeAPIStub
-  alias Store.Workers.{ProcessSubscriptionRenewalWorker, RunDueSubscriptionRenewalsWorker}
+
+  alias Store.Workers.{
+    ProcessSubscriptionRenewalWorker,
+    ProcessWebhookReceiptWorker,
+    RunDueSubscriptionRenewalsWorker
+  }
 
   setup context do
     StripeAPIStub.setup_default(context)
@@ -95,7 +101,7 @@ defmodule Store.Workers.JC259RenewalRetryAuditTest do
     end
   end
 
-  test "successful local payment-method repair cannot enqueue past a retained completed job" do
+  test "verified payment-method repair cannot enqueue past a retained completed job" do
     fixture = fixture!([1, 24, 72])
     job = insert_job!(fixture.args)
     assert %{state: :failure} = execute!(job)
@@ -104,9 +110,37 @@ defmodule Store.Workers.JC259RenewalRetryAuditTest do
     failed = subscription!(fixture.subscription.id)
     assert DateTime.compare(failed.next_retry_at, DateTime.utc_now()) == :gt
     method_ref = "pm_jc259_repaired_#{fixture.subscription.id}"
-    intent = succeeded_setup_intent!(fixture, method_ref)
 
-    assert :ok = Facade.handle_payment_method_update_succeeded_for_system(intent.id)
+    StripeAPIStub.stub_setup_intent(fn conn, params ->
+      StripeAPIStub.json_response(conn, StripeAPIStub.setup_intent_response(params))
+    end)
+
+    {:ok, input} =
+      StartSubscriptionPaymentMethodUpdateInput.new(%{"subscription_id" => failed.id})
+
+    assert {:ok, started} =
+             Facade.start_subscription_payment_method_update_for_user(
+               fixture.customer,
+               failed.id,
+               input
+             )
+
+    intent = payment_intent!(started.payment_intent_id)
+    assert is_integer(intent.subscription_setup_generation)
+    assert intent.subscription_setup_generation > 0
+    assert intent.provider_payment_id
+
+    assert intent.payment_intent_key ==
+             "pm-update:v2:#{failed.id}:#{intent.subscription_setup_generation}"
+
+    assert intent.subscription_setup_generation ==
+             subscription!(failed.id).payment_method_setup_generation
+
+    StripeAPIStub.stub_unexpected!("unexpected provider request after setup creation")
+    succeed_setup!(intent, method_ref, "evt_jc259_payment_repair_#{failed.id}")
+
+    applied_intent = payment_intent!(intent.id)
+    assert %DateTime{} = applied_intent.setup_binding_applied_at
     repaired = subscription!(failed.id)
     assert repaired.provider_billing_ref == method_ref
     assert is_binary(repaired.stored_payment_method_id)
@@ -183,6 +217,8 @@ defmodule Store.Workers.JC259RenewalRetryAuditTest do
 
     created =
       SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
+        provider: :stripe,
+        provider_customer_ref: "cus_jc259_#{customer.id}",
         next_renewal_at: DateTime.add(now, -1, :second)
       })
 
@@ -260,27 +296,53 @@ defmodule Store.Workers.JC259RenewalRetryAuditTest do
              ])
   end
 
-  defp succeeded_setup_intent!(fixture, method_ref) do
+  defp succeed_setup!(intent, method_ref, event_id) do
+    receipt =
+      WebhookReceipt
+      |> Ash.Changeset.for_create(:ingest, %{
+        provider: "stripe",
+        provider_event_id: event_id,
+        event_type: "setup_intent.succeeded",
+        verification_status: "verified",
+        processing_status: "new",
+        raw_body: setup_success_body(intent, method_ref, event_id),
+        headers: %{"content-type" => ["application/json"]}
+      })
+      |> Ash.create!(domain: Store.Payments, authorize?: false)
+
+    assert :ok =
+             ProcessWebhookReceiptWorker.perform(%Oban.Job{
+               args: %{"webhook_receipt_id" => receipt.id}
+             })
+  end
+
+  defp setup_success_body(intent, method_ref, event_id) do
+    Jason.encode!(%{
+      "id" => event_id,
+      "created" => 1_700_000_000,
+      "livemode" => false,
+      "type" => "setup_intent.succeeded",
+      "data" => %{
+        "object" => %{
+          "id" => intent.provider_payment_id,
+          "livemode" => false,
+          "status" => "succeeded",
+          "currency" => String.downcase(intent.currency),
+          "customer" => intent.provider_customer_ref,
+          "payment_method" => method_ref,
+          "metadata" => %{
+            "local_intent_id" => intent.id,
+            "subscription_id" => intent.subscription_id,
+            "currency" => intent.currency
+          }
+        }
+      }
+    })
+  end
+
+  defp payment_intent!(id) do
     PaymentIntent
-    |> Ash.Changeset.for_create(
-      :create_or_reuse,
-      %{
-        order_id: fixture.subscription.source_order_id,
-        amount_received_minor: fixture.plan.amount_minor,
-        currency: fixture.plan.currency,
-        provider: :stripe,
-        provider_customer_ref: "cus_jc259_#{fixture.customer.id}",
-        provider_payment_method_ref: method_ref,
-        payment_intent_key: "jc259:repair:#{fixture.subscription.id}",
-        purpose: :subscription_payment_method_update,
-        subscription_id: fixture.subscription.id
-      },
-      context: %{system?: true}
-    )
-    |> Ash.create!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-    |> Ash.Changeset.for_update(:submit, %{}, context: %{system?: true})
-    |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-    |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
-    |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+    |> Ash.Query.filter(expr(id == ^id))
+    |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
   end
 end

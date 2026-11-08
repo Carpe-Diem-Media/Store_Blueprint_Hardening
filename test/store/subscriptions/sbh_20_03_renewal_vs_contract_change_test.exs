@@ -81,7 +81,7 @@ defmodule Store.Subscriptions.Sbh2003RenewalVsContractChangeTest do
     assert {:ok, queued} = Task.await(queue_task, 10_000)
     queued_change = fetch_contract_change!(queued.current_contract_change_id)
 
-    assert {:ok, :processed} =
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Sandbox.unboxed_run(Store.Repo, fn ->
                Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
                  now: fixture.now
@@ -135,7 +135,7 @@ defmodule Store.Subscriptions.Sbh2003RenewalVsContractChangeTest do
     assert future_change.target_currency == future_revision.currency
     assert future_change.effective_at == attempt.period_end_at
 
-    assert {:ok, :processed} =
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
                now: fixture.now
              )
@@ -386,7 +386,7 @@ defmodule Store.Subscriptions.Sbh2003RenewalVsContractChangeTest do
 
     assert_receive {:queue_before_persist, ^barrier}, 10_000
 
-    assert {:ok, :processed} =
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Sandbox.unboxed_run(Store.Repo, fn ->
                Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
                  now: fixture.now
@@ -709,7 +709,7 @@ defmodule Store.Subscriptions.Sbh2003RenewalVsContractChangeTest do
   end
 
   defp bind_renewal!(fixture) do
-    assert {:ok, :processed} =
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
                now: fixture.now
              )
