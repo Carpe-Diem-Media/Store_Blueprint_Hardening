@@ -1830,6 +1830,119 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
     end)
   end
 
+  test "APPLIED verification seeks past a deep tied-time cursor" do
+    {fixture, history_start} = deep_applied_query_fixture!("jc248_deep_cursor")
+    cursor_at = DateTime.add(history_start, 95_000, :microsecond)
+
+    assert {:ok, deep_query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: DateTime.add(history_start, 200_000, :microsecond),
+               after_inserted_at: cursor_at,
+               after_id: deep_history_id(fixture.effect.id, 190_001),
+               limit: 100
+             })
+
+    Sandbox.unboxed_run(Repo, fn ->
+      {sql, params} =
+        EctoSQL.to_sql(:all, Repo, AppliedAccessVerificationQuery.to_ecto(deep_query))
+
+      %{rows: [[plan]]} = Repo.query!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " <> sql, params)
+
+      IO.puts(
+        "JC248_DEEP_APPLIED_CURSOR_PLAN " <>
+          Jason.encode!(%{
+            operation: "deep_cursor",
+            history_rows: 200_000,
+            cursor_after_row: 190_001,
+            page_limit: 100,
+            explicit_analyze: true,
+            fixture_rows_are_query_plan_data_only: true,
+            plan: plan
+          })
+      )
+
+      assert_deep_cursor_index_seek!(plan)
+    end)
+
+    assert {:ok, deep_rows} =
+             Facade.list_applied_access_verification_window_for_system(deep_query)
+
+    assert length(deep_rows) == 100
+
+    assert Enum.map(deep_rows, & &1.effect.id) ==
+             Enum.map(190_002..190_101, &deep_history_id(fixture.effect.id, &1))
+
+    assert Enum.all?(deep_rows, &(not &1.current?))
+
+    assert {:ok, newest_query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: DateTime.add(history_start, 200_000, :microsecond),
+               after_inserted_at: DateTime.add(history_start, 99_998, :microsecond),
+               after_id: deep_history_id(fixture.effect.id, 199_998),
+               limit: 100
+             })
+
+    assert {:ok, newest_rows} =
+             Facade.list_applied_access_verification_window_for_system(newest_query)
+
+    assert Enum.map(newest_rows, & &1.effect.id) == [
+             deep_history_id(fixture.effect.id, 199_999),
+             deep_history_id(fixture.effect.id, 200_000)
+           ]
+
+    assert Enum.map(newest_rows, & &1.current?) == [false, true]
+  end
+
+  test "APPLIED verification bounds currentness lookup for a skewed source" do
+    {fixture, history_start} = deep_applied_query_fixture!("jc248_skewed_currentness")
+
+    assert {:ok, deep_query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: DateTime.add(history_start, 200_000, :microsecond),
+               after_inserted_at: DateTime.add(history_start, 95_000, :microsecond),
+               after_id: deep_history_id(fixture.effect.id, 190_001),
+               limit: 100
+             })
+
+    Sandbox.unboxed_run(Repo, fn ->
+      {sql, params} =
+        EctoSQL.to_sql(:all, Repo, AppliedAccessVerificationQuery.to_ecto(deep_query))
+
+      %{rows: [[plan]]} = Repo.query!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " <> sql, params)
+
+      IO.puts(
+        "JC248_SKEWED_CURRENTNESS_QUERY_PLAN " <>
+          Jason.encode!(%{
+            operation: "skewed_currentness",
+            history_rows: 200_000,
+            candidate_rows: 100,
+            explicit_analyze: true,
+            fixture_rows_are_query_plan_data_only: true,
+            plan: plan
+          })
+      )
+
+      assert_bounded_latest_effect_lookup!(plan, 100)
+    end)
+
+    assert {:ok, rows} = Facade.list_applied_access_verification_window_for_system(deep_query)
+    assert length(rows) == 100
+    assert Enum.all?(rows, &(not &1.current?))
+
+    assert {:ok, newest_query} =
+             AppliedAccessVerificationQuery.new(%{
+               as_of: DateTime.add(history_start, 200_000, :microsecond),
+               after_inserted_at: DateTime.add(history_start, 99_998, :microsecond),
+               after_id: deep_history_id(fixture.effect.id, 199_998),
+               limit: 100
+             })
+
+    assert {:ok, newest_rows} =
+             Facade.list_applied_access_verification_window_for_system(newest_query)
+
+    assert Enum.map(newest_rows, & &1.current?) == [false, true]
+  end
+
   test "source reconciliation returns stale expected authority without executing it" do
     fixture = create_committed_effective_effect_fixture!("jc248_reconcile_stale")
     before_effect = fetch_effect!(fixture.effect.id)
@@ -3268,6 +3381,115 @@ defmodule Store.Subscriptions.AccessEffectEffectiveExecutionTest do
         scope_keys
       ]
     )
+  end
+
+  defp insert_applied_query_history!(fixture, count, inserted_at) do
+    ids = Enum.map(1..count, &deep_history_id(fixture.effect.id, &1))
+    dumped_ids = Enum.map(ids, &Ecto.UUID.dump!/1)
+
+    Repo.query!(
+      """
+      INSERT INTO access_effects (
+        id, subscription_id, source_version, status, disposition,
+        entitlement_kind, entitlement_scope_key, valid_from_at, valid_until_at,
+        target_fingerprint, source_order_line_item_id, contract_change_id,
+        plan_revision_id, inserted_at, updated_at
+      )
+      SELECT history.id, $2, $3 + history.ordinality, 'applied', 'effective',
+             $4, $5 || ':query-plan:' || history.ordinality::text, $6, $7,
+             $8, $9, $10, $11,
+             $12::timestamp + ((history.ordinality - 1) / 2) * interval '1 microsecond',
+             $12::timestamp + ((history.ordinality - 1) / 2) * interval '1 microsecond'
+      FROM unnest($1::uuid[]) WITH ORDINALITY AS history(id, ordinality)
+      """,
+      [
+        dumped_ids,
+        Ecto.UUID.dump!(fixture.subscription.id),
+        fixture.effect.source_version,
+        to_string(fixture.effect.entitlement_kind),
+        fixture.effect.entitlement_scope_key,
+        fixture.effect.valid_from_at,
+        fixture.effect.valid_until_at,
+        fixture.effect.target_fingerprint,
+        Ecto.UUID.dump!(fixture.line_item.id),
+        maybe_dump_uuid(fixture.effect.contract_change_id),
+        Ecto.UUID.dump!(fixture.effect.plan_revision_id),
+        inserted_at
+      ]
+    )
+  end
+
+  defp deep_applied_query_fixture!(prefix) do
+    fixture = create_committed_effective_effect_fixture!(prefix)
+    history_start = ~U[2098-01-01 00:00:00Z]
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert {:ok, :applied} =
+               Facade.execute_effective_access_effect_for_system(fixture.effect.id)
+
+      insert_applied_query_history!(fixture, 200_000, history_start)
+      Repo.query!("ANALYZE access_effects")
+    end)
+
+    {fixture, history_start}
+  end
+
+  defp maybe_dump_uuid(nil), do: nil
+  defp maybe_dump_uuid(uuid), do: Ecto.UUID.dump!(uuid)
+
+  defp deep_history_id(source_effect_id, index) do
+    <<prefix::binary-size(6), _::binary>> = Ecto.UUID.dump!(source_effect_id)
+    Ecto.UUID.load!(<<prefix::binary, 7::4, 0::12, 2::2, index::62>>)
+  end
+
+  defp assert_deep_cursor_index_seek!(explain_json) do
+    nodes = query_plan_nodes(explain_json)
+
+    assert Enum.any?(nodes, fn node ->
+             condition = Map.get(node, "Index Cond", "")
+             String.contains?(condition, "inserted_at") and String.contains?(condition, "id")
+           end),
+           "deep cursor must constrain both inserted_at and id in an index condition"
+
+    refute Enum.any?(nodes, fn node ->
+             removed = Map.get(node, "Rows Removed by Filter", 0)
+             removed > 1_000
+           end),
+           "deep cursor must not filter a large visited prefix"
+  end
+
+  defp assert_bounded_latest_effect_lookup!(explain_json, candidate_limit) do
+    assert Enum.any?(query_plan_nodes(explain_json), fn node ->
+             node["Node Type"] == "Limit" and node["Plan Rows"] == 1 and
+               Enum.any?(query_plan_nodes_from(node), fn lookup ->
+                 lookup["Node Type"] in ["Index Scan", "Index Only Scan"] and
+                   String.contains?(
+                     Map.get(lookup, "Index Name", ""),
+                     "unique_subscription_source_version"
+                   ) and
+                   String.contains?(Map.get(lookup, "Index Cond", ""), "subscription_id") and
+                   lookup["Scan Direction"] == "Backward" and
+                   lookup["Actual Rows"] <= 1 and lookup["Actual Loops"] <= candidate_limit
+               end)
+           end),
+           "latest effect lookup must use LIMIT 1 above a bounded backward source/version index scan"
+  end
+
+  defp query_plan_nodes(explain_json) do
+    root = get_in(explain_json, [Access.at(0), "Plan"])
+    collect_plan_nodes(root, [])
+  end
+
+  defp query_plan_nodes_from(nil), do: []
+
+  defp query_plan_nodes_from(node) do
+    [node | Enum.flat_map(Map.get(node, "Plans", []), &query_plan_nodes_from/1)]
+  end
+
+  defp collect_plan_nodes(nil, acc), do: acc
+
+  defp collect_plan_nodes(node, acc) do
+    Enum.reduce(Map.get(node, "Plans", []), [node | acc], &collect_plan_nodes/2)
   end
 
   defp issue_legacy_grant!(fixture) do
