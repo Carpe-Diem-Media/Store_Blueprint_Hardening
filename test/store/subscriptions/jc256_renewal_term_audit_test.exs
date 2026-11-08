@@ -5,12 +5,15 @@ defmodule Store.Subscriptions.JC256RenewalTermAuditTest do
   require Ash.Query
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Store.Catalog.InventoryItem
   alias Store.Entitlements.Cache
+  alias Store.Orders.{Order, PaymentApplication}
   alias Store.Payments.PaymentIntent
   alias Store.Repo
   alias Store.Subscriptions.{Facade, RenewalAttempt, RenewalCollectionAttempt}
   alias Store.Subscriptions.{RenewalCollectionAttempts, Subscription}
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   @reference_at ~U[2026-06-01 00:00:00Z]
@@ -20,7 +23,7 @@ defmodule Store.Subscriptions.JC256RenewalTermAuditTest do
     :ok
   end
 
-  test "fixed end at before, equal to, and after the charged period end still reaches merchant dispatch" do
+  test "fixed end before, at, and after the renewal start boundary has no fresh dispatch" do
     for {label, term_end_at} <- [
           {"before", DateTime.add(@reference_at, -1, :second)},
           {"equal", @reference_at},
@@ -33,68 +36,62 @@ defmodule Store.Subscriptions.JC256RenewalTermAuditTest do
         })
 
       on_exit(fn -> cleanup_fixture!(fixture) end)
-      dispatch_ref = make_ref()
-      parent = self()
-
-      StripeAPIStub.stub_payment_intent(fn conn, params ->
-        send(parent, {dispatch_ref, :post, params})
-        StripeAPIStub.json_response(conn, StripeAPIStub.payment_intent_response(params))
-      end)
 
       assert [] =
                Sandbox.unboxed_run(Repo, fn -> fetch_attempts!(fixture.subscription.id) end)
 
-      assert {:ok, :processed} =
-               Sandbox.unboxed_run(Repo, fn ->
-                 Facade.process_due_subscription_renewal_for_system(
-                   fixture.subscription.id,
-                   now: @reference_at
-                 )
-               end)
+      {subscription, attempt, collection, payment_intent, order} =
+        reject_fresh_dispatch!(fixture, @reference_at)
 
-      assert_receive {^dispatch_ref, :post, params}
-      refute_receive {^dispatch_ref, :post, _extra_params}, 0
-      assert params["customer"] == fixture.refs.provider_customer
-      assert params["payment_method"] == fixture.refs.payment_method
-
-      {subscription, attempt, collection, payment_intent} =
-        Sandbox.unboxed_run(Repo, fn ->
-          subscription = fetch_subscription!(fixture.subscription.id)
-          attempt = fetch_latest_attempt!(fixture.subscription.id)
-          collection = fetch_collection!(attempt.id)
-          payment_intent = fetch_payment_intent!(collection.payment_intent_id)
-          {subscription, attempt, collection, payment_intent}
-        end)
-
-      assert subscription.status == :active
       assert attempt.subscription_id == fixture.subscription.id
-      assert attempt.order_id == payment_intent.order_id
-      assert params["metadata[subscription_id]"] == fixture.subscription.id
-      assert params["metadata[renewal_attempt_id]"] == attempt.id
-      assert params["metadata[order_id]"] == attempt.order_id
-      assert params["metadata[local_intent_id]"] == payment_intent.id
-      assert attempt.payment_intent_id == collection.payment_intent_id
       assert collection.renewal_attempt_id == attempt.id
-      assert payment_intent.id == collection.payment_intent_id
-      assert payment_intent.order_id == attempt.order_id
-      assert collection.financial_outcome == :verified_success
-      assert payment_intent.state == :succeeded
+      assert payment_intent.order_id == order.id
 
-      snapshot = attempt.charged_contract_snapshot
+      reached = prepare_legacy_success!(fixture, @reference_at, attempt.id)
+      assert reached.source == :synthetic_legacy_possible_contact
+      assert reached.order.id == order.id
+      assert reached.order.grand_total_minor > 0
+      assert reached.payment_intent.currency == reached.order.currency_code
+      process_legacy_success!(reached)
+
+      {paid_attempt, paid_collection, paid_intent, paid_order, applications} =
+        fetch_paid_evidence!(attempt.id, collection.id)
+
+      recovered_subscription =
+        Sandbox.unboxed_run(Repo, fn -> fetch_subscription!(fixture.subscription.id) end)
+
+      unchanged_fields = [
+        :status,
+        :current_period_start_at,
+        :current_period_end_at,
+        :next_renewal_at
+      ]
+
+      assert Map.take(recovered_subscription, unchanged_fields) ==
+               Map.take(subscription, unchanged_fields)
+
+      snapshot = paid_attempt.charged_contract_snapshot
       assert snapshot["term_mode"] == "fixed_end_at"
       assert {:ok, snapshot_end_at, _offset} = DateTime.from_iso8601(snapshot["term_end_at"])
       assert DateTime.compare(snapshot_end_at, term_end_at) == :eq
-      assert DateTime.compare(attempt.period_start_at, @reference_at) == :eq
+      assert DateTime.compare(paid_attempt.period_start_at, @reference_at) == :eq
 
-      assert DateTime.compare(attempt.period_end_at, DateTime.add(@reference_at, 86_400, :second)) ==
-               :eq
+      assert DateTime.compare(
+               paid_attempt.period_end_at,
+               DateTime.add(@reference_at, 86_400, :second)
+             ) == :eq
 
       assert DateTime.compare(subscription.current_period_end_at, @reference_at) == :eq
       assert DateTime.compare(subscription.next_renewal_at, @reference_at) == :eq
+      assert paid_collection.financial_outcome == :verified_success
+      assert paid_intent.state == :succeeded
+      assert paid_order.state == :paid
+      assert length(applications) == 1
+      assert_success_handoff!(paid_attempt, paid_collection, paid_intent, paid_order)
     end
   end
 
-  test "fixed cycle plans permit N plus one successful paid period extensions" do
+  test "fixed cycle plans permit N plus one paid extensions through synthetic legacy recovery" do
     for cycles <- [1, 3] do
       fixture =
         create_fixture!("fixed_cycles_#{cycles}", %{
@@ -103,13 +100,6 @@ defmodule Store.Subscriptions.JC256RenewalTermAuditTest do
         })
 
       on_exit(fn -> cleanup_fixture!(fixture) end)
-      dispatch_ref = make_ref()
-      parent = self()
-
-      StripeAPIStub.stub_payment_intent(fn conn, params ->
-        send(parent, {dispatch_ref, :post, params})
-        StripeAPIStub.json_response(conn, StripeAPIStub.payment_intent_response(params))
-      end)
 
       successful_period_ends =
         for _extension <- 1..(cycles + 1) do
@@ -124,49 +114,38 @@ defmodule Store.Subscriptions.JC256RenewalTermAuditTest do
 
           assert Enum.all?(previous_attempts, &(&1.status == :succeeded))
 
-          assert {:ok, :processed} =
-                   Sandbox.unboxed_run(Repo, fn ->
-                     Facade.process_due_subscription_renewal_for_system(
-                       fixture.subscription.id,
-                       now: before.next_renewal_at
-                     )
-                   end)
+          {_blocked_subscription, fresh_attempt, fresh_collection, _fresh_intent, _fresh_order} =
+            reject_fresh_dispatch!(fixture, before.next_renewal_at, length(previous_attempts))
 
-          assert_receive {^dispatch_ref, :post, params}
-          refute_receive {^dispatch_ref, :post, _extra_params}, 0
-          assert params["customer"] == fixture.refs.provider_customer
-          assert params["payment_method"] == fixture.refs.payment_method
+          reached = prepare_legacy_success!(fixture, before.next_renewal_at, fresh_attempt.id)
+          assert reached.source == :synthetic_legacy_possible_contact
+          assert reached.collection.id == fresh_collection.id
+          process_legacy_success!(reached)
 
-          {attempt, collection} =
-            Sandbox.unboxed_run(Repo, fn ->
-              attempt = fetch_latest_attempt!(fixture.subscription.id)
-              {attempt, fetch_collection!(attempt.id)}
-            end)
+          {attempt, collection} = {reached.attempt, reached.collection}
 
           assert attempt.subscription_id == fixture.subscription.id
-          assert params["metadata[subscription_id]"] == fixture.subscription.id
-          assert params["metadata[renewal_attempt_id]"] == attempt.id
-          assert params["metadata[order_id]"] == attempt.order_id
-          assert params["metadata[local_intent_id]"] == collection.payment_intent_id
           assert attempt.payment_intent_id == collection.payment_intent_id
           assert collection.renewal_attempt_id == attempt.id
           assert attempt.charged_contract_snapshot["term_mode"] == "fixed_cycles"
           assert attempt.charged_contract_snapshot["term_cycles"] == cycles
 
-          {paid_collection, payment_intent} =
-            Sandbox.unboxed_run(Repo, fn ->
-              {fetch_collection!(attempt.id), fetch_payment_intent!(collection.payment_intent_id)}
-            end)
+          {paid_attempt, paid_collection, payment_intent, paid_order, applications} =
+            fetch_paid_evidence!(attempt.id, collection.id)
 
+          assert paid_attempt.order_id == reached.order.id
           assert paid_collection.financial_outcome == :verified_success
           assert payment_intent.state == :succeeded
+          assert paid_order.grand_total_minor > 0
+          assert paid_order.currency_code == payment_intent.currency
+          assert length(applications) == 1
 
           assert {:ok, handoff} =
                    Sandbox.unboxed_run(Repo, fn ->
                      RenewalCollectionAttempts.success_handoff_for_system(collection.id)
                    end)
 
-          assert handoff.order_id == attempt.order_id
+          assert handoff.order_id == paid_order.id
           assert handoff.renewal_attempt_id == attempt.id
           assert handoff.collection_attempt_id == collection.id
           assert handoff.payment_intent_id == collection.payment_intent_id
@@ -218,52 +197,181 @@ defmodule Store.Subscriptions.JC256RenewalTermAuditTest do
     end
   end
 
-  test "provider-managed subscription still dispatches a merchant Stripe collection" do
+  test "provider-managed label has no fresh dispatch and only synthetic legacy recovery" do
     fixture =
       create_fixture!("provider_managed", %{term_mode: :until_canceled}, :provider_managed)
 
     on_exit(fn -> cleanup_fixture!(fixture) end)
-    dispatch_ref = make_ref()
-    parent = self()
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      send(parent, {dispatch_ref, :post, params})
-      StripeAPIStub.json_response(conn, StripeAPIStub.payment_intent_response(params))
-    end)
+    {subscription, attempt, collection, _payment_intent, _order} =
+      reject_fresh_dispatch!(fixture, @reference_at)
 
-    assert {:ok, :processed} =
-             Sandbox.unboxed_run(Repo, fn ->
-               Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
-                 now: @reference_at
-               )
-             end)
+    reached = prepare_legacy_success!(fixture, @reference_at, attempt.id)
+    assert reached.source == :synthetic_legacy_possible_contact
+    process_legacy_success!(reached)
 
-    assert_receive {^dispatch_ref, :post, params}
-    refute_receive {^dispatch_ref, :post, _extra_params}, 0
+    {paid_attempt, paid_collection, payment_intent, order, applications} =
+      fetch_paid_evidence!(attempt.id, collection.id)
 
-    {subscription, attempt, collection, payment_intent} =
-      Sandbox.unboxed_run(Repo, fn ->
-        subscription = fetch_subscription!(fixture.subscription.id)
-        attempt = fetch_latest_attempt!(fixture.subscription.id)
-        collection = fetch_collection!(attempt.id)
-        {subscription, attempt, collection, fetch_payment_intent!(collection.payment_intent_id)}
-      end)
+    recovered_subscription =
+      Sandbox.unboxed_run(Repo, fn -> fetch_subscription!(fixture.subscription.id) end)
 
     assert subscription.billing_mode == :provider_managed
     assert is_nil(subscription.provider_subscription_id)
     assert subscription.status == :active
-    assert params["customer"] == fixture.refs.provider_customer
-    assert params["payment_method"] == fixture.refs.payment_method
-    assert params["metadata[subscription_id]"] == fixture.subscription.id
-    assert params["metadata[renewal_attempt_id]"] == attempt.id
-    assert params["metadata[order_id]"] == attempt.order_id
-    assert params["metadata[local_intent_id]"] == payment_intent.id
+    assert recovered_subscription.billing_mode == subscription.billing_mode
+    assert recovered_subscription.provider_subscription_id == nil
+    assert recovered_subscription.status == :active
     assert attempt.subscription_id == fixture.subscription.id
-    assert attempt.payment_intent_id == collection.payment_intent_id
-    assert collection.renewal_attempt_id == attempt.id
-    assert payment_intent.order_id == attempt.order_id
-    assert collection.financial_outcome == :verified_success
+    assert paid_attempt.id == attempt.id
+    assert paid_attempt.payment_intent_id == nil
+    assert paid_collection.payment_intent_id == payment_intent.id
+    assert paid_collection.renewal_attempt_id == attempt.id
+    assert payment_intent.order_id == order.id
+    assert order.grand_total_minor > 0
+    assert order.currency_code == payment_intent.currency
+    assert paid_collection.financial_outcome == :verified_success
     assert payment_intent.state == :succeeded
+    assert order.state == :paid
+    assert length(applications) == 1
+    assert_success_handoff!(paid_attempt, paid_collection, payment_intent, order)
+  end
+
+  defp reject_fresh_dispatch!(fixture, now, prior_attempt_count \\ 0) do
+    StripeAPIStub.stub_unexpected!("fresh renewal must not contact Stripe")
+    before = Sandbox.unboxed_run(Repo, fn -> fetch_subscription!(fixture.subscription.id) end)
+
+    assert {:error,
+            %{
+              code: "RENEWAL_DISPATCH_UNAVAILABLE",
+              meta: %{reason: :provider_revocation_fencing_unsupported}
+            }} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
+                 now: now
+               )
+             end)
+
+    {subscription, attempts, attempt, collection, payment_intent, order, applications} =
+      Sandbox.unboxed_run(Repo, fn ->
+        subscription = fetch_subscription!(fixture.subscription.id)
+        attempts = fetch_attempts!(fixture.subscription.id)
+        attempt = fetch_latest_attempt!(fixture.subscription.id)
+        collection = fetch_collection!(attempt.id)
+
+        payment_intent =
+          fetch_payment_intent_by_key!(
+            RenewalCollectionAttempts.payment_intent_key(collection.id)
+          )
+
+        order = fetch_order!(attempt.order_id)
+
+        applications =
+          PaymentApplication
+          |> Ash.Query.filter(expr(order_id == ^order.id))
+          |> Ash.read!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+
+        {subscription, attempts, attempt, collection, payment_intent, order, applications}
+      end)
+
+    assert length(attempts) == prior_attempt_count + 1
+    assert attempt.subscription_id == fixture.subscription.id
+    assert attempt.status == :processing
+    assert collection.renewal_attempt_id == attempt.id
+    assert collection.dispatch_state == :not_started
+    assert collection.financial_outcome == :unresolved
+    assert collection.payment_intent_id == nil
+    assert collection.reservation_generation_id == nil
+    assert payment_intent.order_id == order.id
+    assert payment_intent.state == :created
+    assert payment_intent.provider_payment_id == nil
+    assert payment_intent.provider_customer_ref == nil
+    assert order.state == :pending_payment
+    assert order.grand_total_minor > 0
+    assert applications == []
+    assert subscription.status == before.status
+    assert subscription.dunning_attempt_count == before.dunning_attempt_count
+    assert subscription.retry_suppressed_at == before.retry_suppressed_at
+    assert subscription.next_retry_at == before.next_retry_at
+    assert subscription.current_period_start_at == before.current_period_start_at
+    assert subscription.current_period_end_at == before.current_period_end_at
+    assert subscription.next_renewal_at == before.next_renewal_at
+    assert payment_intent.provider_payment_method_ref == nil
+    assert attempt.payment_intent_id == nil
+    assert Repo.get_by!(InventoryItem, variant_id: fixture.variant.id).reserved_count == 0
+    {subscription, attempt, collection, payment_intent, order}
+  end
+
+  defp prepare_legacy_success!(fixture, now, attempt_id) do
+    reached =
+      Sandbox.unboxed_run(Repo, fn ->
+        ReachedRenewalFixtures.prepare_reached!(fixture.subscription.id, now)
+      end)
+
+    assert reached.attempt.id == attempt_id
+    assert reached.order.grand_total_minor > 0
+    assert reached.order.currency_code == "USD"
+    assert reached.payment_intent.order_id == reached.order.id
+    assert reached.payment_intent.provider_customer_ref == fixture.refs.provider_customer
+    assert reached.payment_intent.provider_payment_method_ref == fixture.refs.payment_method
+    assert is_binary(reached.payment_intent.provider_payment_id)
+    assert reached.collection.renewal_attempt_id == reached.attempt.id
+
+    assert reached.payment_intent.payment_intent_key ==
+             RenewalCollectionAttempts.payment_intent_key(reached.collection.id)
+
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "succeeded")
+    )
+
+    reached
+  end
+
+  defp process_legacy_success!(reached) do
+    assert {:ok, :processed} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.process_due_subscription_renewal_for_system(
+                 reached.attempt.subscription_id,
+                 now: reached.now
+               )
+             end)
+  end
+
+  defp fetch_paid_evidence!(attempt_id, collection_id) do
+    Sandbox.unboxed_run(Repo, fn ->
+      attempt = fetch_attempt!(attempt_id)
+      collection = fetch_collection!(attempt_id)
+      payment_intent = fetch_payment_intent!(collection.payment_intent_id)
+      order = fetch_order!(attempt.order_id)
+
+      applications =
+        PaymentApplication
+        |> Ash.Query.filter(expr(order_id == ^order.id))
+        |> Ash.read!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+
+      {attempt, collection, payment_intent, order, applications}
+    end)
+    |> then(fn {attempt, collection, intent, order, applications} ->
+      assert collection.id == collection_id
+      assert [application] = applications
+      assert application.order_id == order.id
+      assert application.payment_intent_id == intent.id
+      assert intent.amount_received_minor == order.grand_total_minor
+      {attempt, collection, intent, order, applications}
+    end)
+  end
+
+  defp assert_success_handoff!(attempt, collection, payment_intent, order) do
+    assert {:ok, handoff} =
+             Sandbox.unboxed_run(Repo, fn ->
+               RenewalCollectionAttempts.success_handoff_for_system(collection.id)
+             end)
+
+    assert handoff.order_id == order.id
+    assert handoff.renewal_attempt_id == attempt.id
+    assert handoff.collection_attempt_id == collection.id
+    assert handoff.payment_intent_id == payment_intent.id
   end
 
   defp create_fixture!(label, term, billing_mode \\ :merchant_managed) do
@@ -505,6 +613,20 @@ defmodule Store.Subscriptions.JC256RenewalTermAuditTest do
   defp fetch_payment_intent!(id) do
     Ash.get!(PaymentIntent, id,
       domain: Store.Payments,
+      authorize?: false,
+      context: %{system?: true}
+    )
+  end
+
+  defp fetch_payment_intent_by_key!(key) do
+    PaymentIntent
+    |> Ash.Query.filter(expr(payment_intent_key == ^key))
+    |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_order!(id) do
+    Ash.get!(Order, id,
+      domain: Store.Orders,
       authorize?: false,
       context: %{system?: true}
     )

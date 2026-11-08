@@ -7,8 +7,6 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
   alias Ash.Resource.Info
   alias Oban.Job
   alias Store.Entitlements.EntitlementGrant
-  alias Store.Payments.PaymentIntent
-  alias Store.Payments.Types.ProviderObservation
   alias Store.Repo
 
   alias Store.Subscriptions.{
@@ -22,6 +20,7 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
   }
 
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
   alias Store.Workers.RunDueScheduledCancellationsWorker
 
@@ -405,16 +404,9 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     {customer, subscription} =
       create_subscription("jc242_after_b", %{started_at: DateTime.add(now, -80 * 86_400, :second)})
 
-    enable_stripe!()
+    StripeAPIStub.stub_unexpected!("fresh renewal must not contact Stripe")
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-      )
-    end)
-
-    assert {:ok, :processed} =
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
 
     [attempt] = renewal_attempts(subscription.id)
@@ -442,16 +434,9 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
         started_at: DateTime.add(now, -80 * 86_400, :second)
       })
 
-    enable_stripe!()
+    StripeAPIStub.stub_unexpected!("fresh renewal must not contact Stripe")
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-      )
-    end)
-
-    assert {:ok, :processed} =
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
 
     [attempt] = renewal_attempts(subscription.id)
@@ -497,18 +482,8 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
       })
 
     enable_stripe!()
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-      )
-    end)
-
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    [attempt] = renewal_attempts(subscription.id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
 
     assert {:ok, scheduled} =
              Facade.cancel_subscription_for_user(customer, subscription.id, :period_end)
@@ -517,14 +492,8 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     assert is_nil(scheduled.cancel_at_period_end_at)
     assert attempt.failure_code == nil
 
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
-    observation = authoritative_success_observation(payment_intent)
-
-    assert {:ok, %{outcome: :authoritative_success, evidence: payment_attempt}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               observation
-             )
+    payment_intent = reached.payment_intent
+    payment_attempt = observe_and_apply_success!(reached)
 
     collection = collection_for_attempt!(attempt.id)
     assert collection.financial_outcome == :verified_success
@@ -559,18 +528,8 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
       })
 
     enable_stripe!()
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-      )
-    end)
-
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    [attempt] = renewal_attempts(subscription.id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
 
     assert {:ok, scheduled} =
              Facade.cancel_subscription_for_user(customer, subscription.id, :period_end)
@@ -590,13 +549,8 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
                [Ecto.UUID.dump!(subscription.id), Ecto.UUID.dump!(later_attempt.id)]
              )
 
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
-
-    assert {:ok, %{evidence: payment_attempt}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               authoritative_success_observation(payment_intent)
-             )
+    payment_intent = reached.payment_intent
+    payment_attempt = observe_and_apply_success!(reached)
 
     collection = collection_for_attempt!(attempt.id)
     assert collection.payment_attempt_id == payment_attempt.id
@@ -627,18 +581,8 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     _grant = issue_subscription_grant!(subscription)
 
     enable_stripe!()
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-      )
-    end)
-
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    [attempt] = renewal_attempts(subscription.id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
     assert DateTime.compare(attempt.period_end_at, now) == :lt
 
     assert {:ok, scheduled} =
@@ -646,13 +590,8 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
 
     assert scheduled.cancel_after_renewal_attempt_id == attempt.id
 
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
-
-    assert {:ok, %{evidence: payment_attempt}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               authoritative_success_observation(payment_intent)
-             )
+    payment_intent = reached.payment_intent
+    payment_attempt = observe_and_apply_success!(reached)
 
     collection = collection_for_attempt!(attempt.id)
     assert collection.financial_outcome == :verified_success
@@ -695,30 +634,12 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
       })
 
     enable_stripe!()
-    post_count = :atomics.new(1, [])
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      :atomics.add(post_count, 1, 1)
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => "processing"})
-      )
-    end)
-
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    [attempt] = renewal_attempts(subscription.id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
     assert DateTime.compare(attempt.period_end_at, now) == :lt
 
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
-
-    assert {:ok, %{outcome: :authoritative_success, evidence: payment_attempt}} =
-             Store.Payments.record_and_apply_payment_observation_for_system(
-               payment_intent,
-               authoritative_success_observation(payment_intent)
-             )
+    payment_intent = reached.payment_intent
+    payment_attempt = observe_and_apply_success!(reached)
 
     collection = collection_for_attempt!(attempt.id)
     assert collection.financial_outcome == :verified_success
@@ -798,8 +719,6 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
              Repo.query("SELECT count(*) FROM refunds WHERE order_id = $1", [
                Ecto.UUID.dump!(attempt.order_id)
              ])
-
-    assert :atomics.get(post_count, 1) == 1
   end
 
   test "due worker terminalizes with the funded boundary and one effect and email" do
@@ -1209,31 +1128,25 @@ defmodule Store.Subscriptions.Sbh4002DurablePeriodBoundaryTerminalizationTest do
     count
   end
 
-  defp fetch_payment_intent!(id) do
-    query = PaymentIntent |> Ash.Query.filter(expr(id == ^id))
-
-    Ash.read_one!(query,
-      domain: Store.Payments,
-      authorize?: false,
-      context: %{system?: true}
+  defp observe_and_apply_success!(reached) do
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "succeeded")
     )
-  end
 
-  defp authoritative_success_observation(%PaymentIntent{} = payment_intent) do
-    %ProviderObservation{
-      provider: payment_intent.provider,
-      provider_reference: payment_intent.provider_payment_id,
-      provider_reference_kind: :payment_intent,
-      provider_transaction_id: payment_intent.provider_payment_id,
-      local_payment_intent_id: payment_intent.id,
-      observation_source: :verification,
-      normalized_outcome: :authoritative_success,
-      raw_provider_status: "succeeded",
-      amount_minor: payment_intent.amount_received_minor,
-      currency: payment_intent.currency,
-      provider_environment: "test",
-      observed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    input = %Store.Payments.Inputs.ObservePaymentIntentInput{
+      payment_intent_id: reached.payment_intent.id
     }
+
+    assert {:ok, observed} = Store.Payments.Facade.observe_payment_intent_for_system(input)
+
+    assert {:ok, %{outcome: :authoritative_success, payment_intent: _intent}} =
+             Store.Payments.Facade.apply_observed_payment_outcome_for_system(observed)
+
+    collection = collection_for_attempt!(reached.attempt.id)
+    assert collection.financial_outcome == :verified_success
+    assert collection.payment_attempt_id == observed.evidence.id
+    observed.evidence
   end
 
   defp create_renewal_attempt(subscription) do

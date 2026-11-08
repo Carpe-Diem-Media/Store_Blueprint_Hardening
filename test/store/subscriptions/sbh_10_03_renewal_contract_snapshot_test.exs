@@ -5,6 +5,8 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
   require Ash.Query
 
   alias Store.Orders.Order
+  alias Store.Payments.Facade, as: PaymentsFacade
+  alias Store.Payments.Inputs.ObservePaymentIntentInput
   alias Store.Payments.PaymentIntent
 
   alias Store.Subscriptions.{
@@ -13,6 +15,7 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     PlanRevision,
     RenewalAttempt,
     RenewalCollectionAttempt,
+    RenewalCollectionAttempts,
     Scheduler,
     Subscription
   }
@@ -24,6 +27,7 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
 
   alias Store.SubscriptionsFixtures
   alias Store.Support.Telemetry.RepoStats
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   setup context do
@@ -115,48 +119,24 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     {:ok, expected_period} =
       Scheduler.next_period(before_consumption.current_period_end_at, target_revision)
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      attempt_id = params["metadata[renewal_attempt_id]"]
-      assert is_binary(attempt_id)
-      bound_attempt = fetch_attempt!(attempt_id)
-      bound_change = fetch_contract_change!(contract_change_id)
-      bound_subscription = fetch_subscription!(subscription.id)
-
-      assert bound_attempt.charged_contract_version == 1
-      assert bound_attempt.plan_revision_id == target_revision.id
-      assert bound_attempt.contract_change_id == contract_change_id
-      assert bound_attempt.variant_id == target_variant.id
-      assert bound_attempt.quantity == 2
-      assert bound_attempt.amount_minor == 4_700
-      assert bound_attempt.currency == "EUR"
-      assert bound_change.status == :bound_to_renewal
-      assert bound_subscription.current_contract_change_id == nil
-      assert bound_subscription.pending_variant_id == nil
-      assert bound_subscription.pending_subscription_plan_id == nil
-      assert bound_subscription.pending_renewal_amount_minor == nil
-      assert bound_subscription.pending_renewal_currency == nil
-      assert bound_subscription.change_effective_at == nil
-
-      conn
-      |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.resp(200, Jason.encode!(StripeAPIStub.payment_intent_response(params)))
-    end)
+    StripeAPIStub.stub_unexpected!("fresh renewal preparation must not contact Stripe")
 
     {renewal_result, renewal_stats} =
       RepoStats.capture(fn ->
         Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
       end)
 
-    assert {:ok, :processed} = renewal_result
-    # Fresh dispatch adds ten fixed statements: six session-protocol statements and four
-    # current Subscription/payment-method authority reads.
-    assert renewal_stats.query_count <= 100 + 10
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} = renewal_result
+    assert renewal_stats.query_count <= 100
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
     contract_change = fetch_contract_change!(contract_change_id)
     after_consumption = fetch_subscription!(subscription.id)
     order = fetch_order!(attempt.order_id)
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
+    [collection] = list_collections!(attempt.id)
+
+    payment_intent =
+      fetch_payment_intent_by_key!(RenewalCollectionAttempts.payment_intent_key(collection.id))
 
     assert attempt.charged_contract_version == 1
     assert attempt.plan_revision_id == target_revision.id
@@ -205,25 +185,19 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
 
     assert after_consumption.aggregate_version == before_consumption.aggregate_version + 1
     assert order.grand_total_minor == 9_400
-    assert payment_intent.amount_received_minor == 9_400
+    assert payment_intent.state == :created
+    assert payment_intent.provider_payment_id == nil
+    assert payment_intent.order_id == order.id
+    assert collection.dispatch_state == :not_started
+    assert collection.financial_outcome == :unresolved
 
     later_plan = SubscriptionsFixtures.create_subscription_plan!(%{amount_minor: 8_900})
     SubscriptionsFixtures.attach_variant_plan!(target_variant.id, later_plan.id)
     later_revision = SubscriptionsFixtures.create_plan_revision!(later_plan)
     assert {:ok, later_target} = queue_plan_change(customer, after_consumption, later_plan)
 
-    StripeAPIStub.stub_payment_observation(payment_intent.provider_payment_id, %{
-      "amount" => payment_intent.amount_received_minor,
-      "amount_received" => payment_intent.amount_received_minor,
-      "currency" => String.downcase(payment_intent.currency),
-      "id" => payment_intent.provider_payment_id,
-      "livemode" => false,
-      "metadata" => %{"local_intent_id" => payment_intent.id},
-      "status" => "succeeded"
-    })
-
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    mark_reached_success!(reached)
 
     assert fetch_attempt!(attempt.id).plan_revision_id == target_revision.id
     assert fetch_attempt!(attempt.id).contract_change_id == contract_change_id
@@ -235,14 +209,6 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
              :queued
 
     assert later_revision.id != fetch_attempt!(attempt.id).plan_revision_id
-
-    payment_intent
-    |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
-    |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-
-    order
-    |> Ash.Changeset.for_update(:mark_paid, %{}, context: %{system?: true})
-    |> Ash.update!(domain: Store.Orders, authorize?: false, context: %{system?: true})
 
     assert {:ok, :reconciled} =
              Facade.reconcile_paid_subscription_renewal_for_system(
@@ -299,11 +265,10 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     assert {:ok, queued_x} = queue_plan_change(customer, subscription, x_plan)
     x = fetch_contract_change!(queued_x.current_contract_change_id)
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
-    collection = hd(list_collections!(attempt.id))
+    collection = reached.collection
     assert attempt.contract_change_id == x.id
     assert fetch_contract_change!(x.id).status == :bound_to_renewal
 
@@ -334,31 +299,10 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     before_z_reconciliation = z
     before_reconciliation = fetch_subscription!(subscription.id)
 
-    payment_intent = fetch_payment_intent!(collection.payment_intent_id)
     order = fetch_order!(attempt.order_id)
 
-    StripeAPIStub.stub_payment_observation(payment_intent.provider_payment_id, %{
-      "amount" => payment_intent.amount_received_minor,
-      "amount_received" => payment_intent.amount_received_minor,
-      "currency" => String.downcase(payment_intent.currency),
-      "id" => payment_intent.provider_payment_id,
-      "livemode" => false,
-      "metadata" => %{"local_intent_id" => payment_intent.id},
-      "status" => "succeeded"
-    })
-
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    assert hd(list_collections!(attempt.id)).financial_outcome == :verified_success
-
-    payment_intent
-    |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
-    |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-
-    order
-    |> Ash.Changeset.for_update(:mark_paid, %{}, context: %{system?: true})
-    |> Ash.update!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+    mark_reached_success!(reached)
+    assert fetch_collection!(collection.id).financial_outcome == :verified_success
 
     reconciliation_opts = exact_reconciliation_opts!(attempt)
 
@@ -425,15 +369,15 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
 
     before = fetch_subscription!(subscription.id)
 
+    StripeAPIStub.stub_unexpected!("fresh renewal preparation must not contact Stripe")
+
     {result, stats} =
       RepoStats.capture(fn ->
         Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
       end)
 
-    assert {:ok, :processed} = result
-    # Fresh dispatch adds ten fixed statements: six session-protocol statements and four
-    # current Subscription/payment-method authority reads.
-    assert stats.query_count <= 93 + 10
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} = result
+    assert stats.query_count <= 93
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
     after_binding = fetch_subscription!(subscription.id)
@@ -472,7 +416,9 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     assert retired_revision.status == :retired
     assert replacement.status == :effective
 
-    assert {:ok, :processed} =
+    StripeAPIStub.stub_unexpected!("fresh renewal preparation must not contact Stripe")
+
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
@@ -520,22 +466,19 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
 
     assert {:ok, _queued} = queue_plan_change(customer, subscription, target_plan)
 
-    request_count = :atomics.new(1, [])
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    StripeAPIStub.stub_unexpected!("legacy retry recovery must not submit another charge")
 
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      request_no = :atomics.add_get(request_count, 1, 1)
-      status = if request_no == 1, do: "canceled", else: "succeeded"
-
-      StripeAPIStub.json_response(
-        conn,
-        StripeAPIStub.payment_intent_response(params, %{"status" => status})
-      )
-    end)
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "canceled")
+    )
 
     assert {:error, %{code: "PAYMENT_FAILED"}} =
              Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
+    assert attempt.id == reached.attempt.id
     assert attempt.charged_contract_snapshot["grace_period_days"] == 14
     captured_attempt_id = attempt.id
     captured_renewal_key = attempt.renewal_key
@@ -568,37 +511,20 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     )
     |> Ash.update!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
 
-    attempt
-    |> Ash.Changeset.for_update(
-      :mark_failed,
-      %{failure_code: "PAYMENT_FAILED", failure_message: "retry proof", attempt_no: 2},
-      context: %{system?: true}
-    )
-    |> Ash.update!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-
-    subscription = fetch_subscription!(subscription.id)
-
-    subscription
-    |> Ash.Changeset.for_update(
-      :mark_past_due_transition,
-      %{
-        billing_status_reason: "PAYMENT_FAILED",
-        past_due_since_at: DateTime.add(now, -8 * 86_400, :second),
-        dunning_attempt_count: 1,
-        next_retry_at: DateTime.add(now, -10, :second)
-      },
-      context: %{system?: true},
-      private_arguments: %{dunning_renewal_attempt_id: attempt.id}
-    )
-    |> Ash.update!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+    past_due = fetch_subscription!(subscription.id)
+    assert past_due.status == :past_due
+    assert past_due.current_dunning_renewal_attempt_id == attempt.id
+    assert attempt.status == :failed
 
     previous_database = Application.fetch_env(:elixir, :time_zone_database)
 
     try do
       Application.put_env(:elixir, :time_zone_database, Calendar.UTCOnlyTimeZoneDatabase)
 
-      assert {:ok, :processed} =
-               Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+      assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
+               Facade.process_due_subscription_renewal_for_system(subscription.id,
+                 now: past_due.next_retry_at
+               )
     after
       case previous_database do
         {:ok, database} -> Application.put_env(:elixir, :time_zone_database, database)
@@ -606,12 +532,28 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
       end
     end
 
-    assert :atomics.get(request_count, 1) == 2
+    [first_collection, retry_collection] = list_collections!(attempt.id)
+    assert first_collection.id == reached.collection.id
+    assert retry_collection.id != first_collection.id
+    assert retry_collection.dispatch_state == :not_started
+    assert retry_collection.financial_outcome == :unresolved
+
+    retry_intent =
+      fetch_payment_intent_by_key!(
+        RenewalCollectionAttempts.payment_intent_key(retry_collection.id)
+      )
+
+    assert retry_intent.order_id == attempt.order_id
+    assert retry_intent.state == :created
+    assert retry_intent.provider_payment_id == nil
 
     retried_subscription = fetch_subscription!(subscription.id)
     retried_attempt = fetch_attempt!(attempt.id)
 
     assert retried_subscription.status == :past_due
+    assert retried_subscription.failed_payment_boundary_at == past_due.failed_payment_boundary_at
+    assert retried_subscription.dunning_attempt_count == past_due.dunning_attempt_count
+    assert retried_subscription.next_retry_at == past_due.next_retry_at
     assert retried_attempt.status == :processing
     assert retried_attempt.id == captured_attempt_id
     assert retried_attempt.renewal_key == captured_renewal_key
@@ -740,7 +682,9 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     )
     |> Ash.update!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
 
-    assert {:ok, :processed} =
+    StripeAPIStub.stub_unexpected!("fresh renewal preparation must not contact Stripe")
+
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
@@ -806,20 +750,11 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     %{subscription: subscription, now: now} =
       create_due_live_fixture!("sbh_10_03_unbound_paid_reconciliation")
 
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    attempt = fetch_attempt_for_subscription!(subscription.id)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    mark_reached_success!(reached)
+    attempt = fetch_attempt!(reached.attempt.id)
     order = fetch_order!(attempt.order_id)
-    payment_intent = fetch_payment_intent!(attempt.payment_intent_id)
-
-    payment_intent
-    |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
-    |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-
-    order
-    |> Ash.Changeset.for_update(:mark_paid, %{}, context: %{system?: true})
-    |> Ash.update!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+    payment_intent = fetch_payment_intent!(reached.payment_intent.id)
 
     clear_renewal_attempt_binding!(attempt.id)
 
@@ -1061,7 +996,9 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
   test "normal RenewalAttempt update actions cannot mutate charged-contract fields" do
     %{subscription: subscription, now: now} = create_due_live_fixture!("sbh_10_03_write_guard")
 
-    assert {:ok, :processed} =
+    StripeAPIStub.stub_unexpected!("fresh renewal preparation must not contact Stripe")
+
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
 
     attempt = fetch_attempt_for_subscription!(subscription.id)
@@ -1115,26 +1052,79 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
 
     assert {:ok, queued} = queue_plan_change(customer, subscription, target_plan)
     target_id = Map.fetch!(queued, :current_contract_change_id)
+    before_race = fetch_subscription!(subscription.id)
+    orders_before = Store.Repo.aggregate(Order, :count, :id)
+    intents_before = Store.Repo.aggregate(PaymentIntent, :count, :id)
 
-    results =
+    StripeAPIStub.stub_unexpected!("concurrent fresh renewal preparation must not contact Stripe")
+    barrier = make_ref()
+    owner = self()
+
+    tasks =
       1..2
       |> Enum.map(fn _ ->
         Task.async(fn ->
+          send(owner, {:renewal_ready, barrier, self()})
+
+          receive do
+            {:release, ^barrier} -> :ok
+          after
+            5_000 -> raise "concurrent renewal release timed out"
+          end
+
           Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
         end)
       end)
-      |> Enum.map(&Task.await(&1, 10_000))
 
-    assert Enum.all?(results, &match?({:ok, _}, &1))
+    results =
+      try do
+        Enum.each(tasks, fn task ->
+          task_pid = task.pid
+          assert_receive {:renewal_ready, ^barrier, ^task_pid}, 5_000
+        end)
+
+        Enum.each(tasks, fn task -> send(task.pid, {:release, barrier}) end)
+        Enum.map(tasks, &Task.await(&1, 10_000))
+      after
+        Enum.each(tasks, &Task.shutdown(&1, :brutal_kill))
+      end
+
+    assert Enum.any?(results, &match?({:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}}, &1))
+
+    # A caller that loses the processing claim returns processed without financial work.
+    assert Enum.all?(results, fn
+             {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} -> true
+             {:ok, :processed} -> true
+             _other -> false
+           end)
+
+    assert Store.Repo.aggregate(Order, :count, :id) == orders_before + 1
+    assert Store.Repo.aggregate(PaymentIntent, :count, :id) == intents_before + 1
     attempts = list_attempts!(subscription.id)
     assert length(attempts) == 1
     assert hd(attempts).plan_revision_id == target_revision.id
     assert hd(attempts).contract_change_id == target_id
     assert hd(attempts).charged_contract_version == 1
     assert fetch_contract_change!(target_id).status == :bound_to_renewal
+    [collection] = list_collections!(hd(attempts).id)
+    assert collection.renewal_attempt_id == hd(attempts).id
+    assert collection.dispatch_state == :not_started
+    assert collection.financial_outcome == :unresolved
 
-    assert fetch_subscription!(subscription.id).aggregate_version ==
-             subscription.aggregate_version + 2
+    intent =
+      fetch_payment_intent_by_key!(RenewalCollectionAttempts.payment_intent_key(collection.id))
+
+    assert intent.order_id == hd(attempts).order_id
+    assert intent.state == :created
+    assert intent.provider_payment_id == nil
+
+    after_race = fetch_subscription!(subscription.id)
+
+    assert after_race.aggregate_version == before_race.aggregate_version + 1
+    assert after_race.current_period_start_at == before_race.current_period_start_at
+    assert after_race.current_period_end_at == before_race.current_period_end_at
+    assert after_race.status == before_race.status
+    assert after_race.dunning_attempt_count == before_race.dunning_attempt_count
   end
 
   defp queue_plan_change(actor, subscription, plan) do
@@ -1268,5 +1258,34 @@ defmodule Store.Subscriptions.Sbh1003RenewalContractSnapshotTest do
     PaymentIntent
     |> Ash.Query.filter(expr(id == ^id))
     |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_payment_intent_by_key!(key) do
+    PaymentIntent
+    |> Ash.Query.filter(expr(payment_intent_key == ^key))
+    |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+  end
+
+  defp fetch_collection!(id) do
+    RenewalCollectionAttempt
+    |> Ash.Query.filter(expr(id == ^id))
+    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+  end
+
+  defp mark_reached_success!(reached) do
+    StripeAPIStub.stub_payment_observation(
+      reached.payment_intent.provider_payment_id,
+      ReachedRenewalFixtures.observation_body(reached, "succeeded")
+    )
+
+    assert {:ok, observed} =
+             PaymentsFacade.observe_payment_intent_for_system(%ObservePaymentIntentInput{
+               payment_intent_id: reached.payment_intent.id
+             })
+
+    assert {:ok, %{outcome: outcome}} =
+             PaymentsFacade.apply_observed_payment_outcome_for_system(observed)
+
+    assert outcome in [:authoritative_success, :already_applied_success]
   end
 end

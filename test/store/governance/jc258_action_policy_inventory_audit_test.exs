@@ -77,6 +77,7 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
     :replay_scheduled_cancellation_notifications_for_system,
     :list_past_due_missing_failed_payment_boundary_for_system,
     :list_due_renewal_jobs_for_system,
+    :list_due_renewal_job_page_for_system,
     :process_due_subscription_renewal_for_system,
     :reconcile_paid_subscription_renewal_for_system
   ]
@@ -183,6 +184,8 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
     {StoredPaymentMethod, :mark_revoked} => {:admin_write, :needs_product_decision},
     {StoredPaymentMethod, :read} => {:owner_or_staff_read, :needs_product_decision},
     {Subscription, :activate_now} => {:admin_or_system_write, :system_row_gap},
+    {Subscription, :advance_payment_method_setup_generation} =>
+      {:system_only, :needs_product_decision},
     {Subscription, :cancel_at_period_end_transition} => {:self_or_admin_write, :matrix},
     {Subscription, :cancel_now_transition} => {:self_or_admin_write, :matrix},
     {Subscription, :consume_contract_change_for_renewal} =>
@@ -240,7 +243,7 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
       |> Enum.sort()
 
     assert compiled == @action_policy |> Map.keys() |> Enum.sort()
-    assert length(compiled) == 92
+    assert length(compiled) == 93
     resources = @action_policy |> Map.keys() |> Enum.map(&elem(&1, 0)) |> MapSet.new()
     assert resources == MapSet.new(@resource_modules)
   end
@@ -252,10 +255,66 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
 
     assert length(@user_facade_names) == 7
     assert length(@admin_facade_names) == 7
-    assert length(@system_facade_names) == 33
-    assert MapSet.size(expected) == 47
+    assert length(@system_facade_names) == 34
+    assert MapSet.size(expected) == 48
     assert names == expected
-    assert length(functions) == 61
+
+    expected_arities = %{
+      list_subscriptions_for_user: [2],
+      get_subscription_for_user: [2],
+      get_subscription_detail_for_user: [2],
+      cancel_subscription_for_user: [2, 3],
+      queue_subscription_plan_change_for_user: [3],
+      queue_subscription_variant_change_for_user: [3],
+      start_subscription_payment_method_update_for_user: [3],
+      list_subscriptions_for_admin: [2],
+      get_subscription_for_admin: [2],
+      get_subscription_detail_for_admin: [2],
+      cancel_subscription_for_admin: [2, 3],
+      queue_subscription_plan_change_for_admin: [3],
+      queue_subscription_variant_change_for_admin: [3],
+      start_subscription_payment_method_update_for_admin: [3],
+      list_subscription_access_inventory_window_for_system: [1],
+      subscription_access_inventory_upper_bound_for_system: [0],
+      establish_access_effect_for_system: [1],
+      get_current_access_effect_for_system: [1],
+      list_applied_access_verification_window_for_system: [1],
+      verify_subscription_access_window_for_system: [1],
+      validate_complete_bound_renewal_attempt_for_system: [1],
+      mark_access_effect_pending_for_system: [1],
+      mark_access_effect_applied_for_system: [1],
+      mark_access_effect_failed_retryable_for_system: [1],
+      retry_access_effect_for_system: [1],
+      execute_effective_access_effect_for_system: [1],
+      reconcile_subscription_access_for_system: [1],
+      execute_suspension_access_effect_for_system: [1],
+      repair_applied_access_effect_for_system: [1],
+      repair_suspension_access_effect_projection_for_system: [1],
+      run_subscription_access_effect_recovery_for_system: [0, 1],
+      run_access_effect_target_order_reconciliation_for_system: [0, 1],
+      list_variant_subscription_plan_options_for_system: [1, 2],
+      resolve_variant_subscription_plan_for_system: [1, 2],
+      ensure_membership_purchase_allowed_for_system: [2],
+      order_has_subscription_lines_for_system: [1],
+      order_is_subscription_only_for_system: [1],
+      create_subscriptions_from_paid_order_for_system: [1],
+      handle_payment_method_update_succeeded_for_system: [1],
+      run_due_renewals_for_system: [0, 1],
+      run_due_failed_payment_suspensions_for_system: [0, 1],
+      run_due_scheduled_cancellations_for_system: [0, 1],
+      replay_scheduled_cancellation_notifications_for_system: [0, 1],
+      list_past_due_missing_failed_payment_boundary_for_system: [0, 1],
+      list_due_renewal_jobs_for_system: [0, 1],
+      list_due_renewal_job_page_for_system: [0, 1],
+      process_due_subscription_renewal_for_system: [1, 2],
+      reconcile_paid_subscription_renewal_for_system: [1, 2]
+    }
+
+    expected_functions =
+      for {name, arities} <- expected_arities, arity <- arities, do: {name, arity}
+
+    assert length(expected_functions) == 63
+    assert Enum.sort(functions) == Enum.sort(expected_functions)
   end
 
   test "public plan query filters archived plans for all actor contexts" do
@@ -440,6 +499,7 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
   defp argument_value(:after_inserted_at, _resource, _fixtures), do: nil
   defp argument_value(:after_updated_at, _resource, _fixtures), do: nil
   defp argument_value(:after_boundary_at, _resource, _fixtures), do: nil
+  defp argument_value(:after_renewal_at, _resource, _fixtures), do: nil
   defp argument_value(:as_of, _resource, _fixtures), do: now()
   defp argument_value(:now, _resource, _fixtures), do: now()
   defp argument_value(:through_inserted_at, _resource, _fixtures), do: now()

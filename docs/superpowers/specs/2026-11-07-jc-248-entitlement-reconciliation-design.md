@@ -2,7 +2,7 @@
 
 ## Authority and scope
 
-The existing Store Blueprint Linear queue guides this work. JC-245, JC-246 and JC-247 are Done and implemented on canonical main `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`. The user requested one stacked draft PR per ticket, so this branch follows JC-290 at `d1d60edfaa7f9ff24dec340cbee9e3f8fac234eb`, PR #216. Use one checkout and sequential implementation tasks with independent specification and quality reviews.
+The existing Store Blueprint Linear queue guides this work. JC-245, JC-246 and JC-247 are Done and implemented on canonical main `12cb5ee4107ca465c9b773b258c1cbae4754b2c7`. The user requested one stacked draft PR per ticket. This branch originally followed JC-290 at `d1d60edfaa7f9ff24dec340cbee9e3f8fac234eb`, PR #216, and now incorporates its correction at `35ce5bce10fc31f6de5426516d235968db71c0e3` append-only. Use one checkout and sequential implementation tasks with independent specification and quality reviews.
 
 The latest durable AccessEffect is the desired access authority for its exact Subscription source. PostgreSQL grants are the actual state. Neither cache contents, job history, mutable plans nor Subscription status determine a repair target. Store has a scalar zero-or-one target; this work does not introduce NewYou target-set policy.
 
@@ -37,6 +37,8 @@ Missing-effect inventory is diagnostic. Walk bounded Subscription primary-key wi
 Focused tests cover missing and wrong active grants after APPLIED, stale reactivation after a non-effective target, exact scope replacement, empty targets, other sources, valid revocation history, immutable provenance mismatch, unrelated aggregate versions, unpaid future contracts, stale work and projection ordering. Include nonterminal re-drive, repeated/lost enqueue, exhausted retries, worker continuation, cursor restart and old-target reachability.
 
 Measure healthy discovery query counts across page sizes, mismatch repair costs, new selector plans and historical source fanout. Real-connection tests must prove stale scans and delayed workers cannot defeat newer authority. Reuse the required connection test workflow and run each required repetition twice. Run the repository's full checks, strict suite, migration alignment and exact-head reviews before publication.
+
+The corrected parent integrated without conflicts or JC-248 production changes. The combined focused run passed 114 tests, including both JC-248 physical repair races and the strict-dispatch, setup-supersession and timezone-batch regressions. Full `mix check` passed three properties and 1,656 tests with zero failures and 27 excluded connection cases. Types and TEST migration alignment passed. The four required connection modules passed 21 tests twice; the other six affected connection cases passed separately. Independent integration spec and quality reviews found no actionable defect. Existing type filters, documentation warnings and diagnostic measurement limits remain. Fresh publication CI and independent external re-verification are pending; the draft has no merge approval.
 
 ## Performance & Scaling Review
 

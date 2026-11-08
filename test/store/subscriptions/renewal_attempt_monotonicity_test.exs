@@ -4,11 +4,10 @@ defmodule Store.Subscriptions.RenewalAttemptMonotonicityTest do
   import Ash.Expr
   require Ash.Query
 
-  alias Store.Orders.Order
-  alias Store.Payments.PaymentIntent
   alias Store.Payments.Types.ProviderObservation
-  alias Store.Subscriptions.{Facade, RenewalAttempt, RenewalCollectionAttempt, Subscription}
+  alias Store.Subscriptions.{Facade, RenewalAttempt, Subscription}
   alias Store.SubscriptionsFixtures
+  alias Store.TestSupport.ReachedRenewalFixtures
   alias Store.TestSupport.StripeAPIStub
 
   setup context do
@@ -48,13 +47,7 @@ defmodule Store.Subscriptions.RenewalAttemptMonotonicityTest do
   end
 
   defp due_processing_attempt!(subscription, now) do
-    assert {:ok, :processed} =
-             Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
-
-    RenewalAttempt
-    |> Ash.Query.filter(expr(subscription_id == ^subscription.id))
-    |> Ash.Query.sort(inserted_at: :desc, id: :desc)
-    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+    ReachedRenewalFixtures.prepare_reached!(subscription.id, now).attempt
   end
 
   defp reload_attempt!(attempt_id) do
@@ -297,135 +290,86 @@ defmodule Store.Subscriptions.RenewalAttemptMonotonicityTest do
         next_renewal_at: DateTime.add(now, -10, :second)
       })
 
-    {:ok, barrier} = Agent.start_link(fn -> %{release_dispatch?: false} end)
+    reached = ReachedRenewalFixtures.prepare_reached!(subscription.id, now)
+    attempt = reached.attempt
+    payment_intent = reached.payment_intent
+
+    {:ok, barrier} = Agent.start_link(fn -> %{release?: false} end)
     parent = self()
-    handler_id = {__MODULE__, :dispatch_release, make_ref()}
 
-    :ok =
-      :telemetry.attach(
-        handler_id,
-        [:store, :subscriptions, :renewal_charge_dispatch_released],
-        fn _event, _measurements, metadata, config ->
-          await_stale_failure_dispatch(metadata, config)
-        end,
-        %{parent: parent, subscription_id: subscription.id, barrier: barrier}
-      )
-
-    StripeAPIStub.stub_payment_intent(fn conn, params ->
-      StripeAPIStub.payment_intent_error(
-        conn,
-        params,
-        "failed",
-        "card_declined",
-        "stale renewal charge failed"
-      )
-    end)
-
-    renewal_task =
+    stale_writer =
       Task.async(fn ->
-        Facade.process_due_subscription_renewal_for_system(subscription.id, now: now)
+        stale_attempt = reload_attempt!(attempt.id)
+        send(parent, {:sbh7002_stale_attempt_captured, self()})
+
+        unless wait_until(fn -> Agent.get(barrier, & &1.release?) end, 2_000) do
+          raise "stale failure writer barrier timed out"
+        end
+
+        mark_failed!(stale_attempt, %{
+          failure_code: "PAYMENT_FAILED",
+          failure_message: "late stale failure",
+          attempt_no: 99
+        })
       end)
 
     on_exit(fn ->
-      :telemetry.detach(handler_id)
-
-      if Process.alive?(barrier) do
-        Agent.update(barrier, &Map.put(&1, :release_dispatch?, true))
-      end
-
-      if Process.alive?(renewal_task.pid) do
-        Task.shutdown(renewal_task, :brutal_kill)
-      end
+      if Process.alive?(barrier), do: Agent.update(barrier, &Map.put(&1, :release?, true))
+      if Process.alive?(stale_writer.pid), do: Task.shutdown(stale_writer, :brutal_kill)
     end)
 
-    assert_receive {:sbh7002_dispatch_released, ^barrier}, 10_000
-
-    attempt =
-      RenewalAttempt
-      |> Ash.Query.filter(expr(subscription_id == ^subscription.id))
-      |> Ash.Query.sort(inserted_at: :desc, id: :desc)
-      |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
-
-    renewal_order =
-      Order
-      |> Ash.Query.filter(expr(id == ^attempt.order_id))
-      |> Ash.read_one!(domain: Store.Orders, authorize?: false, context: %{system?: true})
-
-    payment_intent =
-      PaymentIntent
-      |> Ash.Query.filter(expr(id == ^attempt.payment_intent_id))
-      |> Ash.read_one!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+    assert_receive {:sbh7002_stale_attempt_captured, stale_writer_pid}, 10_000
+    assert stale_writer.pid == stale_writer_pid
 
     assert {:ok, %{outcome: :authoritative_success}} =
              Store.Payments.record_and_apply_payment_observation_for_system(
                payment_intent,
                %ProviderObservation{
                  provider: payment_intent.provider,
-                 provider_reference: payment_intent.provider_request_reference,
-                 provider_reference_kind: :transaction_reference,
-                 provider_transaction_id: "pi_jc229_race_#{payment_intent.id}",
+                 provider_reference: payment_intent.provider_payment_id,
+                 provider_reference_kind: :payment_intent,
+                 provider_transaction_id: payment_intent.provider_payment_id,
                  local_payment_intent_id: payment_intent.id,
                  observation_source: :verification,
                  normalized_outcome: :authoritative_success,
                  raw_provider_status: "succeeded",
-                 amount_minor: payment_intent.amount_received_minor,
-                 currency: payment_intent.currency,
+                 amount_minor: reached.order.grand_total_minor,
+                 currency: reached.order.currency_code,
                  provider_environment: "test",
                  observed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
                }
              )
 
-    collection =
-      RenewalCollectionAttempt
-      |> Ash.Query.filter(
-        expr(
-          renewal_attempt_id == ^attempt.id and
-            financial_outcome == :verified_success
-        )
-      )
-      |> Ash.read_one!(
-        domain: Store.Subscriptions,
-        authorize?: false,
-        context: %{system?: true}
-      )
-
     assert {:ok, :reconciled} =
-             Facade.reconcile_paid_subscription_renewal_for_system(renewal_order.id,
-               renewal_attempt_id: attempt.id,
-               collection_attempt_id: collection.id,
-               payment_intent_id: collection.payment_intent_id
+             Facade.reconcile_paid_subscription_renewal_for_system(reached.order.id,
+               renewal_attempt_id: reached.attempt.id,
+               collection_attempt_id: reached.collection.id,
+               payment_intent_id: reached.payment_intent.id
              )
 
-    Agent.update(barrier, &Map.put(&1, :release_dispatch?, true))
-
-    assert {:ok, :processed} = Task.await(renewal_task, 10_000)
+    Agent.update(barrier, &Map.put(&1, :release?, true))
+    assert stale_record_error?(Task.await(stale_writer, 10_000))
 
     reloaded_attempt = reload_attempt!(attempt.id)
     assert reloaded_attempt.status == :succeeded
 
     reloaded_subscription = reload_subscription!(subscription.id)
     assert reloaded_subscription.status == :active
+    assert reloaded_subscription.dunning_attempt_count == 0
     refute reloaded_subscription.status == :past_due
   end
 
-  defp await_stale_failure_dispatch(metadata, config) do
-    if metadata.subscription_id == config.subscription_id do
-      send(config.parent, {:sbh7002_dispatch_released, config.barrier})
-
-      wait_until(fn -> Agent.get(config.barrier, & &1.release_dispatch?) end, 2_000)
-
-      unless Agent.get(config.barrier, & &1.release_dispatch?) do
-        raise "stale failure dispatch release barrier timed out"
-      end
-    end
-  end
-
   defp wait_until(predicate, attempts) do
-    if predicate.() or attempts <= 0 do
-      :ok
-    else
-      Process.sleep(5)
-      wait_until(predicate, attempts - 1)
+    cond do
+      predicate.() ->
+        true
+
+      attempts <= 0 ->
+        false
+
+      true ->
+        Process.sleep(5)
+        wait_until(predicate, attempts - 1)
     end
   end
 end

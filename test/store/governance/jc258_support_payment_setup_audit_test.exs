@@ -7,6 +7,7 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
   alias Store.Payments.PaymentIntent
   alias Store.Subscriptions.Facade, as: SubscriptionsFacade
   alias Store.Subscriptions.Inputs.StartSubscriptionPaymentMethodUpdateInput
+  alias Store.Subscriptions.Subscription
   alias Store.SubscriptionsFixtures
   alias Store.TestFixtures
   alias Store.TestSupport.StripeAPIStub
@@ -120,6 +121,7 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
     assert intent.provider_payment_id =~ ~r/^seti_test_/
     assert intent.state == :submitted
     assert_secret_match!(result.client_secret, intent.provider_client_secret)
+    assert_setup_generation!(fixture.subscription.id, intent)
 
     expected_client_secret =
       observed_request
@@ -163,6 +165,12 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
                  )
 
         assert_setup_result!(result, fixture.subscription.id)
+
+        assert_setup_generation!(
+          fixture.subscription.id,
+          fetch_payment_intent!(result.payment_intent_id)
+        )
+
         {fixture, result}
       end)
 
@@ -177,6 +185,12 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
              )
 
     assert_setup_result!(result, fixture.subscription.id)
+
+    assert_setup_generation!(
+      fixture.subscription.id,
+      fetch_payment_intent!(result.payment_intent_id)
+    )
+
     fixtures_and_results = fixtures_and_results ++ [{fixture, result}]
 
     assert length(Agent.get(calls, & &1)) == 3
@@ -196,6 +210,7 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
     editor = actor_with_role!(:editor, "jc258_editor")
     input = setup_input!(fixture.subscription.id)
     before_count = setup_intent_count(fixture.subscription.id)
+    before_generation = setup_generation(fixture.subscription.id)
     StripeAPIStub.stub_unexpected!("rejected admin setup must not call Stripe")
 
     for actor <- [ordinary_owner, non_owner, editor] do
@@ -210,6 +225,7 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
     end
 
     assert setup_intent_count(fixture.subscription.id) == before_count
+    assert setup_generation(fixture.subscription.id) == before_generation
   end
 
   test "customer setup remains owner scoped and nil actors fail the facade contract" do
@@ -217,6 +233,7 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
     other_customer = SubscriptionsFixtures.create_customer!("jc258_user_non_owner")
     input = setup_input!(owner_fixture.subscription.id)
     before_count = setup_intent_count(owner_fixture.subscription.id)
+    before_generation = setup_generation(owner_fixture.subscription.id)
     StripeAPIStub.stub_unexpected!("non-owner and nil-actor setup must not call Stripe")
 
     assert {:ok, nil} =
@@ -235,12 +252,14 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
 
     assert error.code == "VALIDATION_ERROR"
     assert setup_intent_count(owner_fixture.subscription.id) == before_count
+    assert setup_generation(owner_fixture.subscription.id) == before_generation
   end
 
   test "support cannot directly create a PaymentIntent under its own actor authority" do
     support = actor_with_role!(:support, "jc258_direct_intent_support")
     fixture = stripe_subscription_fixture!("jc258_direct_intent")
     before_count = setup_intent_count(fixture.subscription.id)
+    before_generation = setup_generation(fixture.subscription.id)
     StripeAPIStub.stub_unexpected!("direct PaymentIntent create must not call Stripe")
 
     changeset =
@@ -261,6 +280,7 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
              Ash.create(changeset, domain: Store.Payments, actor: support)
 
     assert setup_intent_count(fixture.subscription.id) == before_count
+    assert setup_generation(fixture.subscription.id) == before_generation
   end
 
   defp stripe_subscription_fixture!(prefix) do
@@ -305,6 +325,20 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
     assert intent.state == :submitted
   end
 
+  defp assert_setup_generation!(subscription_id, intent) do
+    subscription =
+      Subscription
+      |> Ash.Query.filter(expr(id == ^subscription_id))
+      |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+
+    assert is_integer(intent.subscription_setup_generation)
+    assert intent.subscription_setup_generation > 0
+    assert subscription.payment_method_setup_generation == intent.subscription_setup_generation
+
+    assert intent.payment_intent_key ==
+             "pm-update:v2:#{subscription_id}:#{intent.subscription_setup_generation}"
+  end
+
   defp assert_secret_match!(returned_secret, expected_secret) do
     unless is_binary(returned_secret) and returned_secret == expected_secret do
       flunk("returned setup credential did not match the expected value")
@@ -317,6 +351,13 @@ defmodule Store.Governance.JC258SupportPaymentSetupAuditTest do
       expr(subscription_id == ^subscription_id and purpose == :subscription_payment_method_update)
     )
     |> Ash.count!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+  end
+
+  defp setup_generation(subscription_id) do
+    Subscription
+    |> Ash.Query.filter(expr(id == ^subscription_id))
+    |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: %{system?: true})
+    |> Map.fetch!(:payment_method_setup_generation)
   end
 
   defp fetch_payment_intent!(payment_intent_id) do

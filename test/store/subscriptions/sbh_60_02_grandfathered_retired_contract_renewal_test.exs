@@ -133,7 +133,7 @@ defmodule Store.Subscriptions.Sbh6002GrandfatheredRetiredContractRenewalTest do
     assert retired_revision.status == :retired
     assert replacement_revision.status == :effective
 
-    assert {:ok, :processed} =
+    assert {:error, %{code: "RENEWAL_DISPATCH_UNAVAILABLE"}} =
              Facade.process_due_subscription_renewal_for_system(fixture.subscription.id,
                now: fixture.now
              )
