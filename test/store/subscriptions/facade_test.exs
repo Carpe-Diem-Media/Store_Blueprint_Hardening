@@ -7,6 +7,9 @@ defmodule Store.Subscriptions.FacadeTest do
   import Ash.Expr
   require Ash.Query
 
+  alias Store.Carts.Facade, as: CartsFacade
+  alias Store.Carts.Inputs.CartItemInput
+
   alias Store.Catalog.{
     InventoryItem,
     ProductOption,
@@ -15,11 +18,15 @@ defmodule Store.Subscriptions.FacadeTest do
     VariantOptionSelection
   }
 
+  alias Store.Checkout
+  alias Store.Checkout.Inputs.{CheckoutFinalizeInput, CheckoutStartInput}
   alias Store.Comms.EmailOutbox
   alias Store.Entitlements.EntitlementGrant
   alias Store.Entitlements.Facade, as: EntitlementsFacade
   alias Store.Orders.{InventoryReservation, Order, OrderLineItem, PaymentApplication}
-  alias Store.Payments.PaymentIntent
+  alias Store.Payments.Facade, as: PaymentsFacade
+  alias Store.Payments.Inputs.{CreateIntentForOrderInput, ObservePaymentIntentInput}
+  alias Store.Payments.{PaymentAttempt, PaymentIntent}
   alias Store.Pricing.TaxRate
   alias Store.Shipping.Facade, as: ShippingFacade
   alias Store.Shipping.Inputs.QuoteRequest
@@ -54,10 +61,12 @@ defmodule Store.Subscriptions.FacadeTest do
 
   setup context do
     previous = Application.get_env(:store, :payments, [])
+    previous_subscription_features = Application.get_env(:store, :subscription_features, [])
     StripeAPIStub.setup_default(context)
 
     on_exit(fn ->
       Application.put_env(:store, :payments, previous)
+      Application.put_env(:store, :subscription_features, previous_subscription_features)
     end)
 
     :ok
@@ -139,6 +148,155 @@ defmodule Store.Subscriptions.FacadeTest do
     assert count_subscription_items_for_order(order.id) == 2
     assert count_access_effects_for_order(order.id) == 2
     assert count_entitlements_for_order(order.id) == 2
+  end
+
+  @tag :jc360_financial_fixture
+  test "paid checkout activation uses matching totals and provider-observed payment evidence" do
+    subscription_features = Application.get_env(:store, :subscription_features, [])
+
+    Application.put_env(
+      :store,
+      :subscription_features,
+      Keyword.put(subscription_features, :expose_purchase?, true)
+    )
+
+    customer = SubscriptionsFixtures.create_customer!("jc360_financial_activation")
+    %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
+
+    plan =
+      SubscriptionsFixtures.create_subscription_plan!(%{
+        amount_minor: 1_999,
+        currency: "USD",
+        entitlement_kind: :membership_access,
+        entitlement_scope_key: "jc360:financial:#{Ecto.UUID.generate()}"
+      })
+
+    revision = SubscriptionsFixtures.create_plan_revision!(plan)
+    _variant_plan = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
+    checkout_token = Ash.UUIDv7.generate()
+
+    assert {:ok, cart_item_input} =
+             CartItemInput.new(%{
+               "variant_id" => variant.id,
+               "subscription_plan_id" => plan.id,
+               "qty" => 1
+             })
+
+    assert {:ok, _cart} = CartsFacade.add_item_for_user(customer, checkout_token, cart_item_input)
+    assert {:ok, checkout_start_input} = CheckoutStartInput.new(%{})
+
+    assert {:ok, checkout} =
+             Checkout.start_from_cart(customer, checkout_token, checkout_start_input)
+
+    assert {:ok, finalize_input} = CheckoutFinalizeInput.new(%{})
+
+    assert {:ok, finalized} =
+             Checkout.finalize_totals(customer, checkout.checkout_key, finalize_input)
+
+    order = fetch_order!(checkout.order_id)
+
+    assert [line_item] =
+             OrderLineItem
+             |> Ash.Query.filter(expr(order_id == ^order.id))
+             |> Ash.read!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+
+    assert order.state == :pending_payment
+    assert order.grand_total_minor > 0
+    assert order.items_subtotal_minor == order.grand_total_minor
+    assert order.shipping_total_minor == 0
+    assert order.currency_code == "USD"
+    assert finalized.grand_total_minor == order.grand_total_minor
+    assert line_item.quantity == 1
+    assert line_item.unit_price_minor == revision.amount_minor
+    assert line_item.line_total_minor == order.grand_total_minor
+    assert line_item.net_line_total_minor == order.grand_total_minor
+    assert line_item.currency == order.currency_code
+    assert line_item.subscription_plan_id_snapshot == plan.id
+    assert line_item.subscription_plan_revision_id_snapshot == revision.id
+
+    assert {:ok, create_intent_input} = CreateIntentForOrderInput.new(%{"provider" => "stripe"})
+
+    assert {:ok, intent_result} =
+             Store.Payments.create_intent_for_order(
+               customer,
+               checkout.checkout_key,
+               create_intent_input
+             )
+
+    payment_intent = fetch_payment_intent!(intent_result.payment_intent_id)
+    assert payment_intent.state == :submitted
+    assert payment_intent.amount_received_minor == order.grand_total_minor
+    assert payment_intent.currency == order.currency_code
+    assert is_binary(payment_intent.provider_payment_id)
+
+    StripeAPIStub.stub_payment_observation(payment_intent.provider_payment_id, %{
+      "amount" => payment_intent.amount_received_minor,
+      "amount_received" => payment_intent.amount_received_minor,
+      "currency" => String.downcase(payment_intent.currency),
+      "id" => payment_intent.provider_payment_id,
+      "livemode" => false,
+      "metadata" => %{
+        "local_intent_id" => payment_intent.id,
+        "order_id" => order.id
+      },
+      "status" => "succeeded"
+    })
+
+    assert {:ok, observation} =
+             PaymentsFacade.observe_payment_intent_for_system(%ObservePaymentIntentInput{
+               payment_intent_id: payment_intent.id
+             })
+
+    assert observation.eligibility == :eligible
+
+    assert %PaymentAttempt{
+             observation_source: "verification",
+             outcome: "authoritative_success",
+             amount_minor: amount_minor,
+             currency: currency,
+             provider_environment: "test"
+           } = observation.evidence
+
+    assert amount_minor == order.grand_total_minor
+    assert currency == order.currency_code
+
+    assert {:ok, payment_result} =
+             PaymentsFacade.apply_observed_payment_outcome_for_system(observation)
+
+    assert payment_result.outcome == :authoritative_success
+    assert fetch_payment_intent!(payment_intent.id).state == :succeeded
+    assert fetch_order!(order.id).state == :paid
+
+    assert [%PaymentApplication{payment_intent_id: payment_intent_id}] =
+             PaymentApplication
+             |> Ash.Query.filter(expr(order_id == ^order.id))
+             |> Ash.read!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+
+    assert payment_intent_id == payment_intent.id
+
+    assert {:ok, activation} =
+             SubscriptionsFacade.create_subscriptions_from_paid_order_for_system(order.id)
+
+    assert activation.subscription_line_count == 1
+    assert activation.created_count == 1
+    assert activation.skipped_count == 0
+    assert activation.entitlement_issued_count == 1
+
+    assert [subscription] = subscriptions_for_order(order.id)
+    assert subscription.source_order_id == order.id
+    assert subscription.source_order_line_item_id == line_item.id
+    assert subscription.current_plan_revision_id == revision.id
+    assert [%SubscriptionItem{} = item] = subscription_items_for_source_line(line_item.id)
+    assert item.subscription_id == subscription.id
+
+    assert {:ok, [%AccessEffect{} = effect]} = current_access_effects(subscription.id)
+    assert effect.status == :applied
+    assert effect.source_order_line_item_id == line_item.id
+    assert effect.plan_revision_id == revision.id
+    assert [%EntitlementGrant{status: :active} = grant] = [fetch_entitlement!(subscription.id)]
+    assert grant.source_id == subscription.id
+    assert grant.kind == effect.entitlement_kind
+    assert grant.scope_key == effect.entitlement_scope_key
   end
 
   @tag :jc360_task11

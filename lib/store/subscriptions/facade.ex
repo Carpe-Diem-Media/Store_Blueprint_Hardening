@@ -3968,6 +3968,7 @@ defmodule Store.Subscriptions.Facade do
              payment_intent,
              stored_payment_method
            ),
+         :ok <- ensure_subscription_source_created(subscription),
          {:ok, item, item_notifications} <-
            create_subscription_item_record(subscription, line_item, plan, revision),
          {:ok, access_effect, complete_entitlement_pair?} <-
@@ -3990,6 +3991,28 @@ defmodule Store.Subscriptions.Facade do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp ensure_subscription_source_created(%Subscription{} = subscription) do
+    # AshPostgres marks a returned upsert as :insert or :update.
+    case Ash.Resource.get_metadata(subscription, :upsert_action) do
+      :insert ->
+        :ok
+
+      :update ->
+        {:error,
+         Error.new(
+           "RESERVATION_CONFLICT",
+           "subscription source was created concurrently; retry activation"
+         )}
+
+      _ ->
+        {:error,
+         Error.new(
+           "INTERNAL_ERROR",
+           "subscription source insertion outcome could not be verified"
+         )}
     end
   end
 
