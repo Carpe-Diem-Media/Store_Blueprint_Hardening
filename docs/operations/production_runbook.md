@@ -84,6 +84,58 @@
   - inspect email outbox backlog
   - reconcile paid orders that arrived during the transition window
 
+### Interrupted verification-index operations
+
+The JC-248 verification-index migration uses concurrent index creation and removal. If creation or rollback is interrupted, inspect both named indexes and their PostgreSQL validity state before taking action.
+
+Inspect the applied `schema_migrations` history when selecting a rollback. Ecto's one-step rollback selects the highest applied version. The index migration is version `20261108015000`, after its parent's setup-generation migration. Availability tests invoke this version explicitly, and a separate staged test verifies its rollback order relative to that parent. Later migrations have their own rollback steps.
+
+```sql
+SELECT table_class.relname AS table_name,
+       index_class.relname AS index_name,
+       index_state.indisvalid,
+       index_state.indisready
+FROM pg_index AS index_state
+JOIN pg_class AS index_class ON index_class.oid = index_state.indexrelid
+JOIN pg_namespace AS namespace ON namespace.oid = index_class.relnamespace
+JOIN pg_class AS table_class ON table_class.oid = index_state.indrelid
+WHERE namespace.nspname = 'public' AND index_class.relname IN (
+  'access_effects_applied_verification_index',
+  'entitlement_grants_active_subscription_source_index'
+)
+ORDER BY index_class.relname;
+```
+
+When completing rollback, absent indexes are the intended state. When restoring verification, both indexes must exist and be valid and ready. Rebuild a missing index. If either exists with `indisvalid = false` or `indisready = false`, rerunning the migration does not repair it. Under the authorized recovery procedure, drop the affected invalid index concurrently and rebuild its original definition. Run only the affected index's statements below, each outside a transaction:
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS public.access_effects_applied_verification_index;
+CREATE INDEX CONCURRENTLY access_effects_applied_verification_index
+  ON public.access_effects (inserted_at, id)
+  WHERE status = 'applied';
+
+DROP INDEX CONCURRENTLY IF EXISTS public.entitlement_grants_active_subscription_source_index;
+CREATE INDEX CONCURRENTLY entitlement_grants_active_subscription_source_index
+  ON public.entitlement_grants (source_id, id)
+  WHERE source_kind = 'subscription' AND status = 'active';
+```
+
+Recheck `pg_index.indisvalid` and `pg_index.indisready` for both indexes after recovery. Do not run these commands as part of routine rollback without explicit operational authorization.
+
+### Pending access-repair delivery
+
+The later JC-248 migration `20261108015229` stores post-commit repair delivery obligations separately from APPLIED AccessEffects. Periodic access-effect recovery retries pending generations even when grants already match. Completion records successful sender-local cache invalidation and PubSub publication for every stored recipient. It does not prove receiving-node delivery or cache eviction.
+
+Before a schema rollback, inspect the pending count:
+
+```sql
+SELECT count(*) AS pending_repair_deliveries
+FROM public.access_repair_deliveries
+WHERE delivered_generation < generation;
+```
+
+The migration refuses rollback while any generation remains pending. Its transactional table lock also prevents a new request from committing between the check and the drop. Restore the failing cache or publication service and run the existing access-effect recovery worker with compatible application code. Recheck the count after recovery. Do not delete obligations, fabricate acknowledgements, or alter APPLIED effects to bypass the fence. Application rollback can retain this table for later recovery; table removal discards completed operational records only after the pending check succeeds.
+
 ## Incident Response
 - Webhook failures:
   - inspect `webhook_receipts` backlog and failed rows

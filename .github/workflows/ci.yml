@@ -321,10 +321,10 @@ jobs:
         run: mix ash_postgres.create && mix ash_postgres.migrate
 
       - name: Run real connection contention proof — repetition 1
-        run: mix test --only real_connections test/store/subscriptions/source_fence_contention_test.exs test/store/subscriptions/access_effect_target_order_contention_test.exs test/store/subscriptions/jc290_payment_method_dispatch_cleanup_test.exs test/store/subscriptions/jc290_payment_method_dispatch_race_test.exs test/store/subscriptions/jc259_worker_overlap_audit_test.exs
+        run: mix test --only real_connections test/store/subscriptions/source_fence_contention_test.exs test/store/subscriptions/access_effect_target_order_contention_test.exs test/store/subscriptions/jc290_payment_method_dispatch_cleanup_test.exs test/store/subscriptions/jc290_payment_method_dispatch_race_test.exs test/store/subscriptions/access_effect_effective_execution_test.exs test/store/subscriptions/jc259_worker_overlap_audit_test.exs
 
       - name: Run real connection contention proof — repetition 2
-        run: mix test --only real_connections test/store/subscriptions/source_fence_contention_test.exs test/store/subscriptions/access_effect_target_order_contention_test.exs test/store/subscriptions/jc290_payment_method_dispatch_cleanup_test.exs test/store/subscriptions/jc290_payment_method_dispatch_race_test.exs test/store/subscriptions/jc259_worker_overlap_audit_test.exs
+        run: mix test --only real_connections test/store/subscriptions/source_fence_contention_test.exs test/store/subscriptions/access_effect_target_order_contention_test.exs test/store/subscriptions/jc290_payment_method_dispatch_cleanup_test.exs test/store/subscriptions/jc290_payment_method_dispatch_race_test.exs test/store/subscriptions/access_effect_effective_execution_test.exs test/store/subscriptions/jc259_worker_overlap_audit_test.exs
 
       - name: Verify Migration Alignment
         run: mix ash_postgres.generate_migrations --check

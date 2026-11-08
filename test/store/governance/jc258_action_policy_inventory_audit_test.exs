@@ -7,8 +7,10 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
   alias Store.Payments.PaymentIntent
   alias Store.Subscriptions
   alias Store.Subscriptions.AccessEffect
+  alias Store.Subscriptions.AccessRepairDelivery
   alias Store.Subscriptions.ContractChange
   alias Store.Subscriptions.Facade, as: SubscriptionsFacade
+  alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
   alias Store.Subscriptions.PlanRevision
   alias Store.Subscriptions.RenewalAttempt
   alias Store.Subscriptions.RenewalCollectionAttempt
@@ -18,6 +20,8 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
   alias Store.Subscriptions.SubscriptionPlan
   alias Store.Subscriptions.VariantSubscriptionPlan
   alias Store.SubscriptionsFixtures
+  alias Store.Support.Errors.Normalize
+  alias Store.Support.Telemetry.RepoStats
   alias Store.TestFixtures
   alias Store.TestSupport.StripeAPIStub
 
@@ -84,6 +88,7 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
 
   @resource_modules [
     AccessEffect,
+    AccessRepairDelivery,
     ContractChange,
     PlanRevision,
     RenewalAttempt,
@@ -138,6 +143,13 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
       {:system_only, :needs_product_decision},
     {AccessEffect, :retry_to_pending} => {:system_only, :needs_product_decision},
     {AccessEffect, :supersede} => {:system_only, :needs_product_decision},
+    {AccessRepairDelivery, :acknowledge_for_system} => {:system_only, :needs_product_decision},
+    {AccessRepairDelivery, :create_for_system} => {:system_only, :needs_product_decision},
+    {AccessRepairDelivery, :read} => {:system_only, :needs_product_decision},
+    {AccessRepairDelivery, :read_for_access_effect} => {:system_only, :needs_product_decision},
+    {AccessRepairDelivery, :read_pending_for_system} =>
+      {:system_only_action, :needs_product_decision},
+    {AccessRepairDelivery, :request_for_system} => {:system_only, :needs_product_decision},
     {ContractChange, :apply} => {:admin_or_system_write, :needs_product_decision},
     {ContractChange, :bind_to_renewal} => {:admin_or_system_write, :needs_product_decision},
     {ContractChange, :cancel} => {:admin_or_system_write, :needs_product_decision},
@@ -243,7 +255,7 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
       |> Enum.sort()
 
     assert compiled == @action_policy |> Map.keys() |> Enum.sort()
-    assert length(compiled) == 93
+    assert length(compiled) == 99
     resources = @action_policy |> Map.keys() |> Enum.map(&elem(&1, 0)) |> MapSet.new()
     assert resources == MapSet.new(@resource_modules)
   end
@@ -352,6 +364,73 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
     end
   end
 
+  test "repair delivery actions reject non-system actors before SQL and accept system execution" do
+    fixtures = fixtures!()
+    delivery = fixtures.access_repair_delivery
+    contexts = Enum.reject(actor_contexts!(fixtures), fn {name, _, _} -> name == :system end)
+
+    for {_name, actor, context} <- contexts do
+      {result, stats} =
+        RepoStats.capture(fn ->
+          denied_delivery_actions(fixtures, delivery, actor, context)
+        end)
+
+      assert result == :ok
+      assert stats.query_count == 0
+    end
+
+    assert {:ok, rows} =
+             AccessRepairDelivery
+             |> Ash.Query.for_read(:read)
+             |> Ash.Query.filter(expr(id == ^delivery.id))
+             |> Ash.read(domain: Subscriptions, authorize?: true, context: %{system?: true})
+
+    assert Enum.map(rows, & &1.id) == [delivery.id]
+
+    assert {:ok, [^delivery]} =
+             AccessRepairDelivery
+             |> Ash.Query.for_read(:read_for_access_effect, %{
+               access_effect_id: fixtures.access_effect.id
+             })
+             |> Ash.read(domain: Subscriptions, authorize?: true, context: %{system?: true})
+
+    pending_input =
+      Ash.ActionInput.for_action(AccessRepairDelivery, :read_pending_for_system, %{
+        as_of: DateTime.add(DateTime.utc_now(), 1, :second),
+        limit: 10
+      })
+
+    assert {:ok, pending} =
+             Ash.run_action(pending_input,
+               domain: Subscriptions,
+               authorize?: true,
+               context: %{system?: true}
+             )
+
+    assert Enum.any?(pending, &(&1.id == delivery.id))
+
+    assert {:ok, requested} =
+             delivery
+             |> Ash.Changeset.for_update(:request_for_system, %{
+               recipient_user_ids: delivery.recipient_user_ids,
+               generation: 2
+             })
+             |> Ash.update(domain: Subscriptions, authorize?: true, context: %{system?: true})
+
+    assert requested.generation == 2
+
+    assert {:ok, acknowledged} =
+             requested
+             |> Ash.Changeset.for_update(:acknowledge_for_system, %{
+               generation: 2,
+               recipient_user_ids: requested.recipient_user_ids,
+               delivered_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+             })
+             |> Ash.update(domain: Subscriptions, authorize?: true, context: %{system?: true})
+
+    assert acknowledged.delivered_generation == 2
+  end
+
   test "user reads preflight and execute against the persisted Subscription row" do
     fixture = fixtures!()
     contexts = actor_contexts!(fixture)
@@ -415,7 +494,13 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
     owner = SubscriptionsFixtures.create_customer!("jc258_matrix_owner")
     non_owner = SubscriptionsFixtures.create_customer!("jc258_matrix_non_owner")
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
-    plan = SubscriptionsFixtures.create_subscription_plan!()
+
+    plan =
+      SubscriptionsFixtures.create_subscription_plan!(%{
+        entitlement_kind: :membership_access,
+        entitlement_scope_key: "jc258_matrix:#{Ash.UUIDv7.generate()}"
+      })
+
     _attachment = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
 
     subscription_fixture =
@@ -429,6 +514,8 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
     attempt = create_pending_attempt!(subscription)
     payment_intent = payment_intent_for_order!(subscription_fixture.order.id)
     stored_method = stored_method!(%{subscription: subscription})
+    access_effect = access_effect!(subscription, subscription_fixture)
+    access_repair_delivery = access_repair_delivery!(access_effect, owner.id)
 
     %{
       owner: owner,
@@ -442,7 +529,9 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
       revision: subscription_fixture.revision,
       renewal_attempt: attempt,
       payment_intent: payment_intent,
-      stored_method: stored_method
+      stored_method: stored_method,
+      access_effect: access_effect,
+      access_repair_delivery: access_repair_delivery
     }
   end
 
@@ -477,15 +566,37 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
   defp arguments!(resource, action, fixtures) do
     info = Ash.Resource.Info.action(resource, action)
 
-    Map.new(info.arguments, fn argument ->
-      {argument.name, argument_value(argument.name, resource, fixtures)}
-    end)
+    arguments =
+      Map.new(info.arguments, fn argument ->
+        {argument.name, argument_value(argument.name, resource, fixtures)}
+      end)
+
+    case {resource, action} do
+      {AccessRepairDelivery, :create_for_system} ->
+        Map.merge(arguments, %{
+          access_effect_id: fixtures.access_effect.id,
+          recipient_user_ids: [fixtures.owner.id],
+          generation: 1,
+          delivered_generation: 0
+        })
+
+      {AccessRepairDelivery, :request_for_system} ->
+        Map.merge(arguments, %{recipient_user_ids: [fixtures.owner.id], generation: 2})
+
+      _ ->
+        arguments
+    end
   end
 
   defp argument_value(:id, StoredPaymentMethod, %{subscription: s}),
     do: s.stored_payment_method_id
 
   defp argument_value(:id, Subscription, %{subscription: s}), do: s.id
+  defp argument_value(:id, AccessRepairDelivery, %{access_repair_delivery: d}), do: d.id
+  defp argument_value(:access_effect_id, AccessRepairDelivery, %{access_effect: e}), do: e.id
+  defp argument_value(:recipient_user_ids, AccessRepairDelivery, %{owner: owner}), do: [owner.id]
+  defp argument_value(:generation, AccessRepairDelivery, _fixtures), do: 1
+  defp argument_value(:delivered_at, AccessRepairDelivery, _fixtures), do: now()
   defp argument_value(:id, SubscriptionPlan, %{plan: p}), do: p.id
   defp argument_value(:subscription_id, _resource, %{subscription: s}), do: s.id
   defp argument_value(:subscription_plan_id, _resource, %{plan: p}), do: p.id
@@ -558,6 +669,9 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
   defp specific_preflight_record(StoredPaymentMethod, action, %{stored_method: method}),
     do: update_preflight_record(StoredPaymentMethod, action, method)
 
+  defp specific_preflight_record(AccessRepairDelivery, action, %{access_repair_delivery: delivery}),
+       do: update_preflight_record(AccessRepairDelivery, action, delivery)
+
   defp specific_preflight_record(_resource, _action, _fixtures), do: :default
 
   defp update_preflight_record(resource, action, record) do
@@ -605,7 +719,105 @@ defmodule Store.Governance.JC258ActionPolicyInventoryAuditTest do
 
   defp update_record(Subscription, fixtures), do: fixtures.subscription
   defp update_record(StoredPaymentMethod, fixtures), do: fixtures.stored_method
+  defp update_record(AccessRepairDelivery, fixtures), do: fixtures.access_repair_delivery
   defp update_record(resource, _fixtures), do: struct(resource)
+
+  defp access_effect!(subscription, fixture) do
+    attrs = %{
+      subscription_id: subscription.id,
+      source_version: subscription.aggregate_version,
+      disposition: :effective,
+      source_order_line_item_id: fixture.line_item.id,
+      contract_change_id: subscription.current_contract_change_id,
+      plan_revision_id: fixture.revision.id,
+      entitlement_kind: fixture.revision.entitlement_kind,
+      entitlement_scope_key: fixture.revision.entitlement_scope_key,
+      valid_from_at: subscription.current_period_start_at,
+      valid_until_at: subscription.current_period_end_at
+    }
+
+    {:ok, input} = EstablishAccessEffectInput.new(attrs)
+
+    SubscriptionsFacade.establish_access_effect_for_system(input)
+    |> case do
+      {:ok, effect} -> effect
+      other -> flunk("expected a valid access effect, got #{inspect(other)}")
+    end
+  end
+
+  defp access_repair_delivery!(effect, user_id) do
+    AccessRepairDelivery
+    |> Ash.Changeset.for_create(
+      :create_for_system,
+      %{
+        access_effect_id: effect.id,
+        recipient_user_ids: [user_id],
+        generation: 1,
+        delivered_generation: 0
+      }, context: %{system?: true})
+    |> Ash.create!(domain: Subscriptions, authorize?: true, context: %{system?: true})
+  end
+
+  defp denied_delivery_actions(fixtures, delivery, actor, context) do
+    effect = fixtures.access_effect
+    user_ids = delivery.recipient_user_ids
+
+    requests = [
+      {:read, nil},
+      {:read_for_access_effect, %{access_effect_id: effect.id}},
+      {:create_for_system,
+       %{
+         access_effect_id: effect.id,
+         recipient_user_ids: user_ids,
+         generation: 2,
+         delivered_generation: 0
+       }},
+      {:request_for_system, %{recipient_user_ids: user_ids, generation: 2}},
+      {:acknowledge_for_system,
+       %{generation: 1, recipient_user_ids: user_ids, delivered_at: now()}},
+      {:read_pending_for_system, %{as_of: now(), limit: 10}}
+    ]
+
+    for {action, args} <- requests do
+      result =
+        case action do
+          :read ->
+            Ash.Query.for_read(AccessRepairDelivery, action)
+            |> Ash.read(domain: Subscriptions, authorize?: true, actor: actor, context: context)
+
+          :read_for_access_effect ->
+            Ash.Query.for_read(AccessRepairDelivery, action, args)
+            |> Ash.read(domain: Subscriptions, authorize?: true, actor: actor, context: context)
+
+          :create_for_system ->
+            AccessRepairDelivery
+            |> Ash.Changeset.for_create(action, args, actor: actor, context: context)
+            |> Ash.create(domain: Subscriptions, authorize?: true, actor: actor, context: context)
+
+          action when action in [:request_for_system, :acknowledge_for_system] ->
+            delivery
+            |> Ash.Changeset.for_update(action, args, actor: actor, context: context)
+            |> Ash.update(domain: Subscriptions, authorize?: true, actor: actor, context: context)
+
+          :read_pending_for_system ->
+            Ash.ActionInput.for_action(AccessRepairDelivery, action, args,
+              actor: actor,
+              context: context
+            )
+            |> Ash.run_action(
+              domain: Subscriptions,
+              authorize?: true,
+              actor: actor,
+              context: context
+            )
+        end
+
+      assert {:error, reason} = result
+      assert %Store.Support.Errors.Error{code: "FORBIDDEN"} = Normalize.normalize(reason)
+    end
+
+    :ok
+  end
 
   defp error_classes(errors) do
     errors
