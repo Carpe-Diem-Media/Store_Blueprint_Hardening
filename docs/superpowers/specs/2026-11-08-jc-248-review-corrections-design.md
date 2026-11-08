@@ -20,6 +20,8 @@ After commit, delivery invalidates and broadcasts to every saved recipient. It a
 
 Delivery performs no grant mutation and does not replay an AccessEffect. Therefore an old delivery obligation remains deliverable after newer source authority commits. Cache invalidation asks subscribers to read current durable grants; it does not restore old access. This avoids a supersession handoff or a second business-currentness mechanism while retaining historical-owner notifications. Tests must prove this boundary.
 
+Acknowledgement records successful sender-local cache invalidation and PubSub publication. It does not confirm receipt or cache eviction on every node. The pre-existing receiving-node cache gap is tracked separately as JC-374, because LiveViews can reload through another node's stale Cachex entry. No receiving-node UI or distributed invalidation change is included here.
+
 The existing periodic AccessEffect recovery sweep gains a separately bounded repair-delivery stream with an immutable insertion high-water and composite insertion cursor. Healthy grants and the original effect delivery timestamp cannot hide pending work. Oban retries accelerate delivery but do not define completion. Repeated pending failures must not monopolize the first page. Pending operational obligations must fence destructive rollback of the new table. The new migration and snapshots must remain aligned.
 
 ## Rollback availability
