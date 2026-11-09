@@ -67,6 +67,12 @@ defmodule Store.Subscriptions.JC366SupportPaymentSetupAuthorizationTest do
 
     assert id == subscription.id
 
+    assert {:ok, support_detail} =
+             Facade.get_subscription_detail_for_admin(support, subscription.id)
+
+    assert support_detail.action_capabilities.payment_method_update_provider == :stripe
+    refute support_detail.action_capabilities.can_update_payment_method?
+
     result =
       Facade.start_subscription_payment_method_update_for_admin(
         support,
@@ -158,6 +164,10 @@ defmodule Store.Subscriptions.JC366SupportPaymentSetupAuthorizationTest do
       actor = TestFixtures.register_user!(email: TestFixtures.unique_email("jc366_#{role}"))
       _assignment = TestFixtures.assign_role!(actor, role)
 
+      assert {:ok, detail} = Facade.get_subscription_detail_for_admin(actor, subscription.id)
+      assert detail.action_capabilities.payment_method_update_provider == :stripe
+      assert detail.action_capabilities.can_update_payment_method?
+
       assert {:ok, %{client_secret: client_secret, payment_intent_id: intent_id}} =
                Facade.start_subscription_payment_method_update_for_admin(
                  actor,
@@ -179,6 +189,10 @@ defmodule Store.Subscriptions.JC366SupportPaymentSetupAuthorizationTest do
 
   test "subscription owner can continue to start setup through the user facade" do
     {owner, _support, subscription} = setup_fixture!("owner")
+
+    assert {:ok, detail} = Facade.get_subscription_detail_for_user(owner, subscription.id)
+    assert detail.action_capabilities.payment_method_update_provider == :stripe
+    assert detail.action_capabilities.can_update_payment_method?
 
     assert {:ok, %{client_secret: client_secret, payment_intent_id: intent_id}} =
              Facade.start_subscription_payment_method_update_for_user(

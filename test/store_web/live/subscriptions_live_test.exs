@@ -164,12 +164,22 @@ defmodule StoreWeb.SubscriptionsLiveTest do
         provider_billing_ref: "pm_support_live_001"
       })
 
-    {:ok, _view, html} = live(conn, ~p"/admin/subscriptions/#{subscription.id}")
+    {:ok, view, html} = live(conn, ~p"/admin/subscriptions/#{subscription.id}")
 
     assert html =~ "Provider Customer Ref"
     assert html =~ "cus_support_live_001"
     refute html =~ "Update Card"
     refute html =~ "start_payment_method_update"
+
+    StripeAPIStub.stub_unexpected!(
+      "support forged payment-method setup event must not call Stripe"
+    )
+
+    forged_event_html = render_click(view, "start_payment_method_update", %{})
+
+    assert forged_event_html =~ "Unable to start payment method update"
+    refute forged_event_html =~ "StripeElements"
+    refute forged_event_html =~ "seti_test_"
   end
 
   test "authenticated non-admin is redirected away from admin subscriptions routes", %{conn: conn} do

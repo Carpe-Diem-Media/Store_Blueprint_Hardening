@@ -1188,7 +1188,7 @@ defmodule Store.Subscriptions.Facade do
   def get_subscription_detail_for_user(actor, subscription_id)
       when is_map(actor) and is_binary(subscription_id) do
     with {:ok, subscription} <- get_subscription_for_user(actor, subscription_id) do
-      build_subscription_detail_result(subscription)
+      build_subscription_detail_result(subscription, true)
     end
   end
 
@@ -1201,7 +1201,10 @@ defmodule Store.Subscriptions.Facade do
   def get_subscription_detail_for_admin(actor, subscription_id)
       when is_map(actor) and is_binary(subscription_id) do
     with {:ok, subscription} <- get_subscription_for_admin(actor, subscription_id) do
-      build_subscription_detail_result(subscription)
+      build_subscription_detail_result(
+        subscription,
+        admin_payment_method_setup_authorized?(actor)
+      )
     end
   end
 
@@ -1433,11 +1436,15 @@ defmodule Store.Subscriptions.Facade do
   end
 
   defp ensure_admin_payment_method_setup_authorized(actor) do
-    if Authorization.has_any_role?(actor, [:super_admin, :admin]) do
+    if admin_payment_method_setup_authorized?(actor) do
       :ok
     else
       {:error, Error.new("FORBIDDEN", "payment method setup is not authorized")}
     end
+  end
+
+  defp admin_payment_method_setup_authorized?(actor) do
+    Authorization.has_any_role?(actor, [:super_admin, :admin])
   end
 
   @doc """
@@ -1485,9 +1492,12 @@ defmodule Store.Subscriptions.Facade do
     {:error, Error.new("VALIDATION_ERROR", "variant_id must be a UUID")}
   end
 
-  defp build_subscription_detail_result(nil), do: {:ok, nil}
+  defp build_subscription_detail_result(nil, _payment_method_setup_authorized?), do: {:ok, nil}
 
-  defp build_subscription_detail_result(%Subscription{} = subscription) do
+  defp build_subscription_detail_result(
+         %Subscription{} = subscription,
+         payment_method_setup_authorized?
+       ) do
     with {:ok, loaded_subscription} <- load_subscription_detail_relationships(subscription),
          {:ok, renewal_attempts} <- list_recent_renewal_attempts(loaded_subscription.id),
          {:ok, plan_targets} <- build_plan_targets(loaded_subscription),
@@ -1498,7 +1508,11 @@ defmodule Store.Subscriptions.Facade do
          renewal_attempts: renewal_attempts,
          plan_targets: plan_targets,
          variant_targets: variant_targets,
-         action_capabilities: action_capabilities_for_subscription(loaded_subscription)
+         action_capabilities:
+           action_capabilities_for_subscription(
+             loaded_subscription,
+             payment_method_setup_authorized?
+           )
        }}
     end
   end
@@ -1571,7 +1585,10 @@ defmodule Store.Subscriptions.Facade do
     end
   end
 
-  defp action_capabilities_for_subscription(%Subscription{} = subscription) do
+  defp action_capabilities_for_subscription(
+         %Subscription{} = subscription,
+         payment_method_setup_authorized?
+       ) do
     provider = Providers.normalize_provider(subscription.provider)
 
     can_queue_change? =
@@ -1582,7 +1599,8 @@ defmodule Store.Subscriptions.Facade do
       can_cancel_at_period_end?: subscription.status in [:active, :past_due, :suspended],
       can_queue_plan_change?: can_queue_change?,
       can_queue_variant_change?: can_queue_change?,
-      can_update_payment_method?: payment_method_update_supported?(subscription),
+      can_update_payment_method?:
+        payment_method_setup_authorized? and payment_method_update_supported?(subscription),
       payment_method_update_provider: if(provider == :stripe, do: :stripe, else: nil)
     }
   end
