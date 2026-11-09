@@ -10,12 +10,71 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
   alias Store.Repo
   alias Store.Subscriptions.{AccessEffect, Facade, Subscription}
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
+  alias Store.Subscriptions.Inputs.ReconcileSubscriptionAccessInput
   alias Store.SubscriptionsFixtures
   alias Store.Support.Telemetry.RepoStats
   alias Store.TestSupport.StripeAPIStub
+  alias Store.Workers.ReconcileSubscriptionAccessWorker
 
   setup context do
     StripeAPIStub.setup_default(context)
+  end
+
+  test "source reconciliation applies current NON_EFFECTIVE authority" do
+    fixture = create_committed_suspended_effect_fixture!("jc248_reconcile_suspended")
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription_id
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect_id).status == :applied
+    assert Enum.all?(grants_for_source!(fixture.subscription_id), &(&1.status != :active))
+
+    assert :ok =
+             Sandbox.unboxed_run(Repo, fn ->
+               ReconcileSubscriptionAccessWorker.perform(%Oban.Job{
+                 args: %{"subscription_id" => fixture.subscription_id}
+               })
+             end)
+  end
+
+  test "source reconciliation rejects NON_EFFECTIVE plan provenance drift without writes" do
+    fixture =
+      create_committed_suspended_effect_fixture!("jc248_reconcile_non_effective_provenance")
+
+    foreign = create_committed_suspended_effect_fixture!("jc248_reconcile_non_effective_foreign")
+    before_effect = fetch_effect!(fixture.effect_id)
+    foreign_effect = fetch_effect!(foreign.effect_id)
+    before_grants = grants_for_source!(fixture.subscription_id)
+
+    on_exit(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+          Ecto.UUID.dump!(fixture.subscription_id),
+          Ecto.UUID.dump!(before_effect.plan_revision_id)
+        ])
+      end)
+    end)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!("UPDATE subscriptions SET current_plan_revision_id = $2 WHERE id = $1", [
+        Ecto.UUID.dump!(fixture.subscription_id),
+        Ecto.UUID.dump!(foreign_effect.plan_revision_id)
+      ])
+    end)
+
+    assert {:error, %Store.Support.Errors.Error{code: "VALIDATION_ERROR"}} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.reconcile_subscription_access_for_system(%ReconcileSubscriptionAccessInput{
+                 subscription_id: fixture.subscription_id
+               })
+             end)
+
+    assert fetch_effect!(fixture.effect_id) == before_effect
+    assert grants_for_source!(fixture.subscription_id) == before_grants
   end
 
   test "current non-effective effect revokes past-due source grants with purchased-policy reason" do
@@ -38,6 +97,101 @@ defmodule Store.Subscriptions.AccessEffectNonEffectiveExecutionTest do
              grants_for_source!(fixture.subscription_id)
 
     assert_receive {:entitlements_invalidated, _, "non_effective_access_effect_applied", _}
+  end
+
+  test "APPLIED source repair revokes an exact-source grant that became active again" do
+    fixture = create_committed_suspended_effect_fixture!("jc248_reactivation")
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.execute_suspension_access_effect_for_system(fixture.effect_id)
+             end)
+
+    effect_snapshot = fetch_effect!(fixture.effect_id)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "UPDATE entitlement_grants SET status = 'active', revoked_at = NULL, revoked_reason = NULL WHERE id = $1",
+        [Ecto.UUID.dump!(fixture.grant_id)]
+      )
+    end)
+
+    assert {:ok, :repaired} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect_id)
+             end)
+
+    assert %EntitlementGrant{
+             status: :revoked,
+             revoked_reason: "subscription_source_reconciliation"
+           } = fetch_grant!(fixture.grant_id)
+
+    assert fetch_effect!(fixture.effect_id) == effect_snapshot
+
+    repaired_grants = grants_for_source!(fixture.subscription_id)
+
+    assert {:ok, :already_converged} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect_id)
+             end)
+
+    assert grants_for_source!(fixture.subscription_id) == repaired_grants
+    assert fetch_effect!(fixture.effect_id) == effect_snapshot
+  end
+
+  test "APPLIED non-effective repair preserves historical evidence and another source" do
+    fixture = create_committed_suspended_effect_fixture!("jc248_exact_non_effective")
+    independent = create_other_subscription_fixture!(fixture)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:ok, :applied} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.execute_suspension_access_effect_for_system(fixture.effect_id)
+             end)
+
+    effect_before = fetch_effect!(fixture.effect_id)
+
+    for suffix <- ["a", "b"] do
+      create_grant!(fixture, "#{fixture.effect_id}:stale:#{suffix}", :active,
+        valid_from_at: DateTime.add(now, -60, :second),
+        valid_to_at: DateTime.add(now, 3_600, :second)
+      )
+    end
+
+    create_grant!(fixture, "#{fixture.effect_id}:expired-history", :expired,
+      valid_from_at: DateTime.add(now, -7_200, :second),
+      valid_to_at: DateTime.add(now, -3_600, :second)
+    )
+
+    independent_grant =
+      create_grant!(fixture, "#{fixture.effect_id}:other-source", :active,
+        source_id: independent.id,
+        valid_from_at: DateTime.add(now, -60, :second),
+        valid_to_at: DateTime.add(now, 3_600, :second)
+      )
+
+    history_before =
+      fixture.subscription_id
+      |> grants_for_source!()
+      |> Enum.reject(&(&1.status == :active))
+
+    independent_before = fetch_grant!(independent_grant.id)
+
+    assert {:ok, :repaired} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Facade.repair_applied_access_effect_for_system(fixture.effect_id)
+             end)
+
+    source_after = grants_for_source!(fixture.subscription_id)
+    refute Enum.any?(source_after, &(&1.status == :active))
+
+    Enum.each(history_before, fn historical ->
+      assert entitlement_grant_attributes(Enum.find(source_after, &(&1.id == historical.id))) ==
+               entitlement_grant_attributes(historical)
+    end)
+
+    assert fetch_grant!(independent_grant.id) == independent_before
+    assert fetch_effect!(fixture.effect_id) == effect_before
   end
 
   test "the public NON_EFFECTIVE executor rejects a caller-owned transaction before writes on commit" do

@@ -1,0 +1,38 @@
+# JC-248 index rollback correction
+
+Use `subagent-driven-development`. Root owns Mix, DevCore, formatting, Git and external writes. Implement R4 from the independent #217 review. Preserve the existing index definitions and disabled DDL transaction.
+
+## Files
+
+- `priv/repo/migrations/20261108015000_jc248_access_verification_indexes.exs`
+- New `test/store/migrations/jc248_access_verification_indexes_test.exs`
+- `test/support/isolated_migration_database.ex`, only if an optional test pool-size argument is needed. Preserve the default of two connections.
+- Existing JC-248 operations documentation for interrupted concurrent index recovery.
+
+## Test first
+
+1. Use the existing isolated migration database helper with a separate repo and at least four connections. It must inherit DevCore's connection configuration and own only its generated database.
+2. Run the actual migration's `down/0` through Ecto.Migrator, rather than copying its DDL. For each affected table, hold a reader transaction until the drop waits on that reader. Identify the migration backend and its waiting index drop through database activity and lock state.
+3. While the drop waits, issue a new table read and a zero-row update with a scoped statement deadline. Both must finish before the held reader releases. The unchanged ordinary drop must fail this assertion because its queued AccessExclusiveLock blocks new access. Use task barriers, bounded polling and cleanup in `after` blocks.
+4. Release the held reader, await migration completion and assert both indexes are absent. Reapply the same migration and check both indexes are present, valid and ready. Repeat independently for the other table, since rollback drops one index before the other.
+5. Root observes the expected red result before production edits.
+
+## Correction and review
+
+Add `concurrently: true` to both rollback index declarations. Root formats and runs both tests, then migration alignment. Obtain a fresh specification review followed by a fresh quality review. Inspect the complete diff and commit append-only.
+
+Document interruption recovery through catalog inspection and an explicit concurrent drop/rebuild of an invalid or partial feature index. Rerunning a migration alone is not a repair of an invalid index. These are operator instructions, not authorization to run production DDL.
+
+## Evidence limits
+
+The tests establish reader and writer availability for these exact index drops on the local DevCore PostgreSQL version. They do not certify production latency, arbitrary load or all migration rollback paths.
+
+## Observed validation
+
+Root observed both table cases fail on ordinary rollback with PostgreSQL `57014` read timeouts. Both cases passed after concurrent drops, then passed again after stronger catalog-backed lock assertions. The final proof ties the exact concurrent drop to the held reader, verifies that reader's granted AccessShareLock on the target table, and observes the drop waiting on a virtual transaction ShareLock. New reads and zero-row updates completed before release for both tables. Each case also verified absent indexes after rollback and valid, ready indexes after rebuilding.
+
+Fresh specification and quality rechecks found no actionable R4 defect. An initial suggestion to assert a waiting index AccessExclusiveLock was corrected because concurrent drop waits on the reader's virtual transaction. The initial exact-version review did not exercise staged deployment. A new regression using the actual bulk migrator upgrade and one-step rollback reproduced selection of the already-applied #216 migration instead of the just-added older-numbered index migration. The unmerged index migration is renumbered after its parent to preserve staged upgrade and rollback order. Its former version was `20261107072703`; no accepted main migration or shared Git history was rewritten. The staged test isolates the parent/index prefix, while later migrations retain their own rollback steps.
+
+Root observed TEST `mix ash_postgres.generate_migrations --check` exit with status zero. That successful command emits an empty log; the exit status came from the execution result, not inferred log content. Logs and review reports are under `/tmp/jc248-review-corrections/`. Full issue checks and exact-head CI follow after R3 and R5.
+
+After renumbering, all three migration cases passed on a fresh private suffix. Fresh specification and quality reviews found no actionable staged-order defect. The initial red selector returned parent version `20261107174747`; the corrected selector returned index version `20261108015000` and retained the parent. This proof covers the parent/index stage, with later feature migrations handled by their own rollback steps.

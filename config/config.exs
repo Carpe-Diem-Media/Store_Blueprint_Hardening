@@ -191,6 +191,8 @@ config :store, Oban,
        {"*/5 * * * *", Store.Workers.RunDueScheduledCancellationsWorker},
        {"*/5 * * * *", Store.Workers.ReplayScheduledCancellationNotificationsWorker},
        {"*/5 * * * *", Store.Workers.RunSubscriptionAccessEffectRecoveryWorker},
+       {"0 0 * * *", Store.Workers.VerifySubscriptionAccessWorker},
+       {"30 0 * * *", Store.Workers.InventorySubscriptionAccessAuthorityWorker},
        {"0 * * * *", Store.Workers.EnqueueMembershipRenewalRemindersWorker},
        {"15 2 * * *", Store.Workers.PurgeWebhookReceiptEvidenceWorker}
      ]}
@@ -240,7 +242,14 @@ config :logger, :default_formatter,
     :provider_event_id,
     :error_code,
     :oban_job_id,
-    :worker
+    :worker,
+    :subscription_id,
+    :access_effect_id,
+    :reason,
+    :classification,
+    :source_order_line_item_id,
+    :queued_contract_change_id,
+    :plan_revision_id
   ]
 
 config :phoenix, :filter_parameters, [

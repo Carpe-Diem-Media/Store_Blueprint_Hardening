@@ -324,6 +324,27 @@ defmodule Store.Subscriptions.Subscription do
       primary?(true)
     end
 
+    action :read_access_inventory_window_for_system, {:array, :map} do
+      public?(false)
+      transaction?(false)
+
+      argument :through_id, :uuid do
+        allow_nil?(false)
+      end
+
+      argument :after_id, :uuid do
+        allow_nil?(true)
+      end
+
+      argument :limit, :integer do
+        allow_nil?(false)
+        default(100)
+        constraints(min: 1, max: 500)
+      end
+
+      run(Store.Subscriptions.Actions.ReadSubscriptionAccessInventoryWindow)
+    end
+
     read :read_for_user do
       pagination(offset?: true, required?: false, default_limit: 20, max_page_size: 100)
       filter(expr(user_id == ^actor(:id)))
@@ -1044,6 +1065,11 @@ defmodule Store.Subscriptions.Subscription do
   end
 
   policies do
+    policy action(:read_access_inventory_window_for_system) do
+      access_type(:runtime)
+      authorize_if(context_equals(:system?, true))
+    end
+
     bypass action([
              :read,
              :read_for_admin,

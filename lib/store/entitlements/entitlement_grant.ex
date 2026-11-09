@@ -17,6 +17,18 @@ defmodule Store.Entitlements.EntitlementGrant do
       primary?(true)
     end
 
+    action :read_active_subscription_sources_for_system, :map do
+      public?(false)
+      transaction?(false)
+
+      argument :source_ids, {:array, :uuid} do
+        allow_nil?(false)
+        constraints(max_length: 500)
+      end
+
+      run(Store.Entitlements.Actions.ReadActiveSubscriptionSourceGrants)
+    end
+
     read :read_for_user do
       pagination(offset?: true, required?: false, default_limit: 50, max_page_size: 200)
       prepare(build(sort: [inserted_at: :desc, id: :desc]))
@@ -173,10 +185,21 @@ defmodule Store.Entitlements.EntitlementGrant do
       index([:user_id, :kind, :scope_key, :status], name: "entitlement_grants_lookup_index")
       index([:source_kind, :source_id], name: "entitlement_grants_source_index")
       index([:valid_to_at], name: "entitlement_grants_valid_to_at_index")
+
+      index([:source_id, :id],
+        where: "source_kind = 'subscription' AND status = 'active'",
+        name: "entitlement_grants_active_subscription_source_index",
+        concurrently: true
+      )
     end
   end
 
   policies do
+    policy action(:read_active_subscription_sources_for_system) do
+      access_type(:runtime)
+      authorize_if(context_equals(:system?, true))
+    end
+
     bypass action_type(:read) do
       access_type(:runtime)
       authorize_if(context_equals(:system?, true))
