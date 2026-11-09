@@ -72,8 +72,9 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
   end
 
   @tag :jc360_followup
-  test "concurrent paid-order activation creates one source pair and effect", context do
-    fixture = create_paid_order_activation_source!("jc360_followup_concurrent")
+  test "concurrent paid-order activation rolls back the losing creator and retries as replay",
+       context do
+    fixture = create_paid_order_activation_source!("jc360_followup_concurrent", 2)
     run_ref = make_ref()
     parent = self()
     handler_id = {__MODULE__, :jc360_followup_source_read, make_ref()}
@@ -117,27 +118,38 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
       refute_received {^run_ref, :gate_timeout, _, _}
       IO.puts("JC360_FOLLOWUP_CONCURRENT raw_results=#{inspect(results)}")
 
-      assert_activation_pair!(fixture)
+      {successful_results, failed_results} =
+        Enum.split_with(results, &match?({:ok, _result}, &1))
 
-      # Characterize the current skipped-upsert path. Both calls report creation,
-      # while one source and one grant persist. JC-360 records the discrepancy
-      # with the frozen authority's losing-create rollback statement.
-      counts =
-        Enum.map(results, fn result ->
-          assert {:ok,
-                  %{
-                    order_id: order_id,
-                    subscription_line_count: 1,
-                    created_count: 1,
-                    skipped_count: 0,
-                    entitlement_issued_count: count
-                  }} = result
+      assert [
+               {:ok,
+                %{
+                  order_id: order_id,
+                  subscription_line_count: 2,
+                  created_count: 2,
+                  skipped_count: 0,
+                  entitlement_issued_count: 2
+                }}
+             ] = successful_results
 
-          assert order_id == fixture.order.id
-          count
-        end)
+      assert order_id == fixture.order.id
+      assert [{:error, %{code: "RESERVATION_CONFLICT"}}] = failed_results
 
-      assert Enum.sort(counts) == [0, 1]
+      pairs = assert_activation_pairs!(fixture)
+
+      assert {:ok, replay} =
+               Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+      assert replay.order_id == fixture.order.id
+      assert replay.subscription_line_count == 2
+      assert replay.created_count == 0
+      assert replay.skipped_count == 2
+      assert replay.entitlement_issued_count == 0
+
+      replayed_pairs = assert_activation_pairs!(fixture)
+
+      assert Enum.map(replayed_pairs, &activation_pair_ids/1) ==
+               Enum.map(pairs, &activation_pair_ids/1)
     after
       try do
         Enum.each(tasks, &send(&1.pid, {run_ref, :release}))
@@ -915,7 +927,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     end
   end
 
-  defp create_paid_order_activation_source!(label) do
+  defp create_paid_order_activation_source!(label, line_count \\ 1) do
     # Seed activation preconditions without claiming checkout or payment-application evidence.
     Repo.transaction(
       fn ->
@@ -942,6 +954,12 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
             %{provider_customer_ref: nil, provider_billing_ref: nil}
           )
 
+        line_items =
+          case line_count do
+            1 -> [line_item]
+            2 -> [line_item, create_additional_subscription_line!(order, line_item, 2)]
+          end
+
         %{
           customer: customer,
           product: product,
@@ -950,6 +968,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
           variant_plan: variant_plan,
           order: order,
           line_item: line_item,
+          line_items: line_items,
           revision: revision
         }
       end,
@@ -962,6 +981,36 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
       {:error, reason} ->
         raise "unable to create paid-order activation fixture: #{inspect(reason)}"
     end
+  end
+
+  defp create_additional_subscription_line!(order, source_line_item, line_no) do
+    source_line_item
+    |> Map.from_struct()
+    |> Map.take([
+      :currency,
+      :quantity,
+      :unit_price_minor,
+      :line_total_minor,
+      :sku_snapshot,
+      :product_title_snapshot,
+      :variant_title_snapshot,
+      :variant_id_snapshot,
+      :subscription_plan_id_snapshot,
+      :subscription_plan_revision_id_snapshot,
+      :subscription_plan_key_snapshot,
+      :subscription_interval_unit_snapshot,
+      :subscription_interval_count_snapshot,
+      :discount_allocated_minor,
+      :net_line_total_minor,
+      :tax_category_snapshot,
+      :tax_minor
+    ])
+    |> Map.merge(%{order_id: order.id, line_no: line_no})
+    |> then(fn attributes ->
+      OrderLineItem
+      |> Ash.Changeset.for_create(:create, attributes, context: %{system?: true})
+      |> Ash.create!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+    end)
   end
 
   defp start_paid_order_activation_task(run_ref, order_id, line_item_id, direct_repo_owner) do
@@ -1161,6 +1210,18 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     {subscription, item, effect, grant}
   end
 
+  defp assert_activation_pairs!(fixture) do
+    Enum.map(fixture.line_items, fn line_item ->
+      fixture
+      |> Map.put(:line_item, line_item)
+      |> assert_activation_pair!()
+    end)
+  end
+
+  defp activation_pair_ids({subscription, item, effect, grant}) do
+    {subscription.id, item.id, effect.id, grant.id}
+  end
+
   defp effects_for_line!(line_item_id) do
     AccessEffect
     |> Ash.Query.filter(expr(source_order_line_item_id == ^line_item_id))
@@ -1180,19 +1241,25 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     assert {:ok, subscription_ids} =
              Repo.transaction(
                fn ->
-                 line_item_id = Ecto.UUID.dump!(fixture.line_item.id)
+                 line_items = Map.get(fixture, :line_items, [fixture.line_item])
+                 line_item_ids = Enum.map(line_items, & &1.id)
                  order_id = Ecto.UUID.dump!(fixture.order.id)
                  variant_plan_id = Ecto.UUID.dump!(fixture.variant_plan.id)
                  revision_id = Ecto.UUID.dump!(fixture.revision.id)
                  plan_id = Ecto.UUID.dump!(fixture.plan.id)
                  product_id = Ecto.UUID.dump!(fixture.product.id)
                  customer_id = Ecto.UUID.dump!(fixture.customer.id)
-                 subscriptions = subscriptions_for_source!(fixture.line_item.id)
+                 subscriptions = Enum.flat_map(line_items, &subscriptions_for_source!(&1.id))
                  subscription_ids = Enum.map(subscriptions, &Ecto.UUID.dump!(&1.id))
 
-                 Repo.query!("DELETE FROM access_effects WHERE source_order_line_item_id = $1", [
-                   line_item_id
-                 ])
+                 Enum.each(line_item_ids, fn line_item_id ->
+                   Repo.query!(
+                     "DELETE FROM access_effects WHERE source_order_line_item_id = $1",
+                     [
+                       Ecto.UUID.dump!(line_item_id)
+                     ]
+                   )
+                 end)
 
                  Enum.each(subscription_ids, fn id ->
                    Repo.query!("DELETE FROM access_effects WHERE subscription_id = $1", [id])
@@ -1211,7 +1278,13 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
                  Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
-                 Repo.query!("DELETE FROM order_line_items WHERE id = $1", [line_item_id])
+
+                 Enum.each(line_item_ids, fn line_item_id ->
+                   Repo.query!("DELETE FROM order_line_items WHERE id = $1", [
+                     Ecto.UUID.dump!(line_item_id)
+                   ])
+                 end)
+
                  Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
 
                  Repo.query!("DELETE FROM variant_subscription_plans WHERE id = $1", [
@@ -1224,23 +1297,27 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
                  Repo.query!("DELETE FROM products WHERE id = $1", [product_id])
                  Repo.query!("DELETE FROM users WHERE id = $1", [customer_id])
 
-                 assert %{rows: [[0]]} =
-                          Repo.query!(
-                            "SELECT count(*) FROM access_effects WHERE source_order_line_item_id = $1",
-                            [line_item_id]
-                          )
+                 Enum.each(line_item_ids, fn line_item_id ->
+                   uuid = Ecto.UUID.dump!(line_item_id)
 
-                 assert %{rows: [[0]]} =
-                          Repo.query!(
-                            "SELECT count(*) FROM subscription_items WHERE source_order_line_item_id = $1",
-                            [line_item_id]
-                          )
+                   assert %{rows: [[0]]} =
+                            Repo.query!(
+                              "SELECT count(*) FROM access_effects WHERE source_order_line_item_id = $1",
+                              [uuid]
+                            )
 
-                 assert %{rows: [[0]]} =
-                          Repo.query!(
-                            "SELECT count(*) FROM subscriptions WHERE source_order_line_item_id = $1",
-                            [line_item_id]
-                          )
+                   assert %{rows: [[0]]} =
+                            Repo.query!(
+                              "SELECT count(*) FROM subscription_items WHERE source_order_line_item_id = $1",
+                              [uuid]
+                            )
+
+                   assert %{rows: [[0]]} =
+                            Repo.query!(
+                              "SELECT count(*) FROM subscriptions WHERE source_order_line_item_id = $1",
+                              [uuid]
+                            )
+                 end)
 
                  Enum.map(subscriptions, & &1.id)
                end,
@@ -1255,7 +1332,6 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
       {"payment_intents", "order_id", fixture.order.id},
       {"fulfillment_orders", "order_id", fixture.order.id},
       {"order_adjustments", "order_id", fixture.order.id},
-      {"order_line_items", "id", fixture.line_item.id},
       {"orders", "id", fixture.order.id},
       {"variant_subscription_plans", "id", fixture.variant_plan.id},
       {"plan_revisions", "id", fixture.revision.id},
@@ -1269,6 +1345,13 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
       assert %{rows: [[0]]} =
                Repo.query!("SELECT count(*) FROM #{table} WHERE #{column} = $1", [
                  Ecto.UUID.dump!(id)
+               ])
+    end)
+
+    Enum.each(Map.get(fixture, :line_items, [fixture.line_item]), fn line_item ->
+      assert %{rows: [[0]]} =
+               Repo.query!("SELECT count(*) FROM order_line_items WHERE id = $1", [
+                 Ecto.UUID.dump!(line_item.id)
                ])
     end)
 
