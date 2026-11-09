@@ -23,6 +23,10 @@ defmodule StoreWeb.Admin.Subscriptions.ShowLive do
        socket
        |> assign(:detail, nil)
        |> assign(:subscription_id, nil)
+       |> assign(
+         :can_start_payment_method_update?,
+         Authorization.has_any_role?(actor, [:super_admin, :admin])
+       )
        |> assign(:payment_update_modal_open?, false)
        |> assign(:payment_update_client_secret, nil)
        |> assign(:payment_update_publishable_key, nil)
@@ -368,7 +372,10 @@ defmodule StoreWeb.Admin.Subscriptions.ShowLive do
         </section>
 
         <section class="grid gap-4 lg:grid-cols-2">
-          <section class="space-y-3 rounded-lg border border-base-300 bg-base-100 p-4">
+          <section
+            :if={@can_start_payment_method_update?}
+            class="space-y-3 rounded-lg border border-base-300 bg-base-100 p-4"
+          >
             <h2 class="text-lg font-semibold">Payment Method</h2>
             <p class="text-sm text-base-content/70">
               Launch the inline Stripe card-update modal for this subscription.

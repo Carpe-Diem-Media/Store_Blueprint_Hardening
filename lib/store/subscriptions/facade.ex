@@ -8,6 +8,7 @@ defmodule Store.Subscriptions.Facade do
   require Ash.Query
   require Logger
 
+  alias Store.Admin.Authorization
   alias Store.Carts.CartItem
   alias Store.Catalog.{Product, Variant}
   alias Store.Checkout.CheckoutDraft
@@ -1397,8 +1398,12 @@ defmodule Store.Subscriptions.Facade do
   end
 
   @doc """
-  Starts an authorized admin setup with the same supersession and transaction
-  contract as `start_subscription_payment_method_update_for_user/3`.
+  Starts payment-method setup for an admin or super-admin with the same
+  supersession and transaction contract as
+  `start_subscription_payment_method_update_for_user/3`.
+
+  Other actors receive `FORBIDDEN` before the subscription lookup or setup side
+  effects. Subscription read access does not authorize setup initiation.
   """
   @spec start_subscription_payment_method_update_for_admin(
           map(),
@@ -1411,7 +1416,8 @@ defmodule Store.Subscriptions.Facade do
         %StartSubscriptionPaymentMethodUpdateInput{} = input
       )
       when is_map(actor) and is_binary(subscription_id) do
-    with {:ok, %Subscription{} = subscription} <-
+    with :ok <- ensure_admin_payment_method_setup_authorized(actor),
+         {:ok, %Subscription{} = subscription} <-
            get_subscription_for_admin(actor, subscription_id),
          :ok <- ensure_input_subscription_id(input.subscription_id, subscription_id) do
       start_payment_method_update(subscription)
@@ -1424,6 +1430,14 @@ defmodule Store.Subscriptions.Facade do
        "VALIDATION_ERROR",
        "actor, subscription_id, and payment method update input are required"
      )}
+  end
+
+  defp ensure_admin_payment_method_setup_authorized(actor) do
+    if Authorization.has_any_role?(actor, [:super_admin, :admin]) do
+      :ok
+    else
+      {:error, Error.new("FORBIDDEN", "payment method setup is not authorized")}
+    end
   end
 
   @doc """

@@ -140,6 +140,38 @@ defmodule StoreWeb.SubscriptionsLiveTest do
     assert html =~ "Update Card"
   end
 
+  test "support can read admin subscription detail without payment setup controls", %{conn: conn} do
+    support = signed_in_user(TestFixtures.unique_email("support_subscription_live"))
+    _role = TestFixtures.assign_role!(support, :support)
+    conn = authenticated_conn(conn, support)
+
+    customer = SubscriptionsFixtures.create_customer!("support_subscription_customer")
+    %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
+
+    plan =
+      SubscriptionsFixtures.create_subscription_plan!(%{
+        key: "support-current",
+        name: "Support Current",
+        amount_minor: 1_500
+      })
+
+    _attachment = SubscriptionsFixtures.attach_variant_plan!(variant.id, plan.id)
+
+    %{subscription: subscription} =
+      SubscriptionsFixtures.create_subscription_fixture!(customer.id, variant, plan, %{
+        provider: :stripe,
+        provider_customer_ref: "cus_support_live_001",
+        provider_billing_ref: "pm_support_live_001"
+      })
+
+    {:ok, _view, html} = live(conn, ~p"/admin/subscriptions/#{subscription.id}")
+
+    assert html =~ "Provider Customer Ref"
+    assert html =~ "cus_support_live_001"
+    refute html =~ "Update Card"
+    refute html =~ "start_payment_method_update"
+  end
+
   test "authenticated non-admin is redirected away from admin subscriptions routes", %{conn: conn} do
     customer = signed_in_user(TestFixtures.unique_email("customer_admin_subscriptions_live"))
     conn = authenticated_conn(conn, customer)
