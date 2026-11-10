@@ -1904,6 +1904,24 @@ defmodule Store.Subscriptions.Facade do
     end
   end
 
+  defp authorize_queued_target_replay(subscription, actor) do
+    case Ash.can({subscription, :queue_change}, actor,
+           maybe_is: false,
+           run_queries?: false
+         ) do
+      {:ok, true} -> :ok
+      {:ok, _unproven} -> {:error, Error.new("FORBIDDEN", "not authorized")}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp replay_locked_contract_change(subscription, actor) do
+    case authorize_queued_target_replay(subscription, actor) do
+      :ok -> {:ok, %{subscription: subscription, notifications: []}}
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
   defp retry_stale_contract_change(
          %Error{code: "STALE_RECORD"} = normalized,
          %Subscription{} = subscription,
@@ -2047,7 +2065,7 @@ defmodule Store.Subscriptions.Facade do
       {:ok, predecessor} ->
         if subscription_action == :queue_change and
              same_queued_contract_change?(current_target, target) do
-          {:ok, %{subscription: subscription, notifications: []}}
+          replay_locked_contract_change(subscription, actor)
         else
           persist_contract_change_tx(
             subscription,
