@@ -4,8 +4,8 @@ defmodule Store.Governance.JC367SystemOnlyWritesTest do
   import Ash.Expr
   require Ash.Query
 
-  alias Store.Subscriptions.RenewalAttempt
-  alias Store.Subscriptions.Subscription
+  alias Store.Subscriptions.{ContractChange, Facade, RenewalAttempt, Subscription}
+  alias Store.Subscriptions.Inputs.QueueSubscriptionPlanChangeInput
   alias Store.SubscriptionsFixtures
   alias Store.TestFixtures
 
@@ -105,6 +105,187 @@ defmodule Store.Governance.JC367SystemOnlyWritesTest do
         assert {:ok, updated} = result
         assert updated.status == :past_due
         assert reload_subscription!(before.id).status == :past_due
+      else
+        assert {:error, %Ash.Error.Forbidden{}} = result
+
+        assert subscription_snapshot(reload_subscription!(before.id)) ==
+                 subscription_snapshot(before)
+      end
+    end
+  end
+
+  test "Subscription PAST_DUE to SUSPENDED is SYSTEM-only for valid persisted rows" do
+    actors = authorization_actors!("jc367_suspended")
+    owner = owner!(actors)
+    %{variant: variant, plan: plan} = subscription_catalog!()
+
+    for actor_context <- actors do
+      fixture = create_subscription_fixture!(owner, variant, plan)
+      active = reload_subscription!(fixture.subscription.id)
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert {:ok, _past_due} =
+               active
+               |> Ash.Changeset.for_update(:mark_past_due_transition, %{
+                 billing_status_reason: "payment_failed",
+                 past_due_since_at: now,
+                 failed_payment_boundary_at: now,
+                 dunning_attempt_count: 1,
+                 next_retry_at: DateTime.add(now, 86_400, :second)
+               })
+               |> update_subscription(Enum.find(actors, &(&1.label == :system)))
+
+      before = reload_subscription!(active.id)
+      assert before.status == :past_due
+
+      changeset =
+        Ash.Changeset.for_update(before, :mark_suspended_transition, %{
+          billing_status_reason: before.billing_status_reason,
+          past_due_since_at: before.past_due_since_at,
+          dunning_attempt_count: before.dunning_attempt_count
+        })
+
+      assert changeset.valid?
+      result = update_subscription(changeset, actor_context)
+
+      if actor_context.label == :system do
+        assert {:ok, updated} = result
+        assert updated.status == :suspended
+        assert is_nil(updated.next_retry_at)
+
+        authoritative = reload_subscription!(before.id)
+        assert authoritative.status == :suspended
+        assert is_nil(authoritative.next_retry_at)
+      else
+        assert {:error, %Ash.Error.Forbidden{}} = result
+
+        assert subscription_snapshot(reload_subscription!(before.id)) ==
+                 subscription_snapshot(before)
+      end
+    end
+  end
+
+  test "Subscription period extension is SYSTEM-only for valid persisted rows" do
+    assert_system_only_subscription_update!(
+      "jc367_extend_period",
+      :extend_period,
+      fn _actor_context, before ->
+        period_end = DateTime.add(before.current_period_end_at, 30 * 86_400, :second)
+
+        %{
+          current_period_end_at: period_end,
+          next_renewal_at: period_end,
+          renewal_amount_minor: before.renewal_amount_minor + 100
+        }
+      end,
+      fn before, updated ->
+        assert updated.status == :active
+
+        assert DateTime.compare(updated.current_period_end_at, before.current_period_end_at) ==
+                 :gt
+
+        assert updated.next_renewal_at == updated.current_period_end_at
+        assert updated.renewal_amount_minor == before.renewal_amount_minor + 100
+      end
+    )
+  end
+
+  test "Subscription expiration is SYSTEM-only for valid persisted rows" do
+    assert_system_only_subscription_update!(
+      "jc367_expire",
+      :mark_expired_transition,
+      fn _actor_context, _before -> %{canceled_reason: "term_end"} end,
+      fn _before, updated ->
+        assert updated.status == :expired
+        assert updated.canceled_reason == "term_end"
+        assert %DateTime{} = updated.ended_at
+      end
+    )
+  end
+
+  test "Subscription provider billing reference updates are SYSTEM-only" do
+    assert_system_only_subscription_update!(
+      "jc367_provider_reference",
+      :set_provider_billing_reference,
+      fn actor_context, _before ->
+        suffix = "#{actor_context.label}_#{Ash.UUIDv7.generate()}"
+
+        %{
+          provider_customer_ref: "jc367_cus_#{suffix}",
+          provider_billing_ref: "jc367_pm_#{suffix}"
+        }
+      end,
+      fn before, updated ->
+        assert updated.provider_customer_ref =~ "jc367_cus_system_"
+        assert updated.provider_billing_ref =~ "jc367_pm_system_"
+
+        assert updated.payment_method_setup_generation ==
+                 before.payment_method_setup_generation + 1
+      end
+    )
+  end
+
+  test "Subscription contract change consumption is SYSTEM-only for a bound queued change" do
+    actors = authorization_actors!("jc367_consume_contract_change")
+    owner = owner!(actors)
+    %{variant: variant, plan: plan} = subscription_catalog!()
+    target_plan = SubscriptionsFixtures.create_subscription_plan!(%{amount_minor: 2_599})
+    _attachment = SubscriptionsFixtures.attach_variant_plan!(variant.id, target_plan.id)
+    _revision = SubscriptionsFixtures.create_plan_revision!(target_plan)
+
+    for actor_context <- actors do
+      fixture = create_subscription_fixture!(owner, variant, plan)
+      input = plan_change_input!(fixture.subscription.id, target_plan.id)
+
+      assert {:ok, queued} =
+               Facade.queue_subscription_plan_change_for_user(
+                 owner,
+                 fixture.subscription.id,
+                 input
+               )
+
+      assert queued.current_contract_change_id
+      assert queued.pending_subscription_plan_id == target_plan.id
+
+      contract_change = reload_contract_change!(queued.current_contract_change_id)
+
+      assert {:ok, bound_contract_change} =
+               contract_change
+               |> Ash.Changeset.for_update(:bind_to_renewal, %{}, context: @system_context)
+               |> Ash.update(
+                 domain: Store.Subscriptions,
+                 authorize?: false,
+                 context: @system_context
+               )
+
+      assert bound_contract_change.status == :bound_to_renewal
+
+      before = reload_subscription!(queued.id)
+
+      attrs = %{
+        current_contract_change_id: nil,
+        pending_variant_id: nil,
+        pending_subscription_plan_id: nil,
+        pending_renewal_amount_minor: nil,
+        pending_renewal_currency: nil,
+        change_effective_at: nil
+      }
+
+      changeset =
+        Ash.Changeset.for_update(before, :consume_contract_change_for_renewal, attrs)
+
+      assert changeset.valid?
+      result = update_subscription(changeset, actor_context)
+
+      if actor_context.label == :system do
+        assert {:ok, updated} = result
+        assert is_nil(updated.current_contract_change_id)
+        assert is_nil(updated.pending_subscription_plan_id)
+        assert is_nil(updated.pending_renewal_amount_minor)
+
+        authoritative = reload_subscription!(before.id)
+        assert is_nil(authoritative.current_contract_change_id)
+        assert is_nil(authoritative.pending_subscription_plan_id)
       else
         assert {:error, %Ash.Error.Forbidden{}} = result
 
@@ -255,6 +436,33 @@ defmodule Store.Governance.JC367SystemOnlyWritesTest do
 
   defp owner!(actors), do: Enum.find(actors, &(&1.label == :owner)).actor
 
+  defp assert_system_only_subscription_update!(prefix, action, attrs_fun, assert_success_fun) do
+    actors = authorization_actors!(prefix)
+    owner = owner!(actors)
+    %{variant: variant, plan: plan} = subscription_catalog!()
+
+    for actor_context <- actors do
+      fixture = create_subscription_fixture!(owner, variant, plan)
+      before = reload_subscription!(fixture.subscription.id)
+      attrs = attrs_fun.(actor_context, before)
+      changeset = Ash.Changeset.for_update(before, action, attrs)
+
+      assert changeset.valid?
+      result = update_subscription(changeset, actor_context)
+
+      if actor_context.label == :system do
+        assert {:ok, updated} = result
+        assert_success_fun.(before, updated)
+        assert_success_fun.(before, reload_subscription!(before.id))
+      else
+        assert {:error, %Ash.Error.Forbidden{}} = result
+
+        assert subscription_snapshot(reload_subscription!(before.id)) ==
+                 subscription_snapshot(before)
+      end
+    end
+  end
+
   defp subscription_catalog! do
     %{variant: variant} = SubscriptionsFixtures.create_subscription_sellable!()
     plan = SubscriptionsFixtures.create_subscription_plan!()
@@ -264,6 +472,16 @@ defmodule Store.Governance.JC367SystemOnlyWritesTest do
 
   defp create_subscription_fixture!(owner, variant, plan, overrides \\ %{}),
     do: SubscriptionsFixtures.create_subscription_fixture!(owner.id, variant, plan, overrides)
+
+  defp plan_change_input!(subscription_id, plan_id) do
+    {:ok, input} =
+      QueueSubscriptionPlanChangeInput.new(%{
+        subscription_id: subscription_id,
+        subscription_plan_id: plan_id
+      })
+
+    input
+  end
 
   defp renewal_attempt_attributes(subscription, prefix) do
     %{
@@ -314,6 +532,16 @@ defmodule Store.Governance.JC367SystemOnlyWritesTest do
     |> Ash.read_one!(domain: Store.Subscriptions, authorize?: false, context: @system_context)
   end
 
+  defp reload_contract_change!(id) do
+    ContractChange
+    |> Ash.Query.filter(expr(id == ^id))
+    |> Ash.read_one!(
+      domain: Store.Subscriptions,
+      authorize?: false,
+      context: @system_context
+    )
+  end
+
   defp attempts_for_key(subscription_id, renewal_key) do
     RenewalAttempt
     |> Ash.Query.filter(expr(subscription_id == ^subscription_id and renewal_key == ^renewal_key))
@@ -330,7 +558,23 @@ defmodule Store.Governance.JC367SystemOnlyWritesTest do
       :billing_status_reason,
       :dunning_attempt_count,
       :next_retry_at,
-      :retry_suppressed_at
+      :retry_suppressed_at,
+      :current_period_start_at,
+      :current_period_end_at,
+      :next_renewal_at,
+      :renewal_amount_minor,
+      :renewal_currency,
+      :ended_at,
+      :canceled_reason,
+      :current_contract_change_id,
+      :pending_variant_id,
+      :pending_subscription_plan_id,
+      :pending_renewal_amount_minor,
+      :pending_renewal_currency,
+      :change_effective_at,
+      :provider_customer_ref,
+      :provider_billing_ref,
+      :payment_method_setup_generation
     ])
   end
 
