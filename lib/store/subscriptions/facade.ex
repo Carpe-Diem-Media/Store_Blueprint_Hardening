@@ -4746,35 +4746,55 @@ defmodule Store.Subscriptions.Facade do
     end
   end
 
-  # Legacy sources are deliberately not backfilled. Replays of new activations verify their
-  # immutable purchase evidence, not the Subscription's later status, period or aggregate version.
-  defp verify_initial_composition_replay(
-         %Subscription{current_composition_snapshot_id: nil},
-         _,
-         _
-       ),
-       do: :ok
-
+  # The paid-activation producer commits source version 1. Later status versions and the
+  # mutable current pointer do not identify that original commercial occurrence.
   defp verify_initial_composition_replay(subscription, line_item, payment_intent) do
-    with {:ok, application} <- initial_payment_application(line_item.order_id, payment_intent.id),
-         {:ok, snapshot} <-
-           Ash.get(CompositionSnapshot, subscription.current_composition_snapshot_id,
-             domain: Subscriptions,
-             authorize?: false,
-             context: %{system?: true}
-           ),
-         true <-
-           matching_initial_composition?(
-             snapshot,
-             subscription,
-             line_item,
-             payment_intent,
-             application
-           ) do
-      :ok
-    else
-      false -> composition_evidence_error()
-      {:error, error} -> {:error, error}
+    source_query =
+      CompositionSnapshot
+      |> Ash.Query.filter(expr(subscription_id == ^subscription.id))
+
+    initial_query = Ash.Query.filter(source_query, expr(source_version == 1))
+
+    case Ash.read_one(initial_query,
+           domain: Subscriptions,
+           authorize?: false,
+           context: %{system?: true}
+         ) do
+      {:ok, nil} when is_nil(subscription.current_composition_snapshot_id) ->
+        # Compatibility only: absence cannot prove pre-migration provenance. Never backfill
+        # evidence or apply paid consequences here, and reject sources with any snapshots.
+        source_query
+        |> Ash.Query.select([:id])
+        |> Ash.Query.limit(1)
+        |> Ash.read_one(domain: Subscriptions, authorize?: false, context: %{system?: true})
+        |> case do
+          {:ok, nil} -> :ok
+          {:ok, _snapshot} -> composition_evidence_error()
+          {:error, error} -> {:error, Normalize.normalize(error)}
+        end
+
+      {:ok, nil} ->
+        composition_evidence_error()
+
+      {:ok, snapshot} ->
+        with {:ok, application} <-
+               initial_payment_application(line_item.order_id, payment_intent.id),
+             true <-
+               matching_initial_composition?(
+                 snapshot,
+                 subscription,
+                 line_item,
+                 payment_intent,
+                 application
+               ) do
+          :ok
+        else
+          false -> composition_evidence_error()
+          {:error, error} -> {:error, error}
+        end
+
+      {:error, error} ->
+        {:error, Normalize.normalize(error)}
     end
   end
 

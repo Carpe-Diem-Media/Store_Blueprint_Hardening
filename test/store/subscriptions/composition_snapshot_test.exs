@@ -4,6 +4,7 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
   import Ash.Expr
   require Ash.Query
 
+  alias Ash.Resource.Info
   alias Store.Orders.PaymentApplication
   alias Store.Payments.PaymentIntent
   alias Store.Subscriptions.{AccessEffect, CompositionSnapshot, Facade, Subscription}
@@ -60,6 +61,117 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
 
     assert snapshot!(source!(fixture.line_item.id)) == before
     assert Repo.aggregate(CompositionSnapshot, :count) == 1
+  end
+
+  test "original sale replay preserves an advanced composition and an independent source" do
+    fixture = paid_source!()
+    independent = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(independent.order.id)
+    subscription = source!(fixture.line_item.id)
+    original = snapshot!(subscription)
+    successor = successor!(original)
+    point_to!(subscription, successor.id)
+    before = evidence_state()
+
+    assert {:ok, %{created_count: 0, skipped_count: 1, entitlement_issued_count: 0}} =
+             Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+    assert evidence_state() == before
+    assert source!(fixture.line_item.id).current_composition_snapshot_id == successor.id
+  end
+
+  test "v1 is verified even with a nil current pointer" do
+    fixture = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+    point_to!(source!(fixture.line_item.id), nil)
+    before = evidence_state()
+
+    assert {:ok, %{created_count: 0, skipped_count: 1, entitlement_issued_count: 0}} =
+             Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+    assert evidence_state() == before
+
+    Repo.query!("UPDATE order_line_items SET quantity = quantity + 1 WHERE id = $1", [
+      Ecto.UUID.dump!(fixture.line_item.id)
+    ])
+
+    assert {:error, %{code: "TARGET_ORDER_UNPROVABLE"}} =
+             Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+    assert evidence_state() == before
+  end
+
+  for pointer <- [:successor, nil] do
+    test "missing v1 fails closed with other snapshots and pointer #{inspect(pointer)}" do
+      fixture = paid_source!()
+      assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+      subscription = source!(fixture.line_item.id)
+      original = snapshot!(subscription)
+      successor = successor!(original)
+      point_to!(subscription, if(unquote(pointer) == :successor, do: successor.id))
+      remove_snapshot_for_test!(original)
+      before = evidence_state()
+
+      assert {:error, %{code: "TARGET_ORDER_UNPROVABLE"}} =
+               Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+      assert evidence_state() == before
+    end
+  end
+
+  test "evidence-free nil-pointer compatibility skips without synthesizing consequences" do
+    fixture = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+    subscription = source!(fixture.line_item.id)
+    original = snapshot!(subscription)
+    point_to!(subscription, nil)
+    remove_snapshot_for_test!(original)
+    independent = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(independent.order.id)
+    # Compatibility is deliberate even without provable historical provenance or payment evidence.
+    Repo.query!("DELETE FROM payment_applications WHERE id = $1", [
+      Ecto.UUID.dump!(fixture.payment_application.id)
+    ])
+
+    before = evidence_state()
+
+    assert {:ok, %{created_count: 0, skipped_count: 1, entitlement_issued_count: 0}} =
+             Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+    assert evidence_state() == before
+  end
+
+  for conflict <- [:purchase, :payment] do
+    test "original #{conflict} evidence conflict fails after the pointer advances" do
+      fixture = paid_source!()
+      assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+      subscription = source!(fixture.line_item.id)
+      successor = successor!(snapshot!(subscription))
+      point_to!(subscription, successor.id)
+
+      case unquote(conflict) do
+        :purchase ->
+          Repo.query!("UPDATE order_line_items SET quantity = quantity + 1 WHERE id = $1", [
+            Ecto.UUID.dump!(fixture.line_item.id)
+          ])
+
+        :payment ->
+          Repo.query!(
+            "UPDATE payment_applications SET application_key = 'conflicting' WHERE id = $1",
+            [
+              Ecto.UUID.dump!(fixture.payment_application.id)
+            ]
+          )
+      end
+
+      before = evidence_state()
+
+      assert {:error, %{code: "TARGET_ORDER_UNPROVABLE"}} =
+               Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+      assert evidence_state() == before
+    end
   end
 
   test "a zero-entitlement offer records an empty component set without changing the scalar effect" do
@@ -191,6 +303,12 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
         assert Enum.count(queries, &String.contains?(&1, "\"composition_snapshots\"")) == 1
         assert Enum.count(queries, &String.contains?(&1, "\"payment_applications\"")) == 1
 
+        if phase == :replay do
+          [lookup] = Enum.filter(queries, &String.contains?(&1, "\"composition_snapshots\""))
+          assert lookup =~ ~s("subscription_id"::uuid =)
+          assert lookup =~ ~s("source_version" =)
+        end
+
         assert Enum.count(
                  queries,
                  &(String.contains?(&1, "\"orders\"") and String.contains?(&1, "FOR UPDATE"))
@@ -200,6 +318,110 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
           "JC274 query sample repetition=#{repetition} phase=#{phase} total=#{length(queries)} composition=1 payment_application=1 order_lock=1"
         )
       end
+    end
+  end
+
+  test "compatibility lookup is bounded and limited to its own source" do
+    for repetition <- 1..2 do
+      fixture = paid_source!()
+      assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+      subscription = source!(fixture.line_item.id)
+      original = snapshot!(subscription)
+      point_to!(subscription, nil)
+      remove_snapshot_for_test!(original)
+      owner = self()
+      handler = {__MODULE__, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:store, :repo, :query],
+          fn _, _, metadata, _ ->
+            if self() == owner, do: send(owner, {:composition_query, metadata.query})
+          end,
+          nil
+        )
+
+      try do
+        assert {:ok, %{created_count: 0, skipped_count: 1}} =
+                 Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+      after
+        :telemetry.detach(handler)
+      end
+
+      queries = collect_queries([])
+      lookups = Enum.filter(queries, &String.contains?(&1, "\"composition_snapshots\""))
+      assert length(lookups) == 2
+      assert Enum.all?(lookups, &String.contains?(&1, ~s("subscription_id"::uuid =)))
+      assert Enum.any?(lookups, &String.contains?(&1, "LIMIT"))
+      refute Enum.any?(queries, &String.contains?(&1, "\"payment_applications\""))
+
+      IO.puts(
+        "JC274 compatibility repetition=#{repetition} total=#{length(queries)} composition=2 payment_application=0"
+      )
+    end
+  end
+
+  # This successor is lookup-only test data, not an implemented composition transition.
+  defp successor!(original) do
+    attrs =
+      original
+      |> Map.from_struct()
+      |> Map.take(Info.action(CompositionSnapshot, :establish).accept)
+
+    attrs =
+      Map.merge(attrs, %{
+        id: Ash.UUIDv7.generate(),
+        source_version: 2,
+        quantity: original.quantity + 1,
+        renewal_amount_minor: original.renewal_amount_minor + 100
+      })
+
+    {:ok, successor} =
+      Repo.transaction(fn ->
+        CompositionSnapshot
+        |> Ash.Changeset.for_create(:establish, attrs, context: %{system?: true})
+        |> Ash.create!(authorize?: false, context: %{system?: true})
+      end)
+
+    successor
+  end
+
+  defp point_to!(subscription, snapshot_id) do
+    Repo.query!("UPDATE subscriptions SET current_composition_snapshot_id = $1 WHERE id = $2", [
+      snapshot_id && Ecto.UUID.dump!(snapshot_id),
+      Ecto.UUID.dump!(subscription.id)
+    ])
+
+    Repo.query!("SET CONSTRAINTS subscriptions_current_composition_snapshot_id_fkey IMMEDIATE")
+    Repo.query!("SET CONSTRAINTS subscriptions_current_composition_snapshot_id_fkey DEFERRED")
+  end
+
+  defp remove_snapshot_for_test!(snapshot) do
+    # Only the sandbox transaction bypasses immutability to simulate absent/corrupted evidence.
+    Repo.query!("SET CONSTRAINTS subscriptions_current_composition_snapshot_id_fkey IMMEDIATE")
+
+    Repo.query!(
+      "ALTER TABLE composition_snapshots DISABLE TRIGGER composition_snapshots_immutable"
+    )
+
+    try do
+      Repo.query!("DELETE FROM composition_snapshots WHERE id = $1", [
+        Ecto.UUID.dump!(snapshot.id)
+      ])
+    after
+      Repo.query!(
+        "ALTER TABLE composition_snapshots ENABLE TRIGGER composition_snapshots_immutable"
+      )
+
+      Repo.query!("SET CONSTRAINTS subscriptions_current_composition_snapshot_id_fkey DEFERRED")
+    end
+  end
+
+  defp evidence_state do
+    for table <-
+          ~w(subscriptions composition_snapshots access_effects entitlement_grants payment_applications payment_intents) do
+      {table, Repo.query!("SELECT to_jsonb(t) FROM #{table} t ORDER BY id").rows}
     end
   end
 
