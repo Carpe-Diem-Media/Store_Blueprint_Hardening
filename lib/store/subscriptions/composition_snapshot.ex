@@ -5,6 +5,10 @@ defmodule Store.Subscriptions.CompositionSnapshot do
   This first format contains zero or one entitlement component. It records the already-applied
   payment and original paid interval; it is neither a billing lifecycle nor current access
   authority. Later source changes need not advance or rewrite this historical snapshot.
+
+  `payment_amount_minor` is the succeeded PaymentIntent amount for the whole Order.
+  Multiple line snapshots may reference that same payment occurrence; the amount is not
+  an allocation of funds to a component and must not be summed across snapshots.
   """
 
   use Ash.Resource,

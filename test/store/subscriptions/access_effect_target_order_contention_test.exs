@@ -12,7 +12,15 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
   alias Store.Orders.{Order, OrderLineItem}
   alias Store.Payments.PaymentIntent
   alias Store.Repo
-  alias Store.Subscriptions.{AccessEffect, PlanRevision, Subscription, SubscriptionItem}
+
+  alias Store.Subscriptions.{
+    AccessEffect,
+    CompositionSnapshot,
+    PlanRevision,
+    Subscription,
+    SubscriptionItem
+  }
+
   alias Store.Subscriptions.Facade
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
   alias Store.SubscriptionsFixtures
@@ -72,19 +80,26 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
   end
 
   @tag :jc360_followup
-  test "concurrent paid-order activation rolls back the losing creator and retries as replay",
+  test "concurrent paid-order activation serializes on Order and returns create then replay",
        context do
     fixture = create_paid_order_activation_source!("jc360_followup_concurrent", 2)
+    independent = create_paid_order_activation_source!("jc274_independent")
+    on_exit(fn -> cleanup_paid_order_activation_source!(independent) end)
+
+    assert {:ok, %{created_count: 1}} =
+             Facade.create_subscriptions_from_paid_order_for_system(independent.order.id)
+
+    independent_pairs = assert_activation_pairs!(independent)
     run_ref = make_ref()
     parent = self()
-    handler_id = {__MODULE__, :jc360_followup_source_read, make_ref()}
+    handler_id = {__MODULE__, :jc274_order_lock, make_ref()}
 
     :ok =
       :telemetry.attach(
         handler_id,
         [:store, :repo, :query],
         fn event, _measurements, metadata, _config ->
-          capture_empty_source_read(event, metadata, parent, run_ref, fixture.line_item.id)
+          capture_activation_order_lock(event, metadata, parent, run_ref, fixture.order.id)
         end,
         nil
       )
@@ -104,38 +119,83 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
       assert_receive {^run_ref, :activation_waiting, pid_b, backend_b}, @task_timeout
       refute pid_a == pid_b
       refute backend_a == backend_b
-      Enum.each(tasks, &send(&1.pid, {run_ref, :run}))
+      [creator, replay] = tasks
+      send(creator.pid, {run_ref, :run})
+      assert_receive {^run_ref, :order_locked, creator_pid, creator_backend}, @task_timeout
+      assert creator_pid == creator.pid
+      assert creator_backend in [backend_a, backend_b]
+      replay_backend = if creator_backend == backend_a, do: backend_b, else: backend_a
 
-      assert_receive {^run_ref, :source_read_empty, caller_a, read_backend_a}, @task_timeout
-      assert_receive {^run_ref, :source_read_empty, caller_b, read_backend_b}, @task_timeout
-      assert caller_a != caller_b
-      assert Enum.sort([read_backend_a, read_backend_b]) == Enum.sort([backend_a, backend_b])
+      send(replay.pid, {run_ref, :run})
+      assert creator_backend in await_blocking_pid!(replay_backend, creator_backend)
+
+      assert %{rows: [["Lock", blocked_query]]} =
+               Repo.query!(
+                 "SELECT wait_event_type, query FROM pg_stat_activity WHERE pid = $1",
+                 [replay_backend]
+               )
+
+      normalized_query = blocked_query |> String.downcase() |> String.replace("\"", "")
+      assert String.contains?(normalized_query, "from orders")
+      # pg_stat_activity can truncate the wide Order SELECT before its FOR UPDATE suffix.
+      # Verify the relation lock as well as the blocked Order query and blocker identity.
+      assert %{rows: [[true]]} =
+               Repo.query!(
+                 """
+                 SELECT EXISTS (
+                   SELECT 1 FROM pg_locks
+                   WHERE pid = $1 AND locktype = 'relation' AND relation = 'orders'::regclass
+                     AND mode = 'RowShareLock' AND granted
+                 )
+                 """,
+                 [replay_backend]
+               )
+
+      refute_received {^run_ref, :order_locked, _, ^replay_backend}
+      refute_received {^run_ref, :activation_result, _, _}
       refute_received {^run_ref, :gate_timeout, _, _}
 
-      Enum.each(tasks, &send(&1.pid, {run_ref, :release}))
+      send(creator.pid, {run_ref, :release})
 
-      results = Enum.map(tasks, &await_activation_result!(&1, run_ref))
-      refute_received {^run_ref, :gate_timeout, _, _}
-      IO.puts("JC360_FOLLOWUP_CONCURRENT raw_results=#{inspect(results)}")
-
-      {successful_results, failed_results} =
-        Enum.split_with(results, &match?({:ok, _result}, &1))
-
-      assert [
-               {:ok,
-                %{
-                  order_id: order_id,
-                  subscription_line_count: 2,
-                  created_count: 2,
-                  skipped_count: 0,
-                  entitlement_issued_count: 2
-                }}
-             ] = successful_results
+      assert {:ok,
+              %{
+                order_id: order_id,
+                subscription_line_count: 2,
+                created_count: 2,
+                skipped_count: 0,
+                entitlement_issued_count: 2
+              }} = await_activation_result!(creator, run_ref)
 
       assert order_id == fixture.order.id
-      assert [{:error, %{code: "RESERVATION_CONFLICT"}}] = failed_results
-
+      assert_receive {^run_ref, :order_locked, replay_pid, ^replay_backend}, @task_timeout
+      assert replay_pid == replay.pid
+      # Capture committed identities while replay holds the Order lock but has not read a source.
       pairs = assert_activation_pairs!(fixture)
+      send(replay.pid, {run_ref, :release})
+
+      assert {:ok,
+              %{
+                order_id: ^order_id,
+                subscription_line_count: 2,
+                created_count: 0,
+                skipped_count: 2,
+                entitlement_issued_count: 0
+              }} = await_activation_result!(replay, run_ref)
+
+      refute_received {^run_ref, :gate_timeout, _, _}
+
+      IO.puts(
+        "JC274_ORDER_SERIALIZATION creator_backend=#{creator_backend} replay_backend=#{replay_backend} two_lines=create_then_replay"
+      )
+
+      assert assert_activation_pairs!(fixture) == pairs
+
+      assert pairs
+             |> Enum.map(fn {subscription, _, _, _, _} -> subscription.id end)
+             |> Enum.uniq()
+             |> length() == 2
+
+      assert assert_activation_pairs!(independent) == independent_pairs
 
       assert {:ok, replay} =
                Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
@@ -150,6 +210,9 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
 
       assert Enum.map(replayed_pairs, &activation_pair_ids/1) ==
                Enum.map(pairs, &activation_pair_ids/1)
+
+      assert Enum.map(replayed_pairs, &elem(&1, 4)) == Enum.map(pairs, &elem(&1, 4))
+      assert assert_activation_pairs!(independent) == independent_pairs
     after
       try do
         Enum.each(tasks, &send(&1.pid, {run_ref, :release}))
@@ -928,7 +991,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
   end
 
   defp create_paid_order_activation_source!(label, line_count \\ 1) do
-    # Seed activation preconditions without claiming checkout or payment-application evidence.
+    # Seed paid activation and apply-once evidence without provider I/O.
     Repo.transaction(
       fn ->
         unique = Ecto.UUID.generate()
@@ -1045,35 +1108,23 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     %{pid: pid, monitor_ref: monitor_ref}
   end
 
-  defp capture_empty_source_read(_event, metadata, parent, run_ref, line_item_id) do
-    if match?({:activation, _, ^line_item_id}, Process.get(:jc360_followup_role)) and
-         Process.get(:jc360_followup_source_read_seen) != true and
-         activation_source_read?(metadata, line_item_id) do
-      case metadata[:result] do
-        {:ok, %Postgrex.Result{rows: [], num_rows: 0}} ->
-          Process.put(:jc360_followup_source_read_seen, true)
-          backend_pid = Process.get(:jc360_followup_backend_pid)
-          send(parent, {run_ref, :source_read_empty, self(), backend_pid})
+  defp capture_activation_order_lock(_event, metadata, parent, run_ref, order_id) do
+    query = metadata[:query] |> to_string() |> String.downcase() |> String.replace("\"", "")
 
-          receive do
-            {^run_ref, :release} -> :ok
-          after
-            @task_timeout -> send(parent, {run_ref, :gate_timeout, self(), backend_pid})
-          end
+    if match?({:activation, ^order_id, _}, Process.get(:jc360_followup_role)) and
+         Process.get(:jc274_order_lock_seen) != true and
+         String.contains?(query, "from orders") and String.contains?(query, "for update") do
+      assert {:ok, %Postgrex.Result{num_rows: 1}} = metadata[:result]
+      Process.put(:jc274_order_lock_seen, true)
+      backend_pid = Process.get(:jc360_followup_backend_pid)
+      send(parent, {run_ref, :order_locked, self(), backend_pid})
 
-        _ ->
-          :ok
+      receive do
+        {^run_ref, :release} -> :ok
+      after
+        @task_timeout -> send(parent, {run_ref, :gate_timeout, self(), backend_pid})
       end
     end
-  end
-
-  defp activation_source_read?(metadata, line_item_id) do
-    query = metadata[:query] |> to_string() |> String.downcase() |> String.replace("\"", "")
-    params = List.wrap(metadata[:params])
-
-    String.contains?(query, "from subscriptions") and
-      String.contains?(query, "source_order_line_item_id") and
-      Enum.any?(params, &(&1 == Ecto.UUID.dump!(line_item_id)))
   end
 
   defp capture_returned_effect_commit(_event, metadata, parent, run_ref) do
@@ -1207,7 +1258,23 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     assert grant.scope_key == effect.entitlement_scope_key
     assert grant.valid_from_at == effect.valid_from_at
     assert grant.valid_to_at == effect.valid_until_at
-    {subscription, item, effect, grant}
+    assert subscription.aggregate_version == 1
+
+    assert [snapshot] =
+             CompositionSnapshot
+             |> Ash.Query.filter(expr(subscription_id == ^subscription.id))
+             |> Ash.read!(
+               domain: Store.Subscriptions,
+               authorize?: false,
+               context: %{system?: true}
+             )
+
+    assert snapshot.id == subscription.current_composition_snapshot_id
+    assert snapshot.subscription_id == subscription.id
+    assert snapshot.source_version == effect.source_version
+    assert snapshot.source_order_line_item_id == fixture.line_item.id
+    assert snapshot.fingerprint == CompositionSnapshot.fingerprint(Map.from_struct(snapshot))
+    {subscription, item, effect, grant, snapshot}
   end
 
   defp assert_activation_pairs!(fixture) do
@@ -1218,8 +1285,8 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
     end)
   end
 
-  defp activation_pair_ids({subscription, item, effect, grant}) do
-    {subscription.id, item.id, effect.id, grant.id}
+  defp activation_pair_ids({subscription, item, effect, grant, snapshot}) do
+    {subscription.id, item.id, effect.id, grant.id, snapshot.id}
   end
 
   defp effects_for_line!(line_item_id) do
@@ -1272,9 +1339,16 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
                    Repo.query!("DELETE FROM email_outboxes WHERE subscription_id = $1", [id])
                    Repo.query!("DELETE FROM subscription_items WHERE subscription_id = $1", [id])
                    Repo.query!("DELETE FROM subscriptions WHERE id = $1", [id])
+
+                   assert %{rows: [[0]]} =
+                            Repo.query!(
+                              "SELECT count(*) FROM composition_snapshots WHERE subscription_id = $1",
+                              [id]
+                            )
                  end)
 
                  Repo.query!("DELETE FROM email_outboxes WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM payment_applications WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
@@ -1864,6 +1938,7 @@ defmodule Store.Subscriptions.AccessEffectTargetOrderContentionTest do
                  Repo.query!("DELETE FROM subscription_items WHERE id = $1", [item_id])
                  Repo.query!("DELETE FROM subscriptions WHERE id = $1", [subscription_id])
                  Repo.query!("DELETE FROM email_outboxes WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM payment_applications WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])

@@ -66,3 +66,23 @@ Task type: IMPLEMENTATION. Task: JC-274.1. Assessment role: author self-assessme
 Implementation Score: 9/10, comprising requirements 4/4, observed verification 2.5/3, correctness and architecture 1.5/2, handoff 1/1. Deductions reflect absent CI for a committed candidate and absent independent review of the final diff. Confidence Score: 90%, a subjective estimate based on focused regressions, real connections, repeated query samples and complete local checks. Production lock contention and capacity remain unmeasured.
 
 Verification Status: VERIFIED for local JC-274.1 implementation criteria only. Merge readiness: NOT_VERIFIED_FOR_MERGE. The next action is independent review of this bounded diff before any integration; JC-274.2 and JC-276 remain separate work. At the implementation handoff, the branch retained uncommitted changes and had no PR or CI status. Opening a PR does not grant merge authorization.
+
+## PR review corrections
+
+The Order-lock-first contention proof gates the first caller after acquiring its Order lock, observes PostgreSQL blocking the second caller specifically on the Order `FOR UPDATE` query, then requires first-create and second-replay success for both lines. A second gate captures the committed source identities before replay can read or modify them. It checks distinct backend PIDs, exact source/item/effect/grant/snapshot identities, unchanged snapshot evidence and aggregate version 1, and an independent source before and after replay. Both required real-connection repetitions now include the snapshot contention suite explicitly.
+
+`payment_amount_minor` records the whole Order payment occurrence. Several line snapshots can reference the same PaymentApplication and PaymentIntent. This is not component funding allocation; summing these amounts across line snapshots would double-count the payment.
+
+Before JC-274.2 adds a format or component semantics, it must define an explicit persisted format version and compatibility validation for the existing version-1 descriptor and fingerprint. This PR does not reinterpret existing records or enable multiple components.
+
+## Correction verification
+
+The previous PR head `6199a7a70fb30a91b330ac89e215e27cd205f8ac` failed required CI because its existing contention proof expected both activations to read an absent source. Its local verification did not cover that required real-connection file. That candidate is blocked for merge.
+
+The corrected required real-connection file list, including `composition_snapshot_concurrency_test.exs`, passed twice locally: 26 tests and zero failures in each repetition. The complete local check passed three properties and 1,723 tests with zero failures. The final full-check command was `devcore-project run test -- env ERL_FLAGS='+S 8:8' mix check`. An earlier default-scheduler attempt failed the unchanged HTTP two-second elapsed-time assertion; that attempt was stopped and the complete check rerun with eight schedulers. No assertion, timeout or required check was weakened.
+
+Correction criteria are: deterministic Order serialization with immutable identities and independent-source cleanup; snapshot-suite registration in both required CI repetitions; payment-occurrence and future format-compatibility clarification; passing local checks; and a pushed candidate with passing exact-head CI. CI and independent review must reassess the new head. Local success does not certify merge readiness.
+
+The correction also passed `devcore-project run test -- env ERL_FLAGS='+S 8:8' mix check.types`, `devcore-project run test -- env MIX_ENV=test ERL_FLAGS='+S 8:8' mix ash_postgres.generate_migrations --check`, and `git diff --check`.
+
+Correction assessment: BUG_FIX, author self-assessment. Four of five criteria have local evidence; pushed exact-head CI remains unverified until the new run completes. Verification Status: PARTIALLY_VERIFIED. Implementation Score: 7/10, comprising requirements 3.5/4, verification 1.5/3, correctness/risk 1.5/2 and handoff 0.5/1. Confidence Score: 90%, based on deterministic lock observations and repeated full-gate tests; runner behavior remains unverified. The gap to 8/10 is passing exact-head required CI and independent review, with no points awarded for pending checks. Merge readiness remains NOT_VERIFIED_FOR_MERGE. No production execution behavior, provider operation or Linear state was changed by this correction.
