@@ -37,6 +37,12 @@ defmodule Store.Subscriptions.CompositionSnapshot do
   ]
 
   attributes do
+    attribute :format_version, :integer do
+      allow_nil?(false)
+      default(1)
+      public?(false)
+    end
+
     uuid_v7_primary_key(:id, writable?: true)
 
     for field <- [:source_version, :quantity] do
@@ -137,9 +143,24 @@ defmodule Store.Subscriptions.CompositionSnapshot do
         end
       end)
 
+      validate(fn changeset, _context ->
+        fields = Map.new(@fields, &{&1, Ash.Changeset.get_attribute(changeset, &1)})
+
+        if valid_v1_components?(fields) do
+          :ok
+        else
+          {:error, field: :components, message: "invalid version 1 components"}
+        end
+      end)
+
       change(fn changeset, _context ->
         fields = Map.new(@fields, &{&1, Ash.Changeset.get_attribute(changeset, &1)})
-        Ash.Changeset.change_attribute(changeset, :fingerprint, fingerprint(fields))
+
+        if changeset.valid? and valid_v1_components?(fields) do
+          Ash.Changeset.change_attribute(changeset, :fingerprint, fingerprint(fields))
+        else
+          changeset
+        end
       end)
     end
   end
@@ -153,6 +174,10 @@ defmodule Store.Subscriptions.CompositionSnapshot do
     end
 
     check_constraints do
+      check_constraint(:format_version, "composition_snapshots_format_version_check",
+        check: "format_version = 1"
+      )
+
       check_constraint(:source_version, "composition_snapshots_source_version_check",
         check: "source_version > 0"
       )
@@ -173,9 +198,68 @@ defmodule Store.Subscriptions.CompositionSnapshot do
     end
   end
 
+  # Version 1 identity is the original order-line UUID. A future format must define
+  # durable identity across snapshots, creation, removal and reactivation explicitly.
+  # Identity is independent of snapshot ID, array position and display labels. Equivalent
+  # entitlement tuples must not result in duplicate charges or rights.
   @doc false
-  @spec fingerprint(map()) :: String.t()
+  def valid_v1_components?(%{components: [], source_order_line_item_id: _}), do: true
+
+  def valid_v1_components?(%{components: [component], source_order_line_item_id: line_id})
+      when is_map(component) do
+    with ["component_key", "kind", "scope_key", "valid_from_at", "valid_until_at"] <-
+           Enum.sort(Map.keys(component)),
+         key when is_binary(key) <- component["component_key"],
+         {:ok, key_uuid} <- Ecto.UUID.cast(key),
+         {:ok, line_uuid} <- Ecto.UUID.cast(line_id),
+         true <- key_uuid == line_uuid,
+         kind when kind in ["membership_access", "digital_library", "discount_tier"] <-
+           component["kind"],
+         scope when is_binary(scope) and byte_size(scope) in 1..255 <- component["scope_key"],
+         true <- String.valid?(scope) and String.trim(scope) != "",
+         {:ok, from, _} <- parse_timestamp(component["valid_from_at"]),
+         {:ok, until} <- parse_optional_timestamp(component["valid_until_at"]) do
+      is_nil(until) or DateTime.compare(from, until) == :lt
+    else
+      _ -> false
+    end
+  end
+
+  def valid_v1_components?(_), do: false
+
+  defp parse_timestamp(value) when is_binary(value), do: DateTime.from_iso8601(value)
+  defp parse_timestamp(_), do: :error
+  defp parse_optional_timestamp(nil), do: {:ok, nil}
+
+  defp parse_optional_timestamp(value) do
+    case parse_timestamp(value) do
+      {:ok, timestamp, _} -> {:ok, timestamp}
+      _ -> :error
+    end
+  end
+
+  @doc false
+  def valid_fingerprint?(%{format_version: 1} = fields) do
+    valid_v1_components?(fields) and fields.fingerprint == fingerprint(fields)
+  rescue
+    ArgumentError -> false
+    KeyError -> false
+    MatchError -> false
+    FunctionClauseError -> false
+  end
+
+  def valid_fingerprint?(_), do: false
+
+  @doc false
+  @spec fingerprint(map()) :: String.t() | {:error, :unsupported_format_version}
   def fingerprint(fields) do
+    case Map.get(fields, :format_version, 1) do
+      1 -> fingerprint_v1(fields)
+      _ -> {:error, :unsupported_format_version}
+    end
+  end
+
+  defp fingerprint_v1(fields) do
     # UUID identities are encoded as binary, never sorted by their textual representation.
     descriptor =
       Enum.map(@fields -- [:id], fn field ->

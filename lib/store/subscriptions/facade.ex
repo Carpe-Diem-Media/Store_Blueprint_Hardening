@@ -4824,7 +4824,7 @@ defmodule Store.Subscriptions.Facade do
     fields = Map.from_struct(snapshot)
 
     Map.take(fields, Map.keys(expected)) == expected and
-      snapshot.fingerprint == CompositionSnapshot.fingerprint(fields)
+      CompositionSnapshot.valid_fingerprint?(fields)
   end
 
   defp composition_evidence_error do
