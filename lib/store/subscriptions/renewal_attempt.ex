@@ -402,7 +402,6 @@ defmodule Store.Subscriptions.RenewalAttempt do
     policy action_type([:create, :update]) do
       access_type(:runtime)
       authorize_if(context_equals(:system?, true))
-      authorize_if({Store.Admin.Checks.HasRole, roles: [:super_admin, :admin]})
     end
   end
 end
