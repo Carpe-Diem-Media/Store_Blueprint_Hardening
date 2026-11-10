@@ -20,6 +20,7 @@ defmodule Store.Subscriptions.Facade do
   alias Store.Orders
   alias Store.Orders.Order
   alias Store.Orders.OrderLineItem
+  alias Store.Orders.PaymentApplication
   alias Store.Payments.Facade, as: PaymentsFacade
   alias Store.Payments.Inputs.RenewalCancellationRemediationInput
   alias Store.Payments.Inputs.RenewalOrderPaymentApplicationInput
@@ -62,6 +63,7 @@ defmodule Store.Subscriptions.Facade do
     AccessEffectCurrentnessFence,
     AccessEffectTargetOrder,
     AccessRepairDelivery,
+    CompositionSnapshot,
     ContractChange,
     PaymentMethodAuthorityGate,
     PlanRevision,
@@ -3185,18 +3187,28 @@ defmodule Store.Subscriptions.Facade do
 
   defp run_subscription_creation_transaction(order, line_items, payment_intent) do
     Repo.transaction(fn ->
-      case maybe_upsert_stored_payment_method(order.user_id, payment_intent) do
-        {:ok, stored_payment_method, stored_payment_method_notifications} ->
-          reduce_subscription_line_items(
-            order,
-            line_items,
-            payment_intent,
-            stored_payment_method,
-            stored_payment_method_notifications
-          )
-
+      # Serialize duplicate activation before source lookup and insertion. The existing
+      # open-membership index can otherwise race the source-line upsert conflict target.
+      with {:ok, %Order{state: :paid} = order} <-
+             Order
+             |> Ash.Query.filter(expr(id == ^order.id))
+             |> Ash.Query.lock("FOR UPDATE")
+             |> Ash.read_one(domain: Orders, authorize?: false, context: %{system?: true}),
+           {:ok, stored_payment_method, stored_payment_method_notifications} <-
+             maybe_upsert_stored_payment_method(order.user_id, payment_intent) do
+        reduce_subscription_line_items(
+          order,
+          line_items,
+          payment_intent,
+          stored_payment_method,
+          stored_payment_method_notifications
+        )
+      else
         {:error, reason} ->
           Repo.rollback(Normalize.normalize(reason))
+
+        {:ok, _missing_or_no_longer_paid} ->
+          Repo.rollback(Error.new("INVALID_STATE_TRANSITION", "activation requires a paid order"))
       end
     end)
     |> normalize_transaction_notifications()
@@ -4645,19 +4657,162 @@ defmodule Store.Subscriptions.Facade do
              revision,
              subscription,
              item
-           ) do
+           ),
+         :ok <-
+           establish_initial_composition(subscription, line_item, payment_intent, access_effect) do
       {:ok, :created,
        %{
          access_effect_id: access_effect.id,
          complete_entitlement_pair?: complete_entitlement_pair?
        }, subscription_notifications ++ item_notifications}
     else
-      {:ok, %Subscription{}} ->
-        {:ok, :skipped, []}
+      {:ok, %Subscription{} = existing} ->
+        with :ok <- verify_initial_composition_replay(existing, line_item, payment_intent) do
+          {:ok, :skipped, []}
+        end
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # The linkage is allocated in the original insert, before any aggregate-version updates.
+  # Its composite FK is deferred until the snapshot and scalar effect have both been established.
+  defp establish_initial_composition(subscription, line_item, payment_intent, effect) do
+    with {:ok, application} <- initial_payment_application(line_item.order_id, payment_intent.id) do
+      attrs = %{
+        id: subscription.current_composition_snapshot_id,
+        subscription_id: subscription.id,
+        source_version: effect.source_version,
+        user_id: subscription.user_id,
+        order_id: line_item.order_id,
+        source_order_line_item_id: line_item.id,
+        plan_revision_id: effect.plan_revision_id,
+        payment_intent_id: payment_intent.id,
+        payment_application_id: application.id,
+        variant_id: line_item.variant_id_snapshot,
+        quantity: subscription.quantity,
+        renewal_amount_minor: subscription.renewal_amount_minor,
+        payment_amount_minor: payment_intent.amount_received_minor,
+        currency: payment_intent.currency,
+        period_start_at: subscription.current_period_start_at,
+        period_end_at: subscription.current_period_end_at,
+        components: initial_composition_components(effect, line_item.id)
+      }
+
+      CompositionSnapshot
+      |> Ash.Changeset.for_create(:establish, attrs, context: %{system?: true})
+      |> Ash.create(domain: Subscriptions, authorize?: false, context: %{system?: true})
+      |> case do
+        {:ok, _snapshot} -> :ok
+        {:error, error} -> {:error, Normalize.normalize(error)}
+      end
+    end
+  end
+
+  defp initial_composition_components(%AccessEffect{entitlement_kind: nil}, _line_id), do: []
+
+  defp initial_composition_components(effect, line_id) do
+    [
+      %{
+        "component_key" => line_id,
+        "kind" => Atom.to_string(effect.entitlement_kind),
+        "scope_key" => effect.entitlement_scope_key,
+        "valid_from_at" => DateTime.to_iso8601(effect.valid_from_at),
+        "valid_until_at" => effect.valid_until_at && DateTime.to_iso8601(effect.valid_until_at)
+      }
+    ]
+  end
+
+  defp initial_payment_application(order_id, payment_intent_id) do
+    query =
+      PaymentApplication
+      |> Ash.Query.filter(expr(order_id == ^order_id))
+      |> Ash.Query.limit(2)
+
+    case Ash.read(query, domain: Orders, authorize?: false, context: %{system?: true}) do
+      {:ok, [%PaymentApplication{payment_intent_id: ^payment_intent_id} = application]} ->
+        if application.application_key == "paid_apply:order:#{order_id}" do
+          {:ok, application}
+        else
+          composition_evidence_error()
+        end
+
+      {:ok, _missing_or_ambiguous} ->
+        composition_evidence_error()
+
+      {:error, error} ->
+        {:error, Normalize.normalize(error)}
+    end
+  end
+
+  # Legacy sources are deliberately not backfilled. Replays of new activations verify their
+  # immutable purchase evidence, not the Subscription's later status, period or aggregate version.
+  defp verify_initial_composition_replay(
+         %Subscription{current_composition_snapshot_id: nil},
+         _,
+         _
+       ),
+       do: :ok
+
+  defp verify_initial_composition_replay(subscription, line_item, payment_intent) do
+    with {:ok, application} <- initial_payment_application(line_item.order_id, payment_intent.id),
+         {:ok, snapshot} <-
+           Ash.get(CompositionSnapshot, subscription.current_composition_snapshot_id,
+             domain: Subscriptions,
+             authorize?: false,
+             context: %{system?: true}
+           ),
+         true <-
+           matching_initial_composition?(
+             snapshot,
+             subscription,
+             line_item,
+             payment_intent,
+             application
+           ) do
+      :ok
+    else
+      false -> composition_evidence_error()
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp matching_initial_composition?(nil, _, _, _, _), do: false
+
+  defp matching_initial_composition?(
+         snapshot,
+         subscription,
+         line_item,
+         payment_intent,
+         application
+       ) do
+    expected = %{
+      subscription_id: subscription.id,
+      source_order_line_item_id: line_item.id,
+      order_id: line_item.order_id,
+      user_id: subscription.user_id,
+      plan_revision_id: line_item.subscription_plan_revision_id_snapshot,
+      variant_id: line_item.variant_id_snapshot,
+      quantity: line_item.quantity,
+      payment_intent_id: payment_intent.id,
+      payment_application_id: application.id,
+      payment_amount_minor: payment_intent.amount_received_minor,
+      currency: payment_intent.currency
+    }
+
+    fields = Map.from_struct(snapshot)
+
+    Map.take(fields, Map.keys(expected)) == expected and
+      snapshot.fingerprint == CompositionSnapshot.fingerprint(fields)
+  end
+
+  defp composition_evidence_error do
+    {:error,
+     Error.new(
+       "TARGET_ORDER_UNPROVABLE",
+       "initial composition payment or purchase evidence conflicts"
+     )}
   end
 
   defp ensure_subscription_source_created(%Subscription{} = subscription) do
@@ -5038,7 +5193,8 @@ defmodule Store.Subscriptions.Facade do
       next_retry_at: nil,
       source_order_id: order.id,
       source_order_line_item_id: line_item.id,
-      current_plan_revision_id: revision.id
+      current_plan_revision_id: revision.id,
+      current_composition_snapshot_id: Ash.UUIDv7.generate()
     }
 
     Subscription

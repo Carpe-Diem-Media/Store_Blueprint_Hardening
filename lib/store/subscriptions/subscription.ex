@@ -220,6 +220,12 @@ defmodule Store.Subscriptions.Subscription do
   end
 
   relationships do
+    belongs_to :current_composition_snapshot, Store.Subscriptions.CompositionSnapshot do
+      allow_nil?(true)
+      attribute_writable?(true)
+      public?(false)
+    end
+
     belongs_to :subscription_plan, Store.Subscriptions.SubscriptionPlan do
       allow_nil?(false)
       attribute_writable?(true)
@@ -533,7 +539,8 @@ defmodule Store.Subscriptions.Subscription do
         :stored_payment_method_id,
         :source_order_id,
         :source_order_line_item_id,
-        :current_plan_revision_id
+        :current_plan_revision_id,
+        :current_composition_snapshot_id
       ])
 
       validate(fn changeset, _context ->
@@ -1015,6 +1022,12 @@ defmodule Store.Subscriptions.Subscription do
     end
 
     references do
+      reference(:current_composition_snapshot,
+        on_delete: :nothing,
+        deferrable: :initially,
+        match_with: [id: :subscription_id]
+      )
+
       reference(:cancel_after_renewal_attempt, on_delete: :restrict)
       reference(:current_dunning_renewal_attempt, on_delete: :restrict)
       reference(:current_plan_revision, on_delete: :restrict)

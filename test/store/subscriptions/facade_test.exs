@@ -2856,6 +2856,7 @@ defmodule Store.Subscriptions.FacadeTest do
                  Repo.query!("DELETE FROM order_line_items WHERE id = $1", [line_item_id])
                  Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM payment_applications WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
 

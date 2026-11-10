@@ -480,6 +480,7 @@ defmodule Store.Workers.SubscriptionsEnsureForPaidOrderWorkerTest do
                  Repo.query!("DELETE FROM order_line_items WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM order_adjustments WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM fulfillment_orders WHERE order_id = $1", [order_id])
+                 Repo.query!("DELETE FROM payment_applications WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM payment_intents WHERE order_id = $1", [order_id])
                  Repo.query!("DELETE FROM orders WHERE id = $1", [order_id])
 

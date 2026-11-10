@@ -13,6 +13,7 @@ defmodule Store.Subscriptions do
     resource(Store.Subscriptions.StoredPaymentMethod)
     resource(Store.Subscriptions.Subscription)
     resource(Store.Subscriptions.SubscriptionItem)
+    resource(Store.Subscriptions.CompositionSnapshot)
     resource(Store.Subscriptions.RenewalAttempt)
     resource(Store.Subscriptions.RenewalCollectionAttempt)
     resource(Store.Subscriptions.AccessEffect)

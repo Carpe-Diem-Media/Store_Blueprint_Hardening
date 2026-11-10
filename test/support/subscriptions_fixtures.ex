@@ -5,7 +5,7 @@ defmodule Store.SubscriptionsFixtures do
   require Ash.Query
 
   alias Store.Catalog.{Product, Variant}
-  alias Store.Orders.{Order, OrderLineItem}
+  alias Store.Orders.{Order, OrderLineItem, PaymentApplication}
   alias Store.Payments.PaymentIntent
   alias Store.Support.ID.OrderRef
 
@@ -175,7 +175,12 @@ defmodule Store.SubscriptionsFixtures do
       )
       when is_binary(user_id) and is_map(overrides) do
     %{order: order, line_item: line_item, revision: revision} =
-      create_paid_order_with_subscription_line!(user_id, variant, plan, overrides)
+      create_paid_order_with_subscription_line!(
+        user_id,
+        variant,
+        plan,
+        Map.put_new(overrides, :create_payment_application?, false)
+      )
 
     revision = ensure_forward_revision!(revision)
 
@@ -393,11 +398,29 @@ defmodule Store.SubscriptionsFixtures do
         )
         |> Ash.create!(domain: Store.Payments, authorize?: false, context: %{system?: true})
 
-      payment_intent
-      |> Ash.Changeset.for_update(:submit, %{}, context: %{system?: true})
-      |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
-      |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
-      |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+      succeeded =
+        payment_intent
+        |> Ash.Changeset.for_update(:submit, %{}, context: %{system?: true})
+        |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+        |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
+        |> Ash.update!(domain: Store.Payments, authorize?: false, context: %{system?: true})
+
+      _ =
+        if Map.get(overrides, :create_payment_application?, true) do
+          PaymentApplication
+          |> Ash.Changeset.for_create(
+            :apply_once,
+            %{
+              order_id: order.id,
+              payment_intent_id: succeeded.id,
+              application_key: "paid_apply:order:#{order.id}"
+            },
+            context: %{system?: true}
+          )
+          |> Ash.create!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+        end
+
+      succeeded
     else
       :ok
     end
