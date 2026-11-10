@@ -20,7 +20,7 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
   alias Store.Repo
   alias Store.Shipping.Facade, as: ShippingFacade
   alias Store.Shipping.Inputs.QuoteRequest
-  alias Store.Shipping.{ShippingMethod, ShippingRateRule, ShippingZone}
+  alias Store.Shipping.{QuoteCache, ShippingMethod, ShippingRateRule, ShippingZone}
   alias Store.Subscriptions.AccessEffect
   alias Store.Subscriptions.Facade, as: SubscriptionsFacade
   alias Store.Subscriptions.Inputs.EstablishAccessEffectInput
@@ -1459,6 +1459,19 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
   end
 
   @tag :jc281_physical
+  test "physical renewal shipping fixtures remain isolated when quote cache keys repeat" do
+    postal_code = "94105-#{System.unique_integer([:positive])}"
+    first = physical_renewal_fixture!("repeated_shipping_key_first", 5, postal_code)
+    second = physical_renewal_fixture!("repeated_shipping_key_second", 5, postal_code)
+    first_order = fetch_order!(first.subscription.source_order_id)
+    second_order = fetch_order!(second.subscription.source_order_id)
+
+    assert first_order.shipping_postal_code == postal_code
+    assert second_order.shipping_postal_code == postal_code
+    refute first_order.shipping_method_code == second_order.shipping_method_code
+  end
+
+  @tag :jc281_physical
   test "certified success evidence from another renewal cannot apply this collection" do
     fixture_a =
       prepare_reached_physical_renewal!(physical_renewal_fixture!("wrong_success_evidence_a", 5))
@@ -2614,7 +2627,7 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
     assert refunds_for(order_id, payment_intent_id) == []
   end
 
-  defp physical_renewal_fixture!(prefix, stock_on_hand) do
+  defp physical_renewal_fixture!(prefix, stock_on_hand, postal_code \\ nil) do
     customer = SubscriptionsFixtures.create_customer!("jc281_#{prefix}")
 
     %{variant: base_variant} =
@@ -2635,7 +2648,7 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
         next_renewal_at: DateTime.add(now, -10, :second)
       })
 
-    configure_physical_renewal_shipping!(source_order, variant)
+    configure_physical_renewal_shipping!(source_order, variant, postal_code)
 
     %{
       customer: customer,
@@ -2652,14 +2665,17 @@ defmodule Store.Subscriptions.CancellationRenewalAuthorityTest do
     Map.merge(fixture, reached)
   end
 
-  defp configure_physical_renewal_shipping!(%Order{} = order, %Variant{} = variant) do
+  defp configure_physical_renewal_shipping!(%Order{} = order, %Variant{} = variant, postal_code) do
     zone = create_shipping_zone!("US", "CA")
     method = create_shipping_method!("GROUND-#{System.unique_integer([:positive])}")
     _tax_rate = create_tax_rate!("US", "CA")
     _rule = create_shipping_rule!(zone.id, method.id, 400)
+    # These fixtures use resource actions directly, so reproduce the facade's cache invalidation.
+    :ok = QuoteCache.invalidate_all("renewal_authority_fixture_mutation")
 
     postal_code =
-      "94105-#{System.unique_integer([:positive]) |> rem(10_000) |> Integer.to_string() |> String.pad_leading(4, "0")}"
+      postal_code ||
+        "94105-#{System.unique_integer([:positive]) |> rem(10_000) |> Integer.to_string() |> String.pad_leading(4, "0")}"
 
     {:ok, request} =
       QuoteRequest.new(%{
