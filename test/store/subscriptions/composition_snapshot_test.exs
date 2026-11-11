@@ -16,6 +16,83 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     :ok
   end
 
+  test "version 1 fingerprints preserve the accepted deterministic descriptor" do
+    id = "018f0000-0000-7000-8000-000000000001"
+
+    fields = %{
+      subscription_id: id,
+      source_version: 1,
+      user_id: id,
+      order_id: id,
+      source_order_line_item_id: id,
+      plan_revision_id: id,
+      payment_intent_id: id,
+      payment_application_id: id,
+      variant_id: id,
+      quantity: 1,
+      renewal_amount_minor: 1234,
+      payment_amount_minor: 1234,
+      currency: "ZAR",
+      period_start_at: ~U[2026-01-01 00:00:00.123456Z],
+      period_end_at: ~U[2026-02-01 00:00:00.123456Z],
+      components: []
+    }
+
+    assert CompositionSnapshot.fingerprint(fields) ==
+             "90d63b184088e1f8cb7339f83120b72ed196a805a0db36128c2d70f499e3f37e"
+
+    component = %{
+      "component_key" => id,
+      "kind" => "membership_access",
+      "scope_key" => "membership:basic",
+      "valid_from_at" => "2026-01-01T00:00:00.123456Z",
+      "valid_until_at" => "2026-02-01T00:00:00.123456Z"
+    }
+
+    single = %{fields | components: [component]}
+
+    assert CompositionSnapshot.fingerprint(single) ==
+             "57f0ecd5af708235af43f6425148fa7661c6f38cc440cf284c0b3799ab8e77c8"
+
+    assert CompositionSnapshot.fingerprint(Map.put(single, :format_version, 2)) ==
+             {:error, :unsupported_format_version}
+  end
+
+  test "version 1 rejects malformed component identities and payloads" do
+    id = "018f0000-0000-7000-8000-000000000001"
+
+    component = %{
+      "component_key" => id,
+      "kind" => "membership_access",
+      "scope_key" => "membership:basic",
+      "valid_from_at" => "2026-01-01T00:00:00Z",
+      "valid_until_at" => "2026-02-01T00:00:00Z"
+    }
+
+    fields = %{source_order_line_item_id: id, components: [component]}
+    assert CompositionSnapshot.valid_v1_components?(fields)
+    assert CompositionSnapshot.valid_v1_components?(%{fields | components: []})
+
+    for malformed <- [
+          Map.delete(component, "component_key"),
+          Map.put(component, "component_key", 42),
+          Map.put(component, "component_key", "018f0000-0000-7000-8000-000000000002"),
+          Map.delete(component, "kind"),
+          Map.put(component, "kind", "invalid"),
+          Map.put(component, "scope_key", " "),
+          Map.put(component, "valid_from_at", "invalid"),
+          Map.put(component, "valid_until_at", "2025-01-01T00:00:00Z"),
+          Map.put(component, "unexpected", "value")
+        ] do
+      refute CompositionSnapshot.valid_v1_components?(%{fields | components: [malformed]})
+    end
+
+    refute CompositionSnapshot.valid_v1_components?(%{
+             fields
+             | components: [component, component]
+           })
+  end
+
   test "initial paid activation records one immutable composition without advancing the source twice" do
     fixture = paid_source!()
 
@@ -25,6 +102,7 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     subscription = source!(fixture.line_item.id)
     assert is_binary(Map.get(subscription, :current_composition_snapshot_id))
     snapshot = snapshot!(subscription)
+    assert Map.get(snapshot, :format_version) == 1
     assert snapshot.source_version == subscription.aggregate_version
     assert snapshot.source_order_line_item_id == fixture.line_item.id
     assert snapshot.payment_application_id == fixture.payment_application.id
@@ -224,6 +302,109 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     assert snapshot!(source!(fixture.line_item.id)) == original
   end
 
+  test "invalid components cannot be created through the Ash action" do
+    fixture = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+    snapshot = snapshot!(source!(fixture.line_item.id))
+    [component] = snapshot.components
+
+    attrs =
+      snapshot
+      |> Map.from_struct()
+      |> Map.take(Info.action(CompositionSnapshot, :establish).accept)
+
+    malformed = [
+      [Map.delete(component, "component_key")],
+      [Map.put(component, "component_key", "invalid")],
+      [Map.put(component, "component_key", Ash.UUIDv7.generate())],
+      [Map.delete(component, "kind")],
+      [Map.put(component, "kind", "invalid")],
+      [Map.put(component, "scope_key", " ")],
+      [Map.put(component, "valid_from_at", "invalid")],
+      [Map.put(component, "valid_until_at", "invalid")],
+      [Map.put(component, "valid_until_at", "2000-01-01T00:00:00Z")],
+      [component, component]
+    ]
+
+    for components <- malformed do
+      candidate =
+        Map.merge(attrs, %{id: Ash.UUIDv7.generate(), source_version: 2, components: components})
+
+      assert {:error, _} =
+               CompositionSnapshot
+               |> Ash.Changeset.for_create(:establish, candidate, context: %{system?: true})
+               |> Ash.create(authorize?: false, context: %{system?: true})
+
+      assert Repo.aggregate(CompositionSnapshot, :count) == 1
+    end
+  end
+
+  test "database rejects unsupported and null format versions" do
+    fixture = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+    snapshot = snapshot!(source!(fixture.line_item.id))
+
+    for version <- [0, 2, nil] do
+      assert {:error, %Postgrex.Error{}} =
+               Repo.query(
+                 """
+                 INSERT INTO composition_snapshots
+                   (id, subscription_id, source_version, user_id, order_id, source_order_line_item_id,
+                    plan_revision_id, payment_intent_id, payment_application_id, variant_id, quantity,
+                    renewal_amount_minor, payment_amount_minor, currency, period_start_at, period_end_at,
+                    components, fingerprint, format_version)
+                 SELECT $1, subscription_id, source_version + 1, user_id, order_id, source_order_line_item_id,
+                    plan_revision_id, payment_intent_id, payment_application_id, variant_id, quantity,
+                    renewal_amount_minor, payment_amount_minor, currency, period_start_at, period_end_at,
+                    components, fingerprint, $2 FROM composition_snapshots WHERE id = $3
+                 """,
+                 [Ecto.UUID.dump!(Ash.UUIDv7.generate()), version, Ecto.UUID.dump!(snapshot.id)],
+                 mode: :savepoint
+               )
+    end
+
+    assert Repo.aggregate(CompositionSnapshot, :count) == 1
+  end
+
+  test "replay rejects self-consistent malformed persisted components" do
+    fixture = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+    snapshot = snapshot!(source!(fixture.line_item.id))
+    [component] = snapshot.components
+
+    for malformed <- [
+          Map.put(component, "component_key", Ash.UUIDv7.generate()),
+          Map.put(component, "valid_from_at", "invalid")
+        ] do
+      components = [malformed]
+
+      fingerprint =
+        CompositionSnapshot.fingerprint(%{Map.from_struct(snapshot) | components: components})
+
+      Repo.query!(
+        "ALTER TABLE composition_snapshots DISABLE TRIGGER composition_snapshots_immutable"
+      )
+
+      try do
+        Repo.query!(
+          "UPDATE composition_snapshots SET components = $1, fingerprint = $2 WHERE id = $3",
+          [components, fingerprint, Ecto.UUID.dump!(snapshot.id)]
+        )
+      after
+        Repo.query!(
+          "ALTER TABLE composition_snapshots ENABLE TRIGGER composition_snapshots_immutable"
+        )
+      end
+
+      before = evidence_state()
+
+      assert {:error, %{code: "TARGET_ORDER_UNPROVABLE"}} =
+               Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+
+      assert evidence_state() == before
+    end
+  end
+
   test "database protection rejects evidence updates while preserving the current snapshot" do
     fixture = paid_source!()
     assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
@@ -232,6 +413,13 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
              Repo.query(
                "UPDATE composition_snapshots SET quantity = quantity + 1 WHERE id = $1",
+               [Ecto.UUID.dump!(snapshot.id)],
+               mode: :savepoint
+             )
+
+    assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
+             Repo.query(
+               "UPDATE composition_snapshots SET format_version = 2 WHERE id = $1",
                [Ecto.UUID.dump!(snapshot.id)],
                mode: :savepoint
              )
