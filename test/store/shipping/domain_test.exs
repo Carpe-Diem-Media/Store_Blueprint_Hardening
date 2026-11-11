@@ -1,6 +1,8 @@
 defmodule Store.Shipping.DomainTest do
   use Store.DataCase, async: false
 
+  alias Ecto.Adapters.SQL.Sandbox
+
   alias Store.Shipping
   alias Store.Shipping.Inputs.QuoteRequest
 
@@ -174,6 +176,146 @@ defmodule Store.Shipping.DomainTest do
 
     assert {:ok, []} = quote_options(request, as_of: before_start)
     assert {:ok, [%{amount_minor: 950}]} = quote_options(request, as_of: starts_at)
+
+    assert {:ok, revision} = ConfigRevision.read()
+    request_key = QuoteCache.request_key(request)
+    assert {:ok, nil} = Cachex.get(QuoteCache, "v2:#{revision}:#{request_key}")
+
+    assert {:ok, :miss} =
+             Redis.term_get("cache:shipping:quote:v2:#{revision}:#{request_key}")
+  end
+
+  test "explicit as_of quote retries when a committed mutation lands during its database read" do
+    parent = self()
+    ref = make_ref()
+    unique = System.unique_integer([:positive])
+    method_code = "AS_OF_RACE_METHOD_#{unique}"
+    postal_code = "AS-OF-RACE-#{unique}"
+
+    {zone, method, rule} =
+      Sandbox.unboxed_run(Repo, fn ->
+        zone = create_zone!("US", "NY")
+        method = create_method!(method_code, "As Of Race")
+        rule = create_rule!(zone.id, method.id, 1_100)
+        {zone, method, rule}
+      end)
+
+    request =
+      quote_request!(%{
+        destination_country_code: "US",
+        destination_region_code: "NY",
+        destination_postal_code: postal_code,
+        currency_code: "USD",
+        shipping_weight_grams: 20
+      })
+
+    query_count = :atomics.new(1, [])
+    resumed = :atomics.new(1, [])
+    associated_reads_after_mutation = :atomics.new(1, [])
+    handler_id = {__MODULE__, :explicit_as_of_revision_race, unique}
+
+    :telemetry.attach(
+      handler_id,
+      [:store, :repo, :query],
+      fn _event, _measurements, metadata, {test_pid, event_ref, count} ->
+        query = metadata[:query] || ""
+        normalized_query = String.downcase(query)
+
+        if String.contains?(normalized_query, "shipping_rates") and
+             Regex.match?(~r/^\s*select\b/i, query) and :atomics.add_get(count, 1, 1) == 1 do
+          send(test_pid, {:as_of_rule_query_complete, event_ref})
+
+          receive do
+            {:resume_as_of_quote, ^event_ref} -> :atomics.put(resumed, 1, 1)
+          after
+            10_000 -> exit(:as_of_quote_barrier_timeout)
+          end
+        else
+          if :atomics.get(resumed, 1) == 1 and
+               String.contains?(normalized_query, "shipping_methods") and
+               Regex.match?(~r/^\s*select\b/i, query) do
+            :atomics.add(associated_reads_after_mutation, 1, 1)
+            send(test_pid, {:as_of_method_query_after_mutation, event_ref})
+          end
+        end
+      end,
+      {parent, ref, query_count}
+    )
+
+    quote_task =
+      Task.async(fn ->
+        Shipping.quote_options(request,
+          as_of: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+        )
+      end)
+
+    try do
+      assert_receive {:as_of_rule_query_complete, ^ref}, 5_000
+
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.transaction(fn ->
+          Repo.query!(
+            "UPDATE shipping_rates SET shipping_cost_minor = $1 WHERE id = $2",
+            [2_300, Ecto.UUID.dump!(rule.id)]
+          )
+
+          Repo.query!(
+            "UPDATE shipping_methods SET name = $1 WHERE id = $2",
+            ["As Of Race Updated", Ecto.UUID.dump!(method.id)]
+          )
+        end)
+      end)
+
+      send(quote_task.pid, {:resume_as_of_quote, ref})
+      assert_receive {:as_of_method_query_after_mutation, ^ref}, 5_000
+
+      assert {:ok, [%{amount_minor: 2_300, label: "As Of Race Updated"}]} =
+               Task.await(quote_task, 10_000)
+
+      assert :atomics.get(associated_reads_after_mutation, 1) > 0
+    after
+      send(quote_task.pid, {:resume_as_of_quote, ref})
+      if Process.alive?(quote_task.pid), do: Task.shutdown(quote_task, :brutal_kill)
+      :telemetry.detach(handler_id)
+
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("DELETE FROM shipping_rates WHERE id = $1", [Ecto.UUID.dump!(rule.id)])
+        Repo.query!("DELETE FROM shipping_zones WHERE id = $1", [Ecto.UUID.dump!(zone.id)])
+        Repo.query!("DELETE FROM shipping_methods WHERE id = $1", [Ecto.UUID.dump!(method.id)])
+      end)
+    end
+  end
+
+  test "an explicit as_of quote returns an error after two revision conflicts" do
+    request = quote_request!(quote_attrs("US", "CA", 24))
+    as_of = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    {:ok, revision_reads} = Agent.start_link(fn -> 0 end)
+    {:ok, fallback_calls} = Agent.start_link(fn -> 0 end)
+
+    assert {:error,
+            %Store.Support.Errors.Error{
+              code: "INTERNAL_ERROR",
+              message: "shipping configuration changed during quote calculation"
+            }} =
+             QuoteCache.fetch_uncached(
+               request,
+               fn _evaluation_time ->
+                 Agent.update(fallback_calls, &(&1 + 1))
+                 {:ok, [:superseded], nil}
+               end,
+               clock: fn -> as_of end,
+               revision_reader: fn ->
+                 Agent.get_and_update(revision_reads, fn count ->
+                   next_revision = count + 1
+                   {{:ok, next_revision}, next_revision}
+                 end)
+               end
+             )
+
+    assert Agent.get(revision_reads, & &1) == 4
+    assert Agent.get(fallback_calls, & &1) == 2
+    Agent.stop(revision_reads)
+    Agent.stop(fallback_calls)
   end
 
   test "rule end remains eligible at equality and expires immediately after" do

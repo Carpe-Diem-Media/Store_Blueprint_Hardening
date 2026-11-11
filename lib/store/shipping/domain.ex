@@ -124,10 +124,11 @@ defmodule Store.Shipping do
   end
 
   defp quote_options_at(request, as_of) do
-    with {:ok, options, _validity} <- quote_options_from_db(request, as_of) do
-      {:ok, options,
-       %{cache: "miss", layer: "cold", request_key: QuoteCache.request_key(request)}}
-    end
+    QuoteCache.fetch_uncached(
+      request,
+      fn evaluation_time -> quote_options_from_db(request, evaluation_time) end,
+      clock: fn -> as_of end
+    )
   end
 
   defp quote_options_current(request, opts) do

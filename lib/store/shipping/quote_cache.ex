@@ -41,10 +41,19 @@ defmodule Store.Shipping.QuoteCache do
     request_key = request_key(request)
 
     case safe_call(deps.in_transaction?, []) do
-      true -> fetch_transactional(request, request_key, fallback, deps, 0)
+      true -> fetch_consistent_uncached(request, request_key, fallback, deps, 0)
       false -> fetch_revision(request, request_key, fallback, deps, 0)
       _other -> authority_unavailable()
     end
+  end
+
+  @doc false
+  @spec fetch_uncached(QuoteRequest.t(), (DateTime.t() -> term()), keyword()) ::
+          {:ok, [term()], cache_metadata()} | {:error, Error.t()}
+  def fetch_uncached(%QuoteRequest{} = request, fallback, opts \\ [])
+      when is_function(fallback, 1) and is_list(opts) do
+    deps = dependencies(opts)
+    fetch_consistent_uncached(request, request_key(request), fallback, deps, 0)
   end
 
   @spec invalidate_all_local() :: :ok
@@ -116,32 +125,31 @@ defmodule Store.Shipping.QuoteCache do
     }
   end
 
-  # Transaction-local quote data must never enter Cachex or Redis. A sandbox
-  # rollback restores the durable revision, so a cached value from the rolled
-  # back generation could otherwise become reachable under a reused revision.
-  defp fetch_transactional(request, request_key, fallback, deps, attempt) do
-    case load_transactional_value(fallback, deps) do
+  # Explicit-time and transaction-local quote data must never enter Cachex or
+  # Redis. The same revision bracket protects both paths from mixed generations.
+  defp fetch_consistent_uncached(request, request_key, fallback, deps, attempt) do
+    case load_uncached_value(fallback, deps) do
       {:ok, value} ->
         {:ok, value, metadata("miss", "cold", request_key)}
 
       {:retry, _reason} ->
-        retry_transactional_or_error(request, request_key, fallback, deps, attempt)
+        retry_consistent_uncached_or_error(request, request_key, fallback, deps, attempt)
 
       {:error, %Error{} = error} ->
         {:error, error}
     end
   end
 
-  defp retry_transactional_or_error(_request, _request_key, _fallback, _deps, attempt)
+  defp retry_consistent_uncached_or_error(_request, _request_key, _fallback, _deps, attempt)
        when attempt + 1 >= @max_revision_attempts do
     {:error, internal_error("shipping configuration changed during quote calculation")}
   end
 
-  defp retry_transactional_or_error(request, request_key, fallback, deps, attempt) do
-    fetch_transactional(request, request_key, fallback, deps, attempt + 1)
+  defp retry_consistent_uncached_or_error(request, request_key, fallback, deps, attempt) do
+    fetch_consistent_uncached(request, request_key, fallback, deps, attempt + 1)
   end
 
-  defp load_transactional_value(fallback, deps) do
+  defp load_uncached_value(fallback, deps) do
     now = deps.clock.()
 
     with {:ok, revision} <- read_revision(deps),
