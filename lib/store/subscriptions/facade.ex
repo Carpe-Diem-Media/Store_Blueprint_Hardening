@@ -4823,7 +4823,8 @@ defmodule Store.Subscriptions.Facade do
 
     fields = Map.from_struct(snapshot)
 
-    Map.take(fields, Map.keys(expected)) == expected and
+    # Initial-sale replay remains bound to v1; codec support does not grant v2 replay authority.
+    Map.get(fields, :format_version) == 1 and Map.take(fields, Map.keys(expected)) == expected and
       CompositionSnapshot.valid_fingerprint?(fields)
   end
 
