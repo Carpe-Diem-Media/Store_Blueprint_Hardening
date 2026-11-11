@@ -82,6 +82,26 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     fingerprint = CompositionSnapshot.fingerprint(fields)
     assert is_binary(fingerprint)
 
+    evidence = Map.put(fields, :fingerprint, fingerprint)
+    assert CompositionSnapshot.valid_fingerprint?(evidence)
+
+    tampered_fingerprint =
+      if String.starts_with?(fingerprint, "0"),
+        do: "1" <> binary_part(fingerprint, 1, 63),
+        else: "0" <> binary_part(fingerprint, 1, 63)
+
+    refute CompositionSnapshot.valid_fingerprint?(%{
+             evidence
+             | fingerprint: tampered_fingerprint
+           })
+
+    malformed_component = Map.put(first, "valid_until_at", "2025-01-01T00:00:00Z")
+
+    refute CompositionSnapshot.valid_fingerprint?(%{
+             evidence
+             | components: [malformed_component, second]
+           })
+
     assert ^fingerprint = CompositionSnapshot.fingerprint(%{fields | components: [second, first]})
 
     fingerprint_with_next_source =
@@ -205,6 +225,21 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     assert [%{"component_key" => key, "kind" => "membership_access"}] = snapshot.components
     assert key == fixture.line_item.id
     assert snapshot.fingerprint == CompositionSnapshot.fingerprint(Map.from_struct(snapshot))
+    assert CompositionSnapshot.valid_fingerprint?(Map.from_struct(snapshot))
+
+    codec_fields =
+      v2_fields([v2_component(Ash.UUIDv7.generate(), "membership:basic")])
+
+    codec_fingerprint = CompositionSnapshot.fingerprint(codec_fields)
+    codec_evidence = Map.put(codec_fields, :fingerprint, codec_fingerprint)
+    assert CompositionSnapshot.valid_fingerprint?(codec_evidence)
+
+    persisted_v2_shape =
+      snapshot
+      |> Map.from_struct()
+      |> Map.merge(codec_evidence)
+
+    refute CompositionSnapshot.valid_fingerprint?(persisted_v2_shape)
     assert subscription.aggregate_version == 1
 
     [effect] = Ash.read!(AccessEffect, authorize?: false, context: %{system?: true})
@@ -437,7 +472,7 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
     snapshot = snapshot!(source!(fixture.line_item.id))
 
-    for version <- [0, 3, nil] do
+    for version <- [0, 2, 3, nil] do
       assert {:error, %Postgrex.Error{}} =
                Repo.query(
                  """
@@ -459,36 +494,56 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     assert Repo.aggregate(CompositionSnapshot, :count) == 1
   end
 
-  test "database cardinality limits match each supported format" do
+  test "database rejects version 2 rows at the persistence boundary" do
     fixture = paid_source!()
     assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
     snapshot = snapshot!(source!(fixture.line_item.id))
 
-    for {version, count} <- [{1, 2}, {2, 17}] do
-      assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
-               Repo.query(
-                 """
-                 INSERT INTO composition_snapshots
-                   (id, subscription_id, source_version, user_id, order_id, source_order_line_item_id,
-                    plan_revision_id, payment_intent_id, payment_application_id, variant_id, quantity,
-                    renewal_amount_minor, payment_amount_minor, currency, period_start_at, period_end_at,
-                    components, fingerprint, format_version)
-                 SELECT $1, subscription_id, source_version + 1, user_id, order_id,
-                    source_order_line_item_id, plan_revision_id, payment_intent_id,
-                    payment_application_id, variant_id, quantity, renewal_amount_minor,
-                    payment_amount_minor, currency, period_start_at, period_end_at,
-                    array_fill(components[1], ARRAY[$2::integer]), fingerprint, $3
-                 FROM composition_snapshots WHERE id = $4
-                 """,
-                 [
-                   Ecto.UUID.dump!(Ash.UUIDv7.generate()),
-                   count,
-                   version,
-                   Ecto.UUID.dump!(snapshot.id)
-                 ],
-                 mode: :savepoint
-               )
-    end
+    assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
+             Repo.query(
+               """
+               INSERT INTO composition_snapshots
+                 (id, subscription_id, source_version, user_id, order_id, source_order_line_item_id,
+                  plan_revision_id, payment_intent_id, payment_application_id, variant_id, quantity,
+                  renewal_amount_minor, payment_amount_minor, currency, period_start_at, period_end_at,
+                  components, fingerprint, format_version)
+               SELECT $1, subscription_id, source_version + 1, user_id, order_id,
+                  source_order_line_item_id, plan_revision_id, payment_intent_id,
+                  payment_application_id, variant_id, quantity, renewal_amount_minor,
+                  payment_amount_minor, currency, period_start_at, period_end_at,
+                  components, fingerprint, 2
+               FROM composition_snapshots WHERE id = $2
+               """,
+               [Ecto.UUID.dump!(Ash.UUIDv7.generate()), Ecto.UUID.dump!(snapshot.id)],
+               mode: :savepoint
+             )
+
+    assert Repo.aggregate(CompositionSnapshot, :count) == 1
+  end
+
+  test "database retains the version 1 single-component cardinality limit" do
+    fixture = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+    snapshot = snapshot!(source!(fixture.line_item.id))
+
+    assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
+             Repo.query(
+               """
+               INSERT INTO composition_snapshots
+                 (id, subscription_id, source_version, user_id, order_id, source_order_line_item_id,
+                  plan_revision_id, payment_intent_id, payment_application_id, variant_id, quantity,
+                  renewal_amount_minor, payment_amount_minor, currency, period_start_at, period_end_at,
+                  components, fingerprint, format_version)
+               SELECT $1, subscription_id, source_version + 1, user_id, order_id,
+                  source_order_line_item_id, plan_revision_id, payment_intent_id,
+                  payment_application_id, variant_id, quantity, renewal_amount_minor,
+                  payment_amount_minor, currency, period_start_at, period_end_at,
+                  array_fill(components[1], ARRAY[2]), fingerprint, 1
+               FROM composition_snapshots WHERE id = $2
+               """,
+               [Ecto.UUID.dump!(Ash.UUIDv7.generate()), Ecto.UUID.dump!(snapshot.id)],
+               mode: :savepoint
+             )
 
     assert Repo.aggregate(CompositionSnapshot, :count) == 1
   end

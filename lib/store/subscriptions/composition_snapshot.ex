@@ -5,8 +5,13 @@ defmodule Store.Subscriptions.CompositionSnapshot do
   Format 1 records the existing initial paid activation with zero or one entitlement component.
   Its component key remains the original order-line UUID, and its fingerprint descriptor is frozen.
   Format 2 defines a stable UUIDv7 component instance key and supports up to 16 components in the
-  codec. The current persistence action remains format 1 because this resource's order and payment
-  fields describe the initial sale and cannot establish provenance for later composition changes.
+  codec. It is codec-only: the Ash resource and PostgreSQL table remain format 1 because this
+  resource's order and payment fields describe the initial sale and cannot establish provenance
+  for later composition changes.
+
+  A governed persistence change must establish commercial source provenance, a v2 record shape,
+  immutable creation and replay, matching Ash and PostgreSQL validation, a tested database
+  round-trip, and migration and rollback safety before enabling persisted format 2 records.
 
   Neither format implements a billing lifecycle or current access authority. Later source changes
   require new immutable evidence and must not rewrite historical snapshots.
@@ -109,7 +114,7 @@ defmodule Store.Subscriptions.CompositionSnapshot do
 
     attribute :components, {:array, :map} do
       allow_nil?(false)
-      constraints(max_length: @v2_max_components)
+      constraints(max_length: 1)
       public?(false)
     end
 
@@ -193,7 +198,7 @@ defmodule Store.Subscriptions.CompositionSnapshot do
 
     check_constraints do
       check_constraint(:format_version, "composition_snapshots_format_version_check",
-        check: "format_version IN (1, 2)"
+        check: "format_version = 1"
       )
 
       check_constraint(:source_version, "composition_snapshots_source_version_check",
@@ -205,9 +210,7 @@ defmodule Store.Subscriptions.CompositionSnapshot do
       )
 
       check_constraint(:components, "composition_snapshots_scalar_components_check",
-        check:
-          "(format_version = 1 AND cardinality(components) <= 1) OR " <>
-            "(format_version = 2 AND cardinality(components) <= #{@v2_max_components})"
+        check: "cardinality(components) <= 1"
       )
     end
   end
