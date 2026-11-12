@@ -208,53 +208,74 @@ defmodule Store.Shipping.ConfigRevisionTest do
         end)
       end)
 
-    writer_b =
-      Task.async(fn ->
-        Sandbox.unboxed_run(Repo, fn ->
-          Repo.transaction(fn ->
-            Repo.query!("SELECT set_config('application_name', $1, true)", [app_b])
-            %{rows: [[backend_pid]]} = Repo.query!("SELECT pg_backend_pid()")
-            send(parent, {:revision_writer_b_started, ref, backend_pid})
-            started_at = System.monotonic_time(:microsecond)
-
-            Repo.query!(
-              "INSERT INTO shipping_zones (code, country_code, active) VALUES ($1, 'ZA', true)",
-              [code_b]
-            )
-
-            {backend_pid, System.monotonic_time(:microsecond) - started_at}
-          end)
-        end)
-      end)
-
     try do
       assert_receive {:revision_writer_a_locked, ^ref, writer_a_pid}, 5_000
-      assert_receive {:revision_writer_b_started, ^ref, writer_b_pid}, 5_000
 
-      wait_us = wait_for_revision_writer(writer_b_pid, writer_a_pid, 1_000)
+      writer_b =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              Repo.query!("SELECT set_config('application_name', $1, true)", [app_b])
+              %{rows: [[backend_pid]]} = Repo.query!("SELECT pg_backend_pid()")
+              send(parent, {:revision_writer_b_started, ref, backend_pid})
+              started_at = System.monotonic_time(:microsecond)
 
-      %{rows: [[writer_connections]]} =
-        Repo.query!(
-          "SELECT count(*) FROM pg_stat_activity WHERE application_name IN ($1, $2)",
-          [app_a, app_b]
-        )
+              Repo.query!(
+                "INSERT INTO shipping_zones (code, country_code, active) VALUES ($1, 'ZA', true)",
+                [code_b]
+              )
 
-      send(writer_a.pid, {:release_revision_writer_a, ref})
+              {backend_pid, System.monotonic_time(:microsecond) - started_at}
+            end)
+          end)
+        end)
 
-      assert {:ok, _} = Task.await(writer_a, 10_000)
-      assert {:ok, {^writer_b_pid, writer_elapsed_us}} = Task.await(writer_b, 10_000)
-      assert revision!() == start_revision + 2
+      try do
+        assert_receive {:revision_writer_b_started, ^ref, writer_b_pid}, 5_000
 
-      pool_size = Keyword.fetch!(Repo.config(), :pool_size)
+        case wait_for_revision_writer(writer_b_pid, writer_a_pid, 1_000) do
+          {:ok, observation} ->
+            %{rows: [[writer_connections]]} =
+              Repo.query!(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name IN ($1, $2)",
+                [app_a, app_b]
+              )
 
-      IO.puts(
-        "JC379_REVISION_CONTENTION wait_us=#{wait_us} writer_elapsed_us=#{writer_elapsed_us} " <>
-          "writer_connections=#{writer_connections} pool_size=#{pool_size}"
-      )
+            send(writer_a.pid, {:release_revision_writer_a, ref})
+
+            assert {:ok, _} = Task.await(writer_a, 10_000)
+            assert {:ok, {^writer_b_pid, writer_elapsed_us}} = Task.await(writer_b, 10_000)
+            assert revision!() == start_revision + 2
+
+            pool_size = Keyword.fetch!(Repo.config(), :pool_size)
+
+            IO.puts(
+              "JC379_REVISION_CONTENTION writer_a_pid=#{writer_a_pid} " <>
+                "writer_b_pid=#{writer_b_pid} state=#{observation.state} " <>
+                "wait_event_type=#{observation.wait_event_type} " <>
+                "wait_event=#{observation.wait_event} " <>
+                "blocker_pids=#{inspect(observation.blocker_pids)} " <>
+                "wait_us=#{observation.wait_us} writer_elapsed_us=#{writer_elapsed_us} " <>
+                "writer_connections=#{writer_connections} pool_size=#{pool_size}"
+            )
+
+          {:error, diagnostics} ->
+            send(writer_a.pid, {:release_revision_writer_a, ref})
+            writer_a_result = await_writer_result(writer_a)
+            writer_b_result = await_writer_result(writer_b)
+            final_revision = revision!()
+
+            flunk(
+              "concurrent Shipping mutation did not wait on the revision singleton: " <>
+                "#{inspect(%{writer_a_pid: writer_a_pid, writer_b_pid: writer_b_pid, diagnostics: diagnostics, writer_a_result: writer_a_result, writer_b_result: writer_b_result, final_revision: final_revision})}"
+            )
+        end
+      after
+        if Process.alive?(writer_b.pid), do: Task.shutdown(writer_b, :brutal_kill)
+      end
     after
       send(writer_a.pid, {:release_revision_writer_a, ref})
       if Process.alive?(writer_a.pid), do: Task.shutdown(writer_a, :brutal_kill)
-      if Process.alive?(writer_b.pid), do: Task.shutdown(writer_b, :brutal_kill)
 
       Sandbox.unboxed_run(Repo, fn ->
         Repo.query!("DELETE FROM shipping_zones WHERE code = ANY($1)", [[code_a, code_b]])
@@ -266,18 +287,28 @@ defmodule Store.Shipping.ConfigRevisionTest do
     %{rows: rows} =
       Repo.query!(
         """
-        SELECT wait_event_type, pg_blocking_pids(pid),
+        SELECT state, wait_event_type, wait_event, pg_blocking_pids(pid), query,
                GREATEST(0, floor(EXTRACT(EPOCH FROM (clock_timestamp() - query_start)) * 1000000)::bigint)
         FROM pg_stat_activity
-        WHERE pid = $1 AND state = 'active'
+        WHERE pid = $1
         """,
         [writer_pid]
       )
 
     case rows do
-      [["Lock", blockers, wait_us]] when is_list(blockers) ->
-        if blocker_pid in blockers do
-          wait_us
+      [["active", "Lock", wait_event, blockers, query, wait_us]]
+      when is_list(blockers) and is_binary(query) ->
+        if blocker_pid in blockers and
+             String.contains?(String.downcase(query), "insert into shipping_zones") do
+          {:ok,
+           %{
+             state: "active",
+             wait_event_type: "Lock",
+             wait_event: wait_event,
+             blocker_pids: blockers,
+             query: query,
+             wait_us: wait_us
+           }}
         else
           retry_wait_for_revision_writer(writer_pid, blocker_pid, attempts_left)
         end
@@ -295,8 +326,43 @@ defmodule Store.Shipping.ConfigRevisionTest do
     end
   end
 
-  defp retry_wait_for_revision_writer(_writer_pid, _blocker_pid, _attempts_left) do
-    flunk("concurrent Shipping mutation did not wait on the revision singleton")
+  defp retry_wait_for_revision_writer(writer_pid, blocker_pid, _attempts_left) do
+    {:error, revision_lock_diagnostics([writer_pid, blocker_pid])}
+  end
+
+  defp revision_lock_diagnostics(writer_pids) do
+    %{rows: activity} =
+      Repo.query!(
+        """
+        SELECT pid, application_name, state, wait_event_type, wait_event,
+               pg_blocking_pids(pid), query
+        FROM pg_stat_activity
+        WHERE pid = ANY($1::integer[])
+        ORDER BY pid
+        """,
+        [writer_pids]
+      )
+
+    %{rows: locks} =
+      Repo.query!(
+        """
+        SELECT pid, locktype, mode, granted, relation::regclass::text,
+               page, tuple, virtualxid, transactionid, classid, objid, objsubid
+        FROM pg_locks
+        WHERE pid = ANY($1::integer[])
+        ORDER BY pid, locktype, mode
+        """,
+        [writer_pids]
+      )
+
+    %{activity: activity, locks: locks}
+  end
+
+  defp await_writer_result(task) do
+    case Task.yield(task, 10_000) do
+      nil -> {:timeout, Task.shutdown(task, :brutal_kill)}
+      result -> result
+    end
   end
 
   test "all source tables install statement triggers for DML and truncate" do
