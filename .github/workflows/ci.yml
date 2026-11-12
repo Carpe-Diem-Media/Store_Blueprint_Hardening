@@ -9,7 +9,7 @@ on:
 jobs:
   check_static:
     name: check_static
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       MIX_ENV: test
       STORE_DB_PORT: 55433
@@ -56,12 +56,39 @@ jobs:
           version-file: .tool-versions
           version-type: strict
 
-      - name: Install system tools (rg + pg_isready)
+      - name: Ensure system tools (rg, psql, pg_isready)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ripgrep postgresql-client
-          rg --version
-          pg_isready --version
+          set -euo pipefail
+          missing_packages=()
+
+          if ! command -v rg >/dev/null 2>&1; then
+            missing_packages+=(ripgrep)
+          fi
+
+          if ! command -v psql >/dev/null 2>&1 || ! command -v pg_isready >/dev/null 2>&1; then
+            missing_packages+=(postgresql-client)
+          fi
+
+          if ((${#missing_packages[@]} > 0)); then
+            echo "Installing missing system packages: ${missing_packages[*]}"
+            if ! sudo apt-get update; then
+              echo "::error::Could not update package indexes for required system tools."
+              exit 1
+            fi
+            if ! sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"; then
+              echo "::error::Could not install required system tools."
+              exit 1
+            fi
+          fi
+
+          for tool in rg psql pg_isready; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required system tool '$tool' is unavailable after setup."
+              exit 1
+            fi
+            "$tool" --version
+          done
 
       - name: Cache Mix build and deps
         uses: actions/cache@v4
@@ -119,7 +146,7 @@ jobs:
 
   test_pr_strict:
     name: test_pr_strict
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: check_static
     env:
       MIX_ENV: test
@@ -167,11 +194,28 @@ jobs:
           version-file: .tool-versions
           version-type: strict
 
-      - name: Install system tools (pg_isready)
+      - name: Ensure system tools (psql, pg_isready)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql-client
-          pg_isready --version
+          set -euo pipefail
+          if ! command -v psql >/dev/null 2>&1 || ! command -v pg_isready >/dev/null 2>&1; then
+            if ! sudo apt-get update; then
+              echo "::error::Could not update package indexes for required PostgreSQL tools."
+              exit 1
+            fi
+            if ! sudo apt-get install -y --no-install-recommends postgresql-client; then
+              echo "::error::Could not install required PostgreSQL tools."
+              exit 1
+            fi
+          fi
+
+          for tool in psql pg_isready; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required system tool '$tool' is unavailable after setup."
+              exit 1
+            fi
+            "$tool" --version
+          done
 
       - name: Cache Mix build and deps
         uses: actions/cache@v4
@@ -223,7 +267,7 @@ jobs:
 
   real_connections_required:
     name: real_connections_required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       MIX_ENV: test
       STORE_BENCH_POOL_SIZE: "4"
@@ -272,11 +316,28 @@ jobs:
           version-file: .tool-versions
           version-type: strict
 
-      - name: Install system tools (pg_isready)
+      - name: Ensure system tools (psql, pg_isready)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql-client
-          pg_isready --version
+          set -euo pipefail
+          if ! command -v psql >/dev/null 2>&1 || ! command -v pg_isready >/dev/null 2>&1; then
+            if ! sudo apt-get update; then
+              echo "::error::Could not update package indexes for required PostgreSQL tools."
+              exit 1
+            fi
+            if ! sudo apt-get install -y --no-install-recommends postgresql-client; then
+              echo "::error::Could not install required PostgreSQL tools."
+              exit 1
+            fi
+          fi
+
+          for tool in psql pg_isready; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required system tool '$tool' is unavailable after setup."
+              exit 1
+            fi
+            "$tool" --version
+          done
 
       - name: Cache Mix build and deps
         uses: actions/cache@v4
@@ -334,7 +395,7 @@ jobs:
 
   performance_smoke_required:
     name: performance_smoke_required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: check_static
     env:
       MIX_ENV: test
@@ -391,11 +452,28 @@ jobs:
           version-file: .tool-versions
           version-type: strict
 
-      - name: Install system tools (pg_isready)
+      - name: Ensure system tools (psql, pg_isready)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql-client
-          pg_isready --version
+          set -euo pipefail
+          if ! command -v psql >/dev/null 2>&1 || ! command -v pg_isready >/dev/null 2>&1; then
+            if ! sudo apt-get update; then
+              echo "::error::Could not update package indexes for required PostgreSQL tools."
+              exit 1
+            fi
+            if ! sudo apt-get install -y --no-install-recommends postgresql-client; then
+              echo "::error::Could not install required PostgreSQL tools."
+              exit 1
+            fi
+          fi
+
+          for tool in psql pg_isready; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required system tool '$tool' is unavailable after setup."
+              exit 1
+            fi
+            "$tool" --version
+          done
 
       - name: Cache Mix build and deps
         uses: actions/cache@v4
@@ -454,7 +532,7 @@ jobs:
 
   performance_smoke_chaos_required:
     name: performance_smoke_chaos_required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: check_static
     env:
       MIX_ENV: test
@@ -513,11 +591,28 @@ jobs:
           version-file: .tool-versions
           version-type: strict
 
-      - name: Install system tools (pg_isready)
+      - name: Ensure system tools (psql, pg_isready)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql-client
-          pg_isready --version
+          set -euo pipefail
+          if ! command -v psql >/dev/null 2>&1 || ! command -v pg_isready >/dev/null 2>&1; then
+            if ! sudo apt-get update; then
+              echo "::error::Could not update package indexes for required PostgreSQL tools."
+              exit 1
+            fi
+            if ! sudo apt-get install -y --no-install-recommends postgresql-client; then
+              echo "::error::Could not install required PostgreSQL tools."
+              exit 1
+            fi
+          fi
+
+          for tool in psql pg_isready; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required system tool '$tool' is unavailable after setup."
+              exit 1
+            fi
+            "$tool" --version
+          done
 
       - name: Cache Mix build and deps
         uses: actions/cache@v4
@@ -576,7 +671,7 @@ jobs:
 
   dialyzer_required:
     name: dialyzer_required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: check_static
     env:
       MIX_ENV: test

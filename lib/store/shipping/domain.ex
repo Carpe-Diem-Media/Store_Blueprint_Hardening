@@ -98,11 +98,9 @@ defmodule Store.Shipping do
   def quote_options(request, opts \\ [])
 
   def quote_options(%QuoteRequest{} = request, opts) when is_list(opts) do
-    now = Keyword.get(opts, :as_of, DateTime.utc_now() |> DateTime.truncate(:microsecond))
     started_at = System.monotonic_time()
 
-    with {:ok, options, cache_metadata} <-
-           QuoteCache.fetch(request, fn -> quote_options_from_db(request, now) end) do
+    with {:ok, options, cache_metadata} <- quote_result(request, opts) do
       emit_quote_telemetry(started_at, options, cache_metadata)
       {:ok, options}
     end
@@ -110,6 +108,40 @@ defmodule Store.Shipping do
 
   def quote_options(_request, _opts) do
     {:error, Error.new("VALIDATION_ERROR", "quote request is required")}
+  end
+
+  defp quote_result(request, opts) do
+    case Keyword.fetch(opts, :as_of) do
+      {:ok, %DateTime{} = as_of} ->
+        quote_options_at(request, as_of)
+
+      {:ok, _invalid_as_of} ->
+        {:error, Error.new("VALIDATION_ERROR", "quote evaluation time is invalid")}
+
+      :error ->
+        quote_options_current(request, opts)
+    end
+  end
+
+  defp quote_options_at(request, as_of) do
+    QuoteCache.fetch_uncached(
+      request,
+      fn evaluation_time -> quote_options_from_db(request, evaluation_time) end,
+      clock: fn -> as_of end
+    )
+  end
+
+  defp quote_options_current(request, opts) do
+    clock = Keyword.get(opts, :clock, &current_quote_time/0)
+
+    if is_function(clock, 0) do
+      QuoteCache.fetch(request, fn now -> quote_options_from_db(request, now) end,
+        clock: clock,
+        in_transaction?: Keyword.get(opts, :repo_in_transaction?, &Store.Repo.in_transaction?/0)
+      )
+    else
+      {:error, Error.new("VALIDATION_ERROR", "quote clock is invalid")}
+    end
   end
 
   defp quote_options_from_db(request, now) do
@@ -120,24 +152,28 @@ defmodule Store.Shipping do
 
     case Ash.read(query, domain: __MODULE__, authorize?: false, context: %{system?: true}) do
       {:ok, rules} ->
-        rules
-        |> Enum.filter(&eligible_rule?(&1, request, now))
-        |> Enum.map(&to_quote_option(&1, request))
-        |> Enum.sort_by(&quote_option_sort_tuple/1)
+        candidates = Enum.filter(rules, &static_eligible_rule?(&1, request))
+
+        options =
+          candidates
+          |> Enum.filter(&active_window?(&1.starts_at, &1.ends_at, now))
+          |> Enum.map(&to_quote_option(&1, request))
+          |> Enum.sort_by(&quote_option_sort_tuple/1)
+
+        {:ok, options, next_eligibility_boundary(candidates, now)}
 
       {:error, _error} ->
-        raise Error.new("INTERNAL_ERROR", "unable to read shipping quote rules")
+        {:error, Error.new("INTERNAL_ERROR", "unable to read shipping quote rules")}
     end
   end
 
-  defp eligible_rule?(%ShippingRateRule{} = rule, %QuoteRequest{} = request, %DateTime{} = now) do
+  defp static_eligible_rule?(%ShippingRateRule{} = rule, %QuoteRequest{} = request) do
     zone = Map.get(rule, :shipping_zone)
     method = Map.get(rule, :shipping_method)
 
     method_active? = match?(%ShippingMethod{active: true}, method)
 
     method_active? and
-      active_window?(rule.starts_at, rule.ends_at, now) and
       zone_eligible?(zone, request) and
       weight_eligible?(
         rule.weight_min_grams,
@@ -161,6 +197,64 @@ defmodule Store.Shipping do
   end
 
   defp active_window?(_starts_at, _ends_at, _now), do: false
+
+  defp next_eligibility_boundary(candidates, %DateTime{} = now) do
+    candidates
+    |> Enum.flat_map(&rule_boundaries(&1, now))
+    |> Enum.reduce(nil, &earlier_boundary/2)
+  end
+
+  defp rule_boundaries(%ShippingRateRule{starts_at: starts_at, ends_at: ends_at}, now) do
+    if valid_rule_interval?(starts_at, ends_at) do
+      start_boundary =
+        if match?(%DateTime{}, starts_at) and DateTime.compare(starts_at, now) == :gt do
+          [{:before, starts_at}]
+        else
+          []
+        end
+
+      end_boundary =
+        if match?(%DateTime{}, ends_at) and DateTime.compare(now, ends_at) in [:lt, :eq] do
+          [{:through, ends_at}]
+        else
+          []
+        end
+
+      start_boundary ++ end_boundary
+    else
+      []
+    end
+  end
+
+  defp valid_rule_interval?(starts_at, ends_at) do
+    case {starts_at, ends_at} do
+      {%DateTime{} = start, %DateTime{} = finish} -> DateTime.compare(start, finish) != :gt
+      _ -> true
+    end
+  end
+
+  defp earlier_boundary(candidate, nil), do: candidate
+
+  defp earlier_boundary(
+         {candidate_kind, candidate_at} = candidate,
+         {current_kind, current_at} = current
+       ) do
+    case DateTime.compare(candidate_at, current_at) do
+      :lt ->
+        candidate
+
+      :gt ->
+        current
+
+      :eq ->
+        if boundary_rank(candidate_kind) < boundary_rank(current_kind),
+          do: candidate,
+          else: current
+    end
+  end
+
+  defp boundary_rank(:before), do: 0
+  defp boundary_rank(:through), do: 1
 
   defp zone_eligible?(nil, _request), do: true
 
@@ -254,4 +348,6 @@ defmodule Store.Shipping do
       }
     )
   end
+
+  defp current_quote_time, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
 end
