@@ -1,14 +1,30 @@
 defmodule Store.Subscriptions.CompositionSnapshot do
   @moduledoc """
-  Immutable commercial evidence for the existing initial paid Subscription activation.
+  Immutable commercial evidence for Subscription compositions.
 
-  This first format contains zero or one entitlement component. It records the already-applied
-  payment and original paid interval; it is neither a billing lifecycle nor current access
-  authority. Later source changes need not advance or rewrite this historical snapshot.
+  Format 1 records the existing initial paid activation with zero or one entitlement component.
+  Its component key remains the original order-line UUID, and its fingerprint descriptor is frozen.
+  Format 2 defines a stable UUIDv7 component instance key and supports up to 16 components in the
+  codec. It is codec-only: the Ash resource and PostgreSQL table remain format 1 because this
+  resource's order and payment fields describe the initial sale and cannot establish provenance
+  for later composition changes.
+
+  A governed persistence change must establish commercial source provenance, a v2 record shape,
+  immutable creation and replay, matching Ash and PostgreSQL validation, a tested database
+  round-trip, and migration and rollback safety before enabling persisted format 2 records.
+
+  Neither format implements a billing lifecycle or current access authority. Later source changes
+  require new immutable evidence and must not rewrite historical snapshots.
 
   `payment_amount_minor` is the succeeded PaymentIntent amount for the whole Order.
   Multiple line snapshots may reference that same payment occurrence; the amount is not
   an allocation of funds to a component and must not be summed across snapshots.
+
+  Format 2 uses the owning Subscription UUID as the membership source. A component UUIDv7 names
+  one recurring obligation within that source. It remains stable across snapshots and renewals,
+  pending removal, rescission, and recovery of the same obligation. Re-admission after terminal
+  removal receives a new component identity. Distinct component identities may share an entitlement
+  scope; commercial admission and effective access rules remain separate responsibilities.
   """
 
   use Ash.Resource,
@@ -35,6 +51,13 @@ defmodule Store.Subscriptions.CompositionSnapshot do
     :period_end_at,
     :components
   ]
+
+  @v2_max_components 16
+  @v2_max_scope_key_bytes 255
+  @v2_max_timestamp_bytes 35
+  @component_kinds ["membership_access", "digital_library", "discount_tier"]
+  @v2_payload_fields [:format_version, :subscription_id, :source_version, :components]
+  @v2_allowed_fields @v2_payload_fields ++ [:id, :fingerprint]
 
   attributes do
     attribute :format_version, :integer do
@@ -198,10 +221,9 @@ defmodule Store.Subscriptions.CompositionSnapshot do
     end
   end
 
-  # Version 1 identity is the original order-line UUID. A future format must define
-  # durable identity across snapshots, creation, removal and reactivation explicitly.
-  # Identity is independent of snapshot ID, array position and display labels. Equivalent
-  # entitlement tuples must not result in duplicate charges or rights.
+  # Version 1 identity is the original order-line UUID. Format 2 identity is a separate UUIDv7
+  # for the logical recurring obligation. It is scoped by subscription_id, not by snapshot id,
+  # array position, display label, variant, price, or entitlement scope.
   @doc false
   def valid_v1_components?(%{components: [], source_order_line_item_id: _}), do: true
 
@@ -213,8 +235,7 @@ defmodule Store.Subscriptions.CompositionSnapshot do
          {:ok, key_uuid} <- Ecto.UUID.cast(key),
          {:ok, line_uuid} <- Ecto.UUID.cast(line_id),
          true <- key_uuid == line_uuid,
-         kind when kind in ["membership_access", "digital_library", "discount_tier"] <-
-           component["kind"],
+         kind when kind in @component_kinds <- component["kind"],
          scope when is_binary(scope) and byte_size(scope) in 1..255 <- component["scope_key"],
          true <- String.valid?(scope) and String.trim(scope) != "",
          {:ok, from, _} <- parse_timestamp(component["valid_from_at"]),
@@ -226,6 +247,41 @@ defmodule Store.Subscriptions.CompositionSnapshot do
   end
 
   def valid_v1_components?(_), do: false
+
+  @doc false
+  def valid_v2_components?(%{components: components})
+      when is_list(components) and length(components) <= @v2_max_components do
+    with {:ok, keys} <- Enum.reduce_while(components, {:ok, []}, &collect_v2_component_key/2),
+         true <- length(keys) == length(Enum.uniq(keys)) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  def valid_v2_components?(_), do: false
+
+  @doc false
+  def valid_components?(fields) when is_map(fields) do
+    case Map.get(fields, :format_version, 1) do
+      1 -> valid_v1_components?(fields)
+      2 -> valid_v2_payload?(fields)
+      _ -> false
+    end
+  end
+
+  def valid_components?(_), do: false
+
+  @doc false
+  def canonical_v2_components(%{format_version: 2, components: components} = fields) do
+    if valid_v2_payload?(fields) do
+      {:ok, canonicalize_v2_components(components)}
+    else
+      {:error, :invalid_v2_payload}
+    end
+  end
+
+  def canonical_v2_components(_), do: {:error, :unsupported_format_version}
 
   defp parse_timestamp(value) when is_binary(value), do: DateTime.from_iso8601(value)
   defp parse_timestamp(_), do: :error
@@ -248,14 +304,32 @@ defmodule Store.Subscriptions.CompositionSnapshot do
     FunctionClauseError -> false
   end
 
+  def valid_fingerprint?(%{format_version: 2} = fields) do
+    valid_v2_payload?(fields) and fields.fingerprint == fingerprint(fields)
+  rescue
+    ArgumentError -> false
+    KeyError -> false
+    MatchError -> false
+    FunctionClauseError -> false
+  end
+
   def valid_fingerprint?(_), do: false
 
   @doc false
-  @spec fingerprint(map()) :: String.t() | {:error, :unsupported_format_version}
+  @spec fingerprint(map()) ::
+          String.t() | {:error, :invalid_v2_payload | :unsupported_format_version}
   def fingerprint(fields) do
     case Map.get(fields, :format_version, 1) do
-      1 -> fingerprint_v1(fields)
-      _ -> {:error, :unsupported_format_version}
+      1 ->
+        fingerprint_v1(fields)
+
+      2 ->
+        if valid_v2_payload?(fields),
+          do: fingerprint_v2(fields),
+          else: {:error, :invalid_v2_payload}
+
+      _ ->
+        {:error, :unsupported_format_version}
     end
   end
 
@@ -297,5 +371,133 @@ defmodule Store.Subscriptions.CompositionSnapshot do
       :erlang.term_to_binary({:initial_composition, 1, descriptor}, [:deterministic])
     )
     |> Base.encode16(case: :lower)
+  end
+
+  defp fingerprint_v2(fields) do
+    descriptor =
+      {Ecto.UUID.dump!(fields.subscription_id), fields.source_version,
+       canonical_v2_component_descriptor(fields.components)}
+
+    :crypto.hash(
+      :sha256,
+      :erlang.term_to_binary({:store_composition_snapshot, 2, descriptor}, [:deterministic])
+    )
+    |> Base.encode16(case: :lower)
+  end
+
+  defp valid_v2_payload?(fields) do
+    Enum.all?(@v2_payload_fields, &Map.has_key?(fields, &1)) and
+      Enum.all?(Map.keys(fields), &(&1 in @v2_allowed_fields)) and
+      Map.get(fields, :format_version) == 2 and valid_v2_source_fields?(fields) and
+      valid_v2_components?(fields) and valid_v2_optional_fields?(fields)
+  end
+
+  defp valid_v2_source_fields?(fields) do
+    match?({:ok, _}, uuid_v7_binary(Map.get(fields, :subscription_id))) and
+      is_integer(Map.get(fields, :source_version)) and Map.get(fields, :source_version) > 0
+  end
+
+  defp valid_v2_optional_fields?(fields) do
+    valid_v2_snapshot_id?(fields) and valid_v2_fingerprint_field?(fields)
+  end
+
+  defp valid_v2_snapshot_id?(fields) do
+    not Map.has_key?(fields, :id) or match?({:ok, _}, uuid_v7_binary(Map.get(fields, :id)))
+  end
+
+  defp valid_v2_fingerprint_field?(fields) do
+    not Map.has_key?(fields, :fingerprint) or
+      (is_binary(Map.get(fields, :fingerprint)) and
+         String.match?(Map.get(fields, :fingerprint), ~r/\A[0-9a-f]{64}\z/))
+  end
+
+  defp collect_v2_component_key(component, {:ok, keys}) do
+    case v2_component_key(component) do
+      {:ok, key} -> {:cont, {:ok, [key | keys]}}
+      :error -> {:halt, :error}
+    end
+  end
+
+  defp v2_component_key(component) when is_map(component) do
+    with ["component_key", "kind", "scope_key", "valid_from_at", "valid_until_at"] <-
+           Enum.sort(Map.keys(component)),
+         {:ok, key} <- uuid_v7_binary(component["component_key"]),
+         kind when kind in @component_kinds <- component["kind"],
+         scope when is_binary(scope) and byte_size(scope) in 1..@v2_max_scope_key_bytes <-
+           component["scope_key"],
+         true <- String.valid?(scope) and String.trim(scope) != "",
+         {:ok, from} <- parse_v2_timestamp(component["valid_from_at"]),
+         {:ok, until} <- parse_optional_v2_timestamp(component["valid_until_at"]),
+         true <- is_nil(until) or DateTime.compare(from, until) == :lt do
+      {:ok, key}
+    else
+      _ -> :error
+    end
+  end
+
+  defp v2_component_key(_), do: :error
+
+  defp uuid_v7_binary(value) when is_binary(value) do
+    with {:ok, uuid} <- Ecto.UUID.cast(value),
+         binary <- Ecto.UUID.dump!(uuid),
+         <<_::48, 7::4, _::12, 2::2, _::62>> <- binary do
+      {:ok, binary}
+    else
+      _ -> :error
+    end
+  end
+
+  defp uuid_v7_binary(_), do: :error
+
+  defp parse_v2_timestamp(value)
+       when is_binary(value) and byte_size(value) in 20..@v2_max_timestamp_bytes do
+    case DateTime.from_iso8601(value) do
+      {:ok, timestamp, _offset} -> {:ok, timestamp}
+      _ -> :error
+    end
+  end
+
+  defp parse_v2_timestamp(_), do: :error
+
+  defp parse_optional_v2_timestamp(nil), do: {:ok, nil}
+
+  defp parse_optional_v2_timestamp(value), do: parse_v2_timestamp(value)
+
+  defp canonical_v2_component_descriptor(components) do
+    components
+    |> canonicalize_v2_components()
+    |> Enum.map(fn component ->
+      {:ok, from} = parse_v2_timestamp(component["valid_from_at"])
+      {:ok, until} = parse_optional_v2_timestamp(component["valid_until_at"])
+
+      {Ecto.UUID.dump!(component["component_key"]), component["kind"], component["scope_key"],
+       DateTime.to_unix(from, :microsecond), until && DateTime.to_unix(until, :microsecond)}
+    end)
+  end
+
+  defp canonicalize_v2_components(components) do
+    components
+    |> Enum.map(fn component ->
+      {:ok, key} = v2_component_key(component)
+      {:ok, from} = parse_v2_timestamp(component["valid_from_at"])
+      {:ok, until} = parse_optional_v2_timestamp(component["valid_until_at"])
+
+      canonical =
+        component
+        |> Map.put("component_key", Ecto.UUID.load!(key))
+        |> Map.put("valid_from_at", canonical_v2_timestamp(from))
+        |> Map.put("valid_until_at", until && canonical_v2_timestamp(until))
+
+      {key, canonical}
+    end)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(&elem(&1, 1))
+  end
+
+  defp canonical_v2_timestamp(timestamp) do
+    timestamp
+    |> DateTime.to_unix(:microsecond)
+    |> DateTime.from_unix!(:microsecond)
+    |> DateTime.to_iso8601()
   end
 end

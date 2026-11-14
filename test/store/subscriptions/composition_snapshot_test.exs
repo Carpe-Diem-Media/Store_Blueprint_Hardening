@@ -54,8 +54,120 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     assert CompositionSnapshot.fingerprint(single) ==
              "57f0ecd5af708235af43f6425148fa7661c6f38cc440cf284c0b3799ab8e77c8"
 
-    assert CompositionSnapshot.fingerprint(Map.put(single, :format_version, 2)) ==
-             {:error, :unsupported_format_version}
+    v2_fingerprint =
+      CompositionSnapshot.fingerprint(
+        v2_fields([v2_component("018f0000-0000-7000-8000-000000000002", "membership:basic")])
+      )
+
+    assert is_binary(v2_fingerprint)
+    refute v2_fingerprint == CompositionSnapshot.fingerprint(single)
+  end
+
+  test "version 2 accepts distinct same-scope components and canonicalizes by binary UUID" do
+    low_key = "018f0000-0000-7000-8000-000000000002"
+    high_key = "018F0000-0000-7000-8000-000000000003"
+    first = v2_component(high_key, "membership:basic")
+    second = v2_component(low_key, "membership:basic")
+    fields = v2_fields([first, second])
+    before = evidence_state()
+
+    assert CompositionSnapshot.valid_v2_components?(fields)
+
+    assert {:ok, [canonical_second, canonical_first]} =
+             CompositionSnapshot.canonical_v2_components(fields)
+
+    assert canonical_second["component_key"] == low_key
+    assert canonical_first["component_key"] == String.downcase(high_key)
+
+    fingerprint = CompositionSnapshot.fingerprint(fields)
+    assert is_binary(fingerprint)
+
+    evidence = Map.put(fields, :fingerprint, fingerprint)
+    assert CompositionSnapshot.valid_fingerprint?(evidence)
+
+    tampered_fingerprint =
+      if String.starts_with?(fingerprint, "0"),
+        do: "1" <> binary_part(fingerprint, 1, 63),
+        else: "0" <> binary_part(fingerprint, 1, 63)
+
+    refute CompositionSnapshot.valid_fingerprint?(%{
+             evidence
+             | fingerprint: tampered_fingerprint
+           })
+
+    malformed_component = Map.put(first, "valid_until_at", "2025-01-01T00:00:00Z")
+
+    refute CompositionSnapshot.valid_fingerprint?(%{
+             evidence
+             | components: [malformed_component, second]
+           })
+
+    assert ^fingerprint = CompositionSnapshot.fingerprint(%{fields | components: [second, first]})
+
+    fingerprint_with_next_source =
+      CompositionSnapshot.fingerprint(%{fields | source_version: fields.source_version + 1})
+
+    refute fingerprint_with_next_source == fingerprint
+
+    fingerprint_with_another_membership =
+      CompositionSnapshot.fingerprint(%{
+        fields
+        | subscription_id: "018f0000-0000-7000-8000-000000000108"
+      })
+
+    refute fingerprint_with_another_membership == fingerprint
+    assert evidence_state() == before
+  end
+
+  test "version 2 rejects duplicate, malformed and over-bound component payloads" do
+    component = v2_component("018f0000-0000-7000-8000-000000000002", "membership:basic")
+    fields = v2_fields([component])
+
+    refute CompositionSnapshot.valid_v2_components?(%{
+             fields
+             | components: [component, component]
+           })
+
+    for malformed <- [
+          Map.put(component, "component_key", "not-a-uuid"),
+          Map.put(component, "component_key", "550e8400-e29b-41d4-a716-446655440000"),
+          Map.put(component, "valid_until_at", "2026-01-01T00:00:00Z"),
+          Map.put(component, "valid_from_at", "not-a-timestamp"),
+          Map.put(component, "scope_key", String.duplicate("x", 256)),
+          Map.put(component, "unexpected", "value"),
+          Map.delete(component, "kind")
+        ] do
+      refute CompositionSnapshot.valid_v2_components?(%{fields | components: [malformed]})
+
+      assert {:error, :invalid_v2_payload} =
+               CompositionSnapshot.fingerprint(%{fields | components: [malformed]})
+    end
+
+    refute CompositionSnapshot.valid_v2_components?(%{
+             fields
+             | components: List.duplicate(component, 17)
+           })
+
+    refute CompositionSnapshot.valid_components?(%{fields | format_version: 3})
+    refute CompositionSnapshot.valid_components?(%{fields | format_version: "2"})
+    refute CompositionSnapshot.valid_components?(Map.put(fields, :unbound_content, "value"))
+    refute CompositionSnapshot.valid_components?(%{fields | source_version: "2"})
+
+    assert {:error, :invalid_v2_payload} =
+             CompositionSnapshot.fingerprint(Map.put(fields, :unbound_content, "value"))
+
+    assert {:error, :unsupported_format_version} =
+             CompositionSnapshot.fingerprint(%{fields | format_version: 3})
+
+    assert {:error, :unsupported_format_version} =
+             CompositionSnapshot.fingerprint(%{fields | format_version: "2"})
+  end
+
+  test "version 2 preserves the empty-component encoding supported by version 1" do
+    fields = v2_fields([])
+
+    assert CompositionSnapshot.valid_v2_components?(fields)
+    assert is_binary(CompositionSnapshot.fingerprint(fields))
   end
 
   test "version 1 rejects malformed component identities and payloads" do
@@ -103,6 +215,7 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     assert is_binary(Map.get(subscription, :current_composition_snapshot_id))
     snapshot = snapshot!(subscription)
     assert Map.get(snapshot, :format_version) == 1
+    refute :format_version in Info.action(CompositionSnapshot, :establish).accept
     assert snapshot.source_version == subscription.aggregate_version
     assert snapshot.source_order_line_item_id == fixture.line_item.id
     assert snapshot.payment_application_id == fixture.payment_application.id
@@ -112,6 +225,21 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     assert [%{"component_key" => key, "kind" => "membership_access"}] = snapshot.components
     assert key == fixture.line_item.id
     assert snapshot.fingerprint == CompositionSnapshot.fingerprint(Map.from_struct(snapshot))
+    assert CompositionSnapshot.valid_fingerprint?(Map.from_struct(snapshot))
+
+    codec_fields =
+      v2_fields([v2_component(Ash.UUIDv7.generate(), "membership:basic")])
+
+    codec_fingerprint = CompositionSnapshot.fingerprint(codec_fields)
+    codec_evidence = Map.put(codec_fields, :fingerprint, codec_fingerprint)
+    assert CompositionSnapshot.valid_fingerprint?(codec_evidence)
+
+    persisted_v2_shape =
+      snapshot
+      |> Map.from_struct()
+      |> Map.merge(codec_evidence)
+
+    refute CompositionSnapshot.valid_fingerprint?(persisted_v2_shape)
     assert subscription.aggregate_version == 1
 
     [effect] = Ash.read!(AccessEffect, authorize?: false, context: %{system?: true})
@@ -344,7 +472,7 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
     assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
     snapshot = snapshot!(source!(fixture.line_item.id))
 
-    for version <- [0, 2, nil] do
+    for version <- [0, 2, 3, nil] do
       assert {:error, %Postgrex.Error{}} =
                Repo.query(
                  """
@@ -362,6 +490,60 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
                  mode: :savepoint
                )
     end
+
+    assert Repo.aggregate(CompositionSnapshot, :count) == 1
+  end
+
+  test "database rejects version 2 rows at the persistence boundary" do
+    fixture = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+    snapshot = snapshot!(source!(fixture.line_item.id))
+
+    assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
+             Repo.query(
+               """
+               INSERT INTO composition_snapshots
+                 (id, subscription_id, source_version, user_id, order_id, source_order_line_item_id,
+                  plan_revision_id, payment_intent_id, payment_application_id, variant_id, quantity,
+                  renewal_amount_minor, payment_amount_minor, currency, period_start_at, period_end_at,
+                  components, fingerprint, format_version)
+               SELECT $1, subscription_id, source_version + 1, user_id, order_id,
+                  source_order_line_item_id, plan_revision_id, payment_intent_id,
+                  payment_application_id, variant_id, quantity, renewal_amount_minor,
+                  payment_amount_minor, currency, period_start_at, period_end_at,
+                  components, fingerprint, 2
+               FROM composition_snapshots WHERE id = $2
+               """,
+               [Ecto.UUID.dump!(Ash.UUIDv7.generate()), Ecto.UUID.dump!(snapshot.id)],
+               mode: :savepoint
+             )
+
+    assert Repo.aggregate(CompositionSnapshot, :count) == 1
+  end
+
+  test "database retains the version 1 single-component cardinality limit" do
+    fixture = paid_source!()
+    assert {:ok, _} = Facade.create_subscriptions_from_paid_order_for_system(fixture.order.id)
+    snapshot = snapshot!(source!(fixture.line_item.id))
+
+    assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
+             Repo.query(
+               """
+               INSERT INTO composition_snapshots
+                 (id, subscription_id, source_version, user_id, order_id, source_order_line_item_id,
+                  plan_revision_id, payment_intent_id, payment_application_id, variant_id, quantity,
+                  renewal_amount_minor, payment_amount_minor, currency, period_start_at, period_end_at,
+                  components, fingerprint, format_version)
+               SELECT $1, subscription_id, source_version + 1, user_id, order_id,
+                  source_order_line_item_id, plan_revision_id, payment_intent_id,
+                  payment_application_id, variant_id, quantity, renewal_amount_minor,
+                  payment_amount_minor, currency, period_start_at, period_end_at,
+                  array_fill(components[1], ARRAY[2]), fingerprint, 1
+               FROM composition_snapshots WHERE id = $2
+               """,
+               [Ecto.UUID.dump!(Ash.UUIDv7.generate()), Ecto.UUID.dump!(snapshot.id)],
+               mode: :savepoint
+             )
 
     assert Repo.aggregate(CompositionSnapshot, :count) == 1
   end
@@ -548,6 +730,25 @@ defmodule Store.Subscriptions.CompositionSnapshotTest do
         "JC274 compatibility repetition=#{repetition} total=#{length(queries)} composition=2 payment_application=0"
       )
     end
+  end
+
+  defp v2_component(key, scope) do
+    %{
+      "component_key" => key,
+      "kind" => "membership_access",
+      "scope_key" => scope,
+      "valid_from_at" => "2026-01-01T00:00:00Z",
+      "valid_until_at" => "2026-02-01T00:00:00Z"
+    }
+  end
+
+  defp v2_fields(components) do
+    %{
+      format_version: 2,
+      subscription_id: "018f0000-0000-7000-8000-000000000100",
+      source_version: 2,
+      components: components
+    }
   end
 
   # This successor is lookup-only test data, not an implemented composition transition.
