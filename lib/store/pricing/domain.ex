@@ -12,6 +12,8 @@ defmodule Store.Pricing do
     Contract,
     Coupon,
     Evaluator,
+    MembershipOfferRevision,
+    MembershipOfferRevisionComponent,
     Promotion,
     Queries.AdminTaxRatesQuery,
     TaxRate,
@@ -22,15 +24,38 @@ defmodule Store.Pricing do
   alias Store.Shipping
   alias Store.Shipping.{ShippingRateRule, ShippingZone}
 
+  alias Store.Repo
   alias Store.Support.Errors.Error
 
   resources do
     resource(Store.Pricing.Coupon)
     resource(Store.Pricing.Promotion)
+    resource(Store.Pricing.MembershipOfferRevision)
+    resource(Store.Pricing.MembershipOfferRevisionComponent)
     resource(Store.Pricing.TaxRate)
   end
 
   @type evaluate_quote_opts :: [authorize?: boolean(), actor: term(), context: map()]
+
+  @doc """
+  Atomically accepts a complete draft Membership offer manifest.
+
+  The revision row lock serializes acceptance with every child mutation. Replaying
+  an accepted revision returns the same immutable evidence. This operation does not
+  select an offer for a customer or create Commerce, Subscription, or access state.
+  """
+  @spec accept_membership_offer_revision_for_system(Ecto.UUID.t()) ::
+          {:ok, MembershipOfferRevision.t()} | {:error, term()}
+  def accept_membership_offer_revision_for_system(revision_id) when is_binary(revision_id) do
+    case Ecto.UUID.dump(revision_id) do
+      {:ok, encoded_id} -> accept_membership_offer_revision_transaction(revision_id, encoded_id)
+      :error -> invalid_membership_offer_revision_id()
+    end
+  end
+
+  def accept_membership_offer_revision_for_system(_revision_id) do
+    invalid_membership_offer_revision_id()
+  end
 
   @spec list_tax_rates_for_admin(AdminTaxRatesQuery.t(), map()) ::
           {:ok, [TaxRate.t()]} | {:error, term()}
@@ -382,4 +407,142 @@ defmodule Store.Pricing do
 
   defp to_upcase_or_nil(nil), do: nil
   defp to_upcase_or_nil(value), do: value |> String.trim() |> String.upcase()
+
+  defp accept_locked_membership_offer_revision(revision_id) do
+    case Ash.get(MembershipOfferRevision, revision_id,
+           domain: __MODULE__,
+           authorize?: false,
+           context: %{system?: true}
+         ) do
+      {:ok, %MembershipOfferRevision{status: "accepted"} = revision} ->
+        revision
+
+      {:ok, %MembershipOfferRevision{status: "draft"} = revision} ->
+        accept_draft_membership_offer_revision(revision)
+
+      {:ok, %MembershipOfferRevision{status: "rejected"}} ->
+        Repo.rollback(Error.new("VALIDATION_ERROR", "Rejected offer revisions are terminal"))
+
+      {:ok, nil} ->
+        Repo.rollback(Error.new("NOT_FOUND", "Membership offer revision not found"))
+
+      {:error, error} ->
+        Repo.rollback(error)
+    end
+  end
+
+  defp accept_membership_offer_revision_transaction(revision_id, encoded_id) do
+    case Repo.transaction(fn ->
+           lock_and_accept_membership_offer_revision(revision_id, encoded_id)
+         end) do
+      {:ok, revision} -> {:ok, revision}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp lock_and_accept_membership_offer_revision(revision_id, encoded_id) do
+    case Repo.query!(
+           "SELECT id FROM membership_offer_revisions WHERE id = $1 FOR UPDATE",
+           [encoded_id]
+         ) do
+      %{num_rows: 1} ->
+        accept_locked_membership_offer_revision(revision_id)
+
+      %{num_rows: 0} ->
+        Repo.rollback(Error.new("NOT_FOUND", "Membership offer revision not found"))
+    end
+  end
+
+  defp invalid_membership_offer_revision_id do
+    {:error, Error.new("VALIDATION_ERROR", "Invalid membership offer revision id")}
+  end
+
+  defp accept_draft_membership_offer_revision(revision) do
+    revision_id = revision.id
+
+    query =
+      MembershipOfferRevisionComponent
+      |> Ash.Query.filter(expr(revision_id == ^revision_id))
+      |> Ash.Query.limit(17)
+
+    case Ash.read(query,
+           domain: __MODULE__,
+           authorize?: false,
+           context: %{system?: true}
+         ) do
+      {:ok, components} when length(components) == 17 ->
+        Repo.rollback(invalid_offer_manifest_error())
+
+      {:ok, components} ->
+        case offer_manifest_fingerprint(revision, components) do
+          {:ok, fingerprint} -> persist_accepted_offer_revision(revision, fingerprint)
+          :error -> Repo.rollback(invalid_offer_manifest_error())
+        end
+
+      {:error, error} ->
+        Repo.rollback(error)
+    end
+  end
+
+  defp offer_manifest_fingerprint(revision, components) do
+    if valid_offer_manifest?(revision, components) do
+      {:ok,
+       MembershipOfferRevision.Fingerprint.compute(
+         revision.offer_key,
+         revision.revision,
+         revision.currency,
+         components
+       )}
+    else
+      :error
+    end
+  end
+
+  defp persist_accepted_offer_revision(revision, fingerprint) do
+    changeset =
+      Ash.Changeset.for_update(
+        revision,
+        :accept,
+        %{
+          fingerprint: fingerprint,
+          accepted_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+        },
+        context: %{system?: true}
+      )
+
+    case Ash.update(changeset,
+           domain: __MODULE__,
+           authorize?: false,
+           context: %{system?: true}
+         ) do
+      {:ok, accepted} -> accepted
+      {:error, error} -> Repo.rollback(error)
+    end
+  end
+
+  defp invalid_offer_manifest_error do
+    Error.new(
+      "VALIDATION_ERROR",
+      "Membership offer revision must contain one to sixteen valid component definitions"
+    )
+  end
+
+  defp valid_offer_manifest?(%MembershipOfferRevision{} = revision, components) do
+    definition_keys = Enum.map(components, & &1.definition_key)
+
+    length(components) in 1..16 and
+      length(Enum.uniq(definition_keys)) == length(definition_keys) and
+      Regex.match?(~r/\A[A-Z]{3}\z/, revision.currency) and
+      Enum.all?(components, fn component ->
+        is_integer(component.gross_minor) and component.gross_minor >= 0 and
+          valid_manifest_key?(component.discount_eligibility_key) and
+          valid_manifest_key?(component.tax_treatment_key) and
+          match?({:ok, _binary}, Ecto.UUID.dump(component.definition_key))
+      end)
+  end
+
+  defp valid_manifest_key?(value) when is_binary(value),
+    do: Regex.match?(~r/\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\z/, value)
+
+  defp valid_manifest_key?(_value), do: false
 end
