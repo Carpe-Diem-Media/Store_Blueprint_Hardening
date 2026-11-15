@@ -460,13 +460,19 @@ defmodule Store.Pricing do
   defp accept_draft_membership_offer_revision(revision) do
     revision_id = revision.id
 
-    query = Ash.Query.filter(MembershipOfferRevisionComponent, expr(revision_id == ^revision_id))
+    query =
+      MembershipOfferRevisionComponent
+      |> Ash.Query.filter(expr(revision_id == ^revision_id))
+      |> Ash.Query.limit(17)
 
     case Ash.read(query,
            domain: __MODULE__,
            authorize?: false,
            context: %{system?: true}
          ) do
+      {:ok, components} when length(components) == 17 ->
+        Repo.rollback(invalid_offer_manifest_error())
+
       {:ok, components} ->
         case offer_manifest_fingerprint(revision, components) do
           {:ok, fingerprint} -> persist_accepted_offer_revision(revision, fingerprint)

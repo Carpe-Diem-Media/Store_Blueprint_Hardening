@@ -53,6 +53,21 @@ defmodule Store.Pricing.MembershipOfferRevisionTest do
     assert reload_revision!(oversized.id).status == "draft"
   end
 
+  test "rejects a substantially oversized draft after reading at most seventeen definitions" do
+    revision = create_revision!()
+    Enum.each(1..128, fn _index -> create_component!(revision) end)
+
+    {result, component_queries} =
+      capture_component_manifest_queries(fn ->
+        Pricing.accept_membership_offer_revision_for_system(revision.id)
+      end)
+
+    assert {:error, _} = result
+    assert [query] = component_queries
+    assert_query_limit(query)
+    assert reload_revision!(revision.id).status == "draft"
+  end
+
   test "rejects duplicate component definitions and negative gross amounts" do
     revision = create_revision!()
     component = create_component!(revision)
@@ -283,5 +298,53 @@ defmodule Store.Pricing.MembershipOfferRevisionTest do
       discount_eligibility_key: eligibility,
       tax_treatment_key: treatment
     }
+  end
+
+  defp capture_component_manifest_queries(fun) do
+    owner = self()
+    ref = make_ref()
+    handler = {__MODULE__, ref}
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:store, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          query = Map.get(metadata, :query, "")
+          normalized_query = String.downcase(query)
+
+          if String.contains?(normalized_query, "membership_offer_revision_components") and
+               Regex.match?(~r/^\s*select\b/i, query) do
+            send(owner, {:membership_component_query, ref, query, Map.get(metadata, :params)})
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, collect_component_manifest_queries(ref, [])}
+    after
+      :telemetry.detach(handler)
+    end
+  end
+
+  defp collect_component_manifest_queries(ref, queries) do
+    receive do
+      {:membership_component_query, ^ref, query, params} ->
+        collect_component_manifest_queries(ref, [%{query: query, params: params} | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp assert_query_limit(%{query: query, params: params}) do
+    case Regex.run(~r/\bLIMIT\s+\$(\d+)\b/i, query, capture: :all_but_first) do
+      [index] ->
+        assert Enum.at(params, String.to_integer(index) - 1) == 17
+
+      nil ->
+        assert Regex.match?(~r/\bLIMIT\s+17\b/i, query)
+    end
   end
 end
