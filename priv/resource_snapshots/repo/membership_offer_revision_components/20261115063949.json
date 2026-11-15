@@ -1,0 +1,190 @@
+{
+  "attributes": [
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"uuid_generate_v7()\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": true,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "definition_key",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "gross_minor",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "discount_eligibility_key",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "tax_treatment_key",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "inserted_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "updated_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "membership_offer_revision_components_revision_id_fkey",
+        "on_delete": "restrict",
+        "on_update": null,
+        "primary_key?": true,
+        "schema": "public",
+        "table": "membership_offer_revisions"
+      },
+      "scale": null,
+      "size": null,
+      "source": "revision_id",
+      "type": "uuid"
+    }
+  ],
+  "base_filter": null,
+  "check_constraints": [
+    {
+      "attribute": [
+        "definition_key"
+      ],
+      "base_filter": null,
+      "check": "substring(definition_key::text FROM 15 FOR 1) = '7'",
+      "name": "membership_offer_revision_components_definition_key_v7_check"
+    },
+    {
+      "attribute": [
+        "gross_minor"
+      ],
+      "base_filter": null,
+      "check": "gross_minor >= 0",
+      "name": "membership_offer_revision_components_gross_minor_check"
+    },
+    {
+      "attribute": [
+        "discount_eligibility_key"
+      ],
+      "base_filter": null,
+      "check": "discount_eligibility_key ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'",
+      "name": "membership_offer_revision_components_eligibility_key_check"
+    },
+    {
+      "attribute": [
+        "tax_treatment_key"
+      ],
+      "base_filter": null,
+      "check": "tax_treatment_key ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'",
+      "name": "membership_offer_revision_components_tax_treatment_key_check"
+    }
+  ],
+  "create_table_options": null,
+  "custom_indexes": [],
+  "custom_statements": [],
+  "has_create_action": true,
+  "hash": "96B3F49B9648A08853B7E101B76B7139B17DFE4270BED50094C9A64526F634EE",
+  "identities": [
+    {
+      "all_tenants?": false,
+      "base_filter": null,
+      "index_name": "membership_offer_revision_components_revision_definition_index",
+      "keys": [
+        {
+          "type": "atom",
+          "value": "revision_id"
+        },
+        {
+          "type": "atom",
+          "value": "definition_key"
+        }
+      ],
+      "name": "revision_definition",
+      "nils_distinct?": true,
+      "where": null
+    }
+  ],
+  "multitenancy": {
+    "attribute": null,
+    "global": null,
+    "strategy": null
+  },
+  "repo": "Elixir.Store.Repo",
+  "schema": null,
+  "table": "membership_offer_revision_components",
+  "temporal": null
+}
