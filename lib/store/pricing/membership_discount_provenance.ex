@@ -32,6 +32,7 @@ defmodule Store.Pricing.MembershipDiscountProvenance do
     with {:ok, ^output} <- Evaluator.evaluate(input),
          true <- valid_revision?(revision, components, output.currency),
          {:ok, source} <- source(input, output),
+         true <- is_nil(source) or Enum.any?(input.lines, &(&1.eligible? == true)),
          {:ok, rows} <- map_components(components, mapping, output.lines),
          true <- mapped_line_discounts_eligible?(rows, input.lines, output.lines),
          {:ok, allocated} <- allocate(rows, output.lines, source) do
@@ -187,7 +188,7 @@ defmodule Store.Pricing.MembershipDiscountProvenance do
     Enum.all?(rows, fn row ->
       input = Map.fetch!(inputs, row.line_id)
       line = Map.fetch!(evaluated, row.line_id)
-      input.eligible? != false or line.discount_allocated_minor == 0
+      input.eligible? == true or line.discount_allocated_minor == 0
     end)
   end
 

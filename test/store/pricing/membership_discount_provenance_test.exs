@@ -343,4 +343,22 @@ defmodule Store.Pricing.MembershipDiscountProvenanceTest do
     assert {:ok, result} = derive({input, output, revision, components, mapping})
     assert Enum.all?(result.components, &(&1.discount_minor == 0))
   end
+
+  test "rejects a discounted membership line with nil eligibility" do
+    {input, _, revision, components, mapping} = fixture(10)
+    input = %{input | lines: [%{hd(input.lines) | eligible?: nil}]}
+    assert {:ok, output} = Evaluator.evaluate(input)
+    assert [%{discount_allocated_minor: 10}] = output.lines
+    assert {:error, :invalid_provenance} = derive({input, output, revision, components, mapping})
+  end
+
+  test "rejects all-ineligible fallback when only an unmapped line gets the remainder" do
+    {input, _, revision, components, mapping} = fixture(1)
+    member = %{hd(input.lines) | eligible?: nil}
+    other = %{member | id: "018f0000-0000-7000-8000-000000000000", line_no: 2, eligible?: false}
+    input = %{input | lines: [member, other]}
+    assert {:ok, output} = Evaluator.evaluate(input)
+    assert Enum.map(output.lines, & &1.discount_allocated_minor) == [1, 0]
+    assert {:error, :invalid_provenance} = derive({input, output, revision, components, mapping})
+  end
 end
