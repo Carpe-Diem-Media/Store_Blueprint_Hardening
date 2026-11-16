@@ -301,4 +301,46 @@ defmodule Store.Pricing.MembershipDiscountProvenanceTest do
     assert [%{source_kind: :manual_adjustment}] = output.applied_adjustments
     assert {:error, _} = derive({input, output, revision, components, mapping})
   end
+
+  test "rejects a discounted ineligible membership line under legacy fallback" do
+    {input, _, revision, components, mapping} = fixture(10)
+    input = %{input | lines: [%{hd(input.lines) | eligible?: false}]}
+    assert {:ok, output} = Evaluator.evaluate(input)
+    assert [%{discount_allocated_minor: 10}] = output.lines
+    assert {:error, :invalid_provenance} = derive({input, output, revision, components, mapping})
+  end
+
+  test "rejects mapped discounts when all lines are ineligible" do
+    {input, _, revision, components, mapping} = fixture(10)
+    line = %{hd(input.lines) | eligible?: false}
+    other = %{line | id: @a, line_no: 2}
+    input = %{input | lines: [line, other]}
+    assert {:ok, output} = Evaluator.evaluate(input)
+    assert Enum.map(output.lines, & &1.discount_allocated_minor) == [5, 5]
+    assert {:error, :invalid_provenance} = derive({input, output, revision, components, mapping})
+  end
+
+  test "mixed eligibility allocates only to eligible lines" do
+    {input, _, revision, components, mapping} = fixture(10)
+    member = hd(input.lines)
+    other = %{member | id: @a, line_no: 2, eligible?: false}
+    input = %{input | lines: [member, other]}
+    assert {:ok, output} = Evaluator.evaluate(input)
+    assert Enum.map(output.lines, & &1.discount_allocated_minor) == [10, 0]
+    assert {:ok, result} = derive({input, output, revision, components, mapping})
+    assert Enum.sum(Enum.map(result.components, & &1.discount_minor)) == 10
+    input = %{input | lines: [%{member | eligible?: false}, %{other | eligible?: true}]}
+    assert {:ok, output} = Evaluator.evaluate(input)
+    assert Enum.map(output.lines, & &1.discount_allocated_minor) == [0, 10]
+    assert {:ok, result} = derive({input, output, revision, components, mapping})
+    assert Enum.all?(result.components, &(&1.discount_minor == 0))
+  end
+
+  test "ineligible membership lines allow zero discount" do
+    {input, _, revision, components, mapping} = fixture(0)
+    input = %{input | lines: [%{hd(input.lines) | eligible?: false}]}
+    assert {:ok, output} = Evaluator.evaluate(input)
+    assert {:ok, result} = derive({input, output, revision, components, mapping})
+    assert Enum.all?(result.components, &(&1.discount_minor == 0))
+  end
 end
