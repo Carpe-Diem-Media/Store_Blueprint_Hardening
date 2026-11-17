@@ -248,11 +248,11 @@ def verify_allocations(h):
         send(holder,'BEGIN;'+manifest_lock+"SELECT 'READY';")
         wait_line(holder,'READY')
         owner(f"""
-          DO $$ DECLARE revision uuid; locked integer := 0; BEGIN
-            FOR revision IN SELECT id FROM public.membership_offer_revisions
+          DO $$ DECLARE candidate_id uuid; locked integer := 0; BEGIN
+            FOR candidate_id IN SELECT id FROM public.membership_offer_revisions
               WHERE id=ANY({revision_array}) ORDER BY id LOOP
               BEGIN
-                PERFORM 1 FROM public.membership_offer_revisions WHERE id=revision FOR UPDATE NOWAIT;
+                PERFORM 1 FROM public.membership_offer_revisions WHERE id=candidate_id FOR UPDATE NOWAIT;
                 RAISE EXCEPTION 'manifest revision was not locked by writer';
               EXCEPTION WHEN lock_not_available THEN locked := locked + 1;
               END;
