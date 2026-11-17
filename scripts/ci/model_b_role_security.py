@@ -201,6 +201,8 @@ def main():
     from model_b_allocation_lock_security import verify_allocations, verify_fixture_regressions
     verify_allocations(sys.modules[__name__])
     verify_fixture_regressions(sys.modules[__name__])
+    from model_b_writer_boundary import verify_writer_boundary
+    verify_writer_boundary(sys.modules[__name__])
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as output:
