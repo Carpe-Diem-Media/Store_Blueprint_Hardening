@@ -201,8 +201,28 @@ def verify_allocations(h):
         b[key]=a['line' if key=='row_line' else 'component']
         rejection('BEGIN;'+prelock(a,b)+construction(a,accept=False)+construction(b,accept=False)+accept_both(a,b)+'COMMIT;',f'cross_occurrence_{key}')
         h.equal(h.RUNTIME,f"SELECT count(*) FROM public.order_line_items WHERE order_id='{a['order']}';",'0',f'rollback_cross_occurrence_{key}')
-    for invalid in ("ARRAY[]::uuid[]",f"ARRAY['{first['revision']}'::uuid,'{first['revision']}'::uuid]", "array_fill(NULL::uuid,ARRAY[17])"):
-        rejection(f"BEGIN;SELECT public.lock_membership_acceptance_manifest('{first['order']}',{invalid}); COMMIT;",'invalid_bounded_revision_manifest')
+    draft, missing = owner("SELECT public.uuid_generate_v7();"), owner("SELECT public.uuid_generate_v7();")
+    owner(f"INSERT INTO public.membership_offer_revisions(id,offer_key,revision,currency) VALUES('{draft}','CI{draft}',1,'USD');")
+    for label, invalid in (
+        ('empty', "ARRAY[]::uuid[]"),
+        ('null_manifest', "NULL::uuid[]"),
+        ('null_revision', f"ARRAY['{first['revision']}'::uuid,NULL::uuid]"),
+        ('duplicate', f"ARRAY['{first['revision']}'::uuid,'{first['revision']}'::uuid]"),
+        ('missing', f"ARRAY['{first['revision']}'::uuid,'{missing}'::uuid]"),
+        ('unaccepted', f"ARRAY['{first['revision']}'::uuid,'{draft}'::uuid]"),
+    ):
+        rejection(f"BEGIN;SELECT public.lock_membership_acceptance_manifest('{first['order']}',{invalid}); COMMIT;",f'invalid_revision_manifest_{label}')
+
+    # The component bound is per occurrence, not a distinct-revision Order cap.
+    manifests = [fixture() for _ in range(17)]
+    revision_array = 'ARRAY[' + ','.join(f"'{f['revision']}'::uuid" for f in reversed(manifests)) + ']'
+    manifest_lock = f"SELECT public.lock_membership_acceptance_manifest('{manifests[0]['order']}',{revision_array});"
+    started = time.monotonic()
+    h.equal(h.WRITER, 'BEGIN;'+manifest_lock+"COMMIT;SELECT 17;", '17', 'seventeen_accepted_revision_manifest_COMMIT')
+    elapsed = time.monotonic() - started
+    if elapsed >= 10:
+        raise RuntimeError('17-revision manifest exceeded existing transaction budget')
+    print(f'PASS principal={h.WRITER} seventeen_revision_COMMIT_elapsed_seconds={elapsed:.3f}',flush=True)
 
     def live(role):
         p = subprocess.Popen(['psql','-XqAt','-v','ON_ERROR_STOP=1','-v','VERBOSITY=sqlstate'],
@@ -220,6 +240,32 @@ def verify_allocations(h):
             if line==expected:return
             if p.poll() is not None:break
         raise RuntimeError('restricted connection synchronization failed')
+
+    # An independent owner connection probes each tuple with NOWAIT. It must
+    # find all 17 locked by the actual writer, not merely see helper success.
+    holder = live(h.WRITER)
+    try:
+        send(holder,'BEGIN;'+manifest_lock+"SELECT 'READY';")
+        wait_line(holder,'READY')
+        owner(f"""
+          DO $$ DECLARE revision uuid; locked integer := 0; BEGIN
+            FOR revision IN SELECT id FROM public.membership_offer_revisions
+              WHERE id=ANY({revision_array}) ORDER BY id LOOP
+              BEGIN
+                PERFORM 1 FROM public.membership_offer_revisions WHERE id=revision FOR UPDATE NOWAIT;
+                RAISE EXCEPTION 'manifest revision was not locked by writer';
+              EXCEPTION WHEN lock_not_available THEN locked := locked + 1;
+              END;
+            END LOOP;
+            IF locked <> 17 THEN RAISE EXCEPTION 'expected all 17 revision locks'; END IF;
+          END $$;
+        """)
+        print(f'PASS principal={h.WRITER} all_seventeen_offer_rows_locked_independent_NOWAIT_probe',flush=True)
+        send(holder,"COMMIT;SELECT 'COMMITTED';")
+        wait_line(holder,'COMMITTED')
+    finally:
+        if holder.poll() is None:
+            holder.kill();holder.communicate(timeout=5)
 
     # Competing writers supply reversed manifests. The helper locks offer rows
     # in binary UUID order before the Order; the losing writer cannot append to
