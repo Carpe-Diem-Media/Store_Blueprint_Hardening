@@ -20,7 +20,7 @@ def install():
     if ROOT.exists():
         raise RuntimeError('refusing to replace an existing boundary installation')
     for identity in (RUNTIME, OPERATOR, WRITER):
-        subprocess.run(['/usr/sbin/useradd', '--system', '--no-create-home',
+        subprocess.run(['/usr/sbin/useradd', '--system', '--user-group', '--no-create-home',
                         '--shell', '/usr/sbin/nologin', identity], check=True)
     import pwd
     writer = pwd.getpwnam(WRITER)

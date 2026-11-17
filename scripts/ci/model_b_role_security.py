@@ -207,7 +207,7 @@ def main():
     if summary:
         with open(summary, "a", encoding="utf-8") as output:
             output.write(f"Model B role capability proof passed {ASSERTIONS} assertions on PostgreSQL 18.\n\n")
-            output.write("Actual restricted logins verified. Restricted-writer SQL COMMIT and lock integration tested; trusted evaluator invocation, complete application compatibility and OS credential isolation remain unverified.\n")
+            output.write("Actual restricted logins, SQL COMMIT/locks and the isolated CI operator/OS writer probe verified. Trusted evaluator invocation, financial acceptance invocation, workstation/production isolation and complete application compatibility remain unverified.\n")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,17 @@ defmodule Store.Release do
   alias Ecto.Migrator
   alias Store.Operations.Health
 
+  @doc """
+  Probes the isolated DEV/TEST writer identity without starting Store or writing evidence.
+
+  Called only by the fixed operator OS launcher. Credentials have no runtime,
+  owner or migrator fallback; ordinary-runtime calls fail closed.
+  """
+  @spec membership_writer_boundary_probe() :: :ok | {:error, :writer_boundary_denied}
+  def membership_writer_boundary_probe do
+    Store.Orders.MembershipWriterBoundary.probe()
+  end
+
   @spec migrate() :: map()
   def migrate do
     run_migration_command("migrate", [migration_target(Store.Repo)])

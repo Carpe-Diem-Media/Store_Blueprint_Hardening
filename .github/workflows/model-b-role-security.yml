@@ -11,6 +11,8 @@ on:
       - .github/workflows/model-b-role-security.yml
       - scripts/ci/model_b*.py
       - scripts/ci/model_b*.exs
+      - lib/store/release.ex
+      - lib/store/orders/membership_writer_boundary.ex
       - priv/repo/migrations/**
       - test/store/orders/membership_allocation*.exs
 
