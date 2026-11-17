@@ -50,7 +50,7 @@ defmodule Store.Operations.AllocationRuntimeContract do
     :ok
   end
 
-  @doc "Rejects the ordinary release migration route while allocation triggers are pending."
+  @doc "Rejects pending migrations or missing, altered or disabled allocation protections."
   @spec guard_standard_migrations!(Ecto.Repo.t()) :: :ok
   def guard_standard_migrations!(repo) do
     %{rows: [[table]]} = SQL.query!(repo, "SELECT to_regclass('public.schema_migrations')", [])
@@ -63,6 +63,23 @@ defmodule Store.Operations.AllocationRuntimeContract do
 
     unless installed?,
       do: raise("allocation triggers pending; use Store.Release.migrate_allocation_foundation/0")
+
+    check_protections!(repo)
+  end
+
+  @doc "Checks the fixed protection trigger manifest after installation. No writes."
+  @spec check_protections!(Ecto.Repo.t()) :: :ok
+  def check_protections!(repo) do
+    sql =
+      :store
+      |> Application.app_dir("priv/repo/contracts/allocation_protection_postflight.sql")
+      |> File.read!()
+
+    %{rows: failures} = SQL.query!(repo, sql, [], log: false)
+
+    if failures != [] do
+      raise "allocation protection postflight failed: #{Enum.join(List.flatten(failures), ",")}"
+    end
 
     :ok
   end
@@ -104,6 +121,7 @@ defmodule Store.Operations.AllocationRuntimeContract do
       check!(MigrationRepo, roles)
       versions = Ecto.Migrator.run(MigrationRepo, path, :up, all: true, log: false)
       check!(MigrationRepo, roles)
+      check_protections!(MigrationRepo)
       %{status: "ok", runtime_roles: roles, migrated_versions: versions}
     after
       Supervisor.stop(pid)

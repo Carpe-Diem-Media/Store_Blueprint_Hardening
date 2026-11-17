@@ -76,7 +76,15 @@ baseline permissions are prerequisites, not silently repaired by this file.
 
 Rerun the dedicated entrypoint after approval and provisioning. Any inadequate,
 unknown or excessive effective ACL fails closed before the trigger migrations.
-The preflight checks again after migration. Success returns only role names,
+The ACL preflight checks again after migration. A separate read-only postflight
+then requires all 20 allocation locking, immutability, completeness, acceptance,
+tax-evidence and truncate triggers, bound to their expected public tables and
+functions with exact events, row/statement and deferred semantics. Every trigger
+must have ordinary enablement (`tgenabled=O`); disabled and replica-only states
+fail closed. The ordinary migration gate also checks this fixed manifest once
+all nine migrations are recorded. Pre-trigger staging does not run postflight.
+These catalog checks do not attest function bodies or protect against later
+privileged DDL changes. Success returns only role names,
 status and migration versions. All temporary connections close on success or
 failure. An already accepted foundation can be checked again through the same
 entrypoint without replaying migrations.
@@ -102,7 +110,9 @@ SnapshotWriter create/replay, the existing shipping insert/conflict pattern,
 tax/finalization and lifecycle/replay through both runtime pools. The ordinary
 shipping private function and full Cart/Inventory/Checkout flow remain outside
 this proof. Original writer COMMIT/locks/timeouts, 74 role assertions and all 34
-foundation regressions remain required.
+foundation regressions remain required. Disposable fault injection drops, disables,
+sets replica-only and misbinds each of the 20 required triggers, requiring refusal
+and successful rechecking after transactional restoration.
 
 ## Performance and resource limits
 

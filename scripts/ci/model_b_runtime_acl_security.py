@@ -12,12 +12,15 @@ def prepare_contract(h, owner, env):
                MODEL_B_DIRECT_RUNTIME_USER=h.DIRECT_RUNTIME,
                MODEL_B_DIRECT_RUNTIME_PASSWORD=h.PASSWORDS[h.DIRECT_RUNTIME])
 
-    def migrate(success):
+    def migrate(success, postflight=False):
         result = subprocess.run(['mix', 'run', '--no-start', 'scripts/ci/model_b_contract_migrate.exs'],
                                 env=env, text=True, capture_output=True, timeout=180, check=False)
         if (result.returncode == 0) != success:
             raise RuntimeError('supported migration preflight disposition mismatch')
-        print('PASS supported_migration_preflight_' + ('accepted' if success else 'rejected_before_triggers'), flush=True)
+        if postflight and 'allocation protection postflight failed:' not in result.stdout:
+            raise RuntimeError('expected protection postflight refusal was not observed')
+        print('PASS supported_migration_' + ('postflight_rejected' if postflight else 'preflight_' + ('accepted' if success else 'rejected_before_triggers')), flush=True)
+        # Every successful and refused operator invocation closes temporary sessions.
         h.equal(h.ADMIN, "SELECT count(*) FROM pg_stat_activity WHERE application_name IN ('jc382_allocation_migration','jc382_allocation_identity');",
                 '0', 'preflight_identity_and_migration_connection_cleanup')
 
@@ -41,6 +44,24 @@ def prepare_contract(h, owner, env):
             migrate(False)
             owner(f'GRANT {permission} ON {target} TO {role};')
     migrate(True)
+
+    table = 'public.order_line_component_allocation_sets'
+    trigger = 'membership_allocation_validate_accept'
+    definition = owner(f"SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgrelid='{table}'::regclass AND tgname='{trigger}';")
+    for fault in ('disabled', 'missing'):
+        try:
+            if fault == 'disabled':
+                owner(f'ALTER TABLE {table} DISABLE TRIGGER {trigger};')
+            else:
+                owner(f'DROP TRIGGER {trigger} ON {table};')
+            migrate(False, postflight=True)
+        finally:
+            if fault == 'disabled':
+                owner(f'ALTER TABLE {table} ENABLE TRIGGER {trigger};')
+            else:
+                owner(definition + ';')
+        migrate(True)
+        print('PASS supported_postflight_' + fault + '_trigger_refused_and_restored', flush=True)
 
     for role in (h.RUNTIME, h.DIRECT_RUNTIME):
         h.equal(role, "SELECT current_user=session_user;", 't', 'independent_runtime_login')

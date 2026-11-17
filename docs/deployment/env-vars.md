@@ -99,7 +99,7 @@ The app raises at boot if these are missing in `MIX_ENV=prod`:
 - `PORT` (default `4000`)
 - `PHX_HOST` (default `example.com`)
 - `ECTO_IPV6` (`true`/`1` enables IPv6 socket options)
-- `DNS_CLUSTER_QUERY` (fallbacks: `RAILWAY_PRIVATE_DOMAIN`, `RAILWAY_PRIVATE_NETWORKING_DOMAIN`)
+- `DNS_CLUSTER_QUERY` (set explicitly when clustering is enabled)
 - `STORE_CLUSTER_TRANSPORT` (`inet6` default in release env script, or `inet`)
 - `STORE_TRUSTED_PROXY_PROXIES` (comma-separated CIDRs/IPs; defaults from compile-time config)
 - `STORE_TRUSTED_PROXY_HEADERS` (default `cf-connecting-ip,x-forwarded-for`)

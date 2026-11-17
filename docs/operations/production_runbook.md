@@ -35,11 +35,10 @@
 - Verify conditional vars based on deployment mode:
   - `STORE_STRIPE_SECRET_KEY`, `STORE_STRIPE_PUBLISHABLE_KEY`, `STORE_STRIPE_WEBHOOK_SECRET` only when `STORE_PAYMENTS_ENABLED_PROVIDERS` includes `stripe`
   - `RELEASE_COOKIE` only when clustering/distribution is enabled (`DNS_CLUSTER_QUERY` set and multi-node distribution expected)
-  - `DNS_CLUSTER_QUERY` can be set directly, or resolved from `RAILWAY_PRIVATE_DOMAIN` / `RAILWAY_PRIVATE_NETWORKING_DOMAIN`
+  - `DNS_CLUSTER_QUERY` must be set explicitly when clustering is enabled
 - Run preflight from the release:
   - `bin/store eval "Store.Release.preflight()"`
-- Railway deploys must run migrations through the pre-deploy command in `railway.toml`:
-  - `bin/store eval "Store.Release.migrate_all()"`
+- Before allocation trigger installation, follow the operator-only [allocation runtime ACL procedure](../deployment/allocation-runtime-acl.md). The ordinary `Store.Release.migrate_all/0` route rejects a pending foundation. Railway is not a deployment target; no platform migration hook is supplied.
 - Do not run migrations manually after traffic has already shifted to the new web containers.
 - Confirm health endpoints:
   - `GET /health/live`
@@ -64,10 +63,8 @@
 - Do not rely on IP allowlisting as the only control; signature verification remains mandatory.
 
 ## Clustering and CDN
-- `DNS_CLUSTER_QUERY` should resolve to the Railway private service domain (`*.railway.internal`) when clustering is enabled.
-- Runtime fallback order is: explicit `DNS_CLUSTER_QUERY`, then `RAILWAY_PRIVATE_DOMAIN`, then `RAILWAY_PRIVATE_NETWORKING_DOMAIN`.
-- `rel/env.sh.eex` auto-exports `DNS_CLUSTER_QUERY` from `RAILWAY_PRIVATE_DOMAIN` only when `DNS_CLUSTER_QUERY` is unset; it does not auto-export from `RAILWAY_PRIVATE_NETWORKING_DOMAIN`.
-- `rel/env.sh.eex` sets named distribution and IPv6 transport for Railway-compatible clustering; keep `RELEASE_COOKIE` consistent across replicas.
+- Set `DNS_CLUSTER_QUERY` explicitly to the service discovery domain when clustering is enabled.
+- `rel/env.sh.eex` sets named distribution and IPv6 transport; keep `RELEASE_COOKIE` consistent across replicas.
 - After autoscaling, verify that PubSub-sensitive flows propagate across nodes:
   - checkout/order state changes
   - catalog/shipping cache invalidations
