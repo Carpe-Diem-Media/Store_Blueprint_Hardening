@@ -159,6 +159,9 @@ def verify_audit_cases():
             '-Wl,-rpath,'+str(fixture), '-lmodel_b_audit_fixture', '-o', str(executable)],
             input='extern int model_b_audit_fixture(void); int main(void) { return model_b_audit_fixture(); }',
             text=True, capture_output=True, timeout=10, check=True)
+        # Match installed executable protections regardless of the CI umask.
+        library.chmod(0o555)
+        executable.chmod(0o555)
         linked = subprocess.run(['/usr/bin/ldd', str(executable)],
                                 text=True, capture_output=True, timeout=5, check=False)
         linked_dependencies(executable, linked)
