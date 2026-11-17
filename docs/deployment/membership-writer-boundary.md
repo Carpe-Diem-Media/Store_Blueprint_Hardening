@@ -41,6 +41,31 @@ outside Model B's restricted-runtime threat model. A compromised writer remains
 trusted under the approved model. The job's disposable VM destroys its identities,
 sudo rule and installation after the run; nothing is installed on shared DevCore.
 
+## Protected Elixir/OTP installation
+
+The trusted bootstrap discovers the active setup-beam Elixir script and OTP root
+from the running toolchain. It verifies System.version, OTP release and the full
+OTP_VERSION file against `.tool-versions`. It copies those exact installations
+under `/opt/store-membership-writer-ci/toolchain`, without changing access to the
+runner's private setup-beam directories.
+
+Internal symlinks are rewritten to relative links within the copied installation;
+links outside that closure reject installation. Files and directories are owned
+by root, with read/traverse/execute access and no unprivileged write access. The
+bootstrap checks ELF RPATH/RUNPATH and ldd dependencies, rejects missing libraries
+or writable/private dependency paths, and records namei/readlink/stat evidence.
+System loader/libraries remain dependencies of the pinned runtime; their resolved
+paths and ancestors must be root-owned and non-writable by unprivileged accounts.
+
+Both the fixed launcher and the direct-runtime BEAM test use this installation,
+fixed ERTS_BIN/ERL_ROOTDIR and a cleared environment. They run from the protected
+installation directory. CI first proves that the runtime UID can execute the
+installed version and obtain the expected relocated OTP root. Its authorization
+test then requires both BEAM_STARTED and AUTH_DENIED markers plus exit 23. An
+inaccessible executable or another nonzero exit fails the test. Each remaining
+negative assertion checks its exact expected exit code; all three OS identities
+must find no writable path anywhere in the toolchain tree.
+
 ## Limits and next gate
 
 GitHub job authorization and the supervisor-created operator OS identity are the
