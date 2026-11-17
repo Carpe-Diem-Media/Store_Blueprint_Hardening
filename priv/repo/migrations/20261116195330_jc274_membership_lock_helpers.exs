@@ -7,16 +7,16 @@ defmodule Store.Repo.Migrations.Jc274MembershipLockHelpers do
     RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
     DECLARE n integer; locked integer;
     BEGIN
-      n := cardinality(p_offer_revision_ids);
-      IF p_order_id IS NULL OR n IS NULL OR n NOT BETWEEN 1 AND 16 OR
-         array_position(p_offer_revision_ids, NULL) IS NOT NULL OR
-         n <> (SELECT count(DISTINCT id) FROM unnest(p_offer_revision_ids) id) THEN
-        RAISE EXCEPTION 'exact bounded order and offers required for acceptance locks' USING ERRCODE = 'check_violation';
-      END IF;
       PERFORM set_config('lock_timeout', '1s', true);
       PERFORM set_config('statement_timeout', '5s', true);
       PERFORM set_config('idle_in_transaction_session_timeout', '5s', true);
       PERFORM set_config('transaction_timeout', '10s', true);
+      n := cardinality(p_offer_revision_ids);
+      IF p_order_id IS NULL OR n IS NULL OR n < 1 OR
+         array_position(p_offer_revision_ids, NULL) IS NOT NULL OR
+         n <> (SELECT count(DISTINCT id) FROM unnest(p_offer_revision_ids) id) THEN
+        RAISE EXCEPTION 'exact bounded order and offers required for acceptance locks' USING ERRCODE = 'check_violation';
+      END IF;
       LOCK TABLE public.tax_rates IN SHARE MODE;
       LOCK TABLE public.promotions IN SHARE MODE;
       LOCK TABLE public.coupons IN SHARE MODE;
