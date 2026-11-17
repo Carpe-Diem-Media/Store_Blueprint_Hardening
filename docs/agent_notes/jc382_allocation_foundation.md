@@ -27,7 +27,7 @@ remains unverified under JC-381. No OS launcher or toolchain code is included.
 
 CONSTRUCTING has accepted_at NULL only within a transaction. It must become
 ACCEPTED with complete 1–16 component evidence before COMMIT. Invalid or partial
-construction rolls back. ACCEPTED is terminal. Existing conflict keys permit
+construction rolls back. ACCEPTED is terminal. Legacy inputs with both Membership markers NULL and existing conflict keys permit
 ON CONFLICT DO NOTHING to reach PostgreSQL's unique-key decision; they do not
 permit appending a new row. ON CONFLICT UPDATE still faces immutable UPDATE
 triggers. Source and monetary validation, per-occurrence identity and lock order

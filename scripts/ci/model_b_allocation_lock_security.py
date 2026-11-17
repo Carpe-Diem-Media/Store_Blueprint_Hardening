@@ -353,15 +353,18 @@ def verify_allocations(h):
             send(maintenance,'ROLLBACK;\\q');maintenance.communicate(timeout=5)
     accepted_fixtures = []
     for _ in range(4):
-        f = fixture()
-        owner(adjustment(f))
-        h.equal(h.WRITER, 'BEGIN;'+construction(f)+'COMMIT; SELECT 1;', '1', 'runtime_compatibility_accepted_fixture')
-        accepted_fixtures.append(f)
+        batch = {}
+        for disposition in ('paid', 'failed', 'cancelled'):
+            f = fixture()
+            owner(adjustment(f))
+            h.equal(h.WRITER, 'BEGIN;'+construction(f)+'COMMIT; SELECT 1;', '1', 'runtime_compatibility_accepted_fixture')
+            batch[disposition] = f
+        accepted_fixtures.append(batch)
     for table in ('order_line_component_allocation_sets', 'order_line_component_allocations'):
         h.equal(h.RUNTIME, f"SELECT NOT has_any_column_privilege(current_user,'public.{table}','INSERT,UPDATE') AND NOT has_table_privilege(current_user,'public.{table}','DELETE');", 't', f'actual_runtime_no_{table}_writes')
     h.deny(h.RUNTIME, "INSERT INTO public.order_line_items(membership_occurrence_key_snapshot) VALUES(public.uuid_generate_v7());", 'actual_runtime_marker_insert')
     h.deny(h.RUNTIME, "SELECT public.lock_membership_acceptance_sources(NULL,NULL);", 'actual_runtime_helper')
-    for f in accepted_fixtures:
+    for f in (f for batch in accepted_fixtures for f in batch.values()):
         rejection(f"UPDATE public.orders SET grand_total_minor=grand_total_minor+1 WHERE id='{f['order']}';", 'actual_runtime_accepted_financial_update', h.RUNTIME)
         rejection(f"INSERT INTO public.order_line_items(id,order_id,line_no,currency,quantity,unit_price_minor,line_total_minor,inserted_at,updated_at) VALUES(public.uuid_generate_v7(),'{f['order']}',99,'USD',1,100,100,now(),now());", 'actual_runtime_accepted_late_line', h.RUNTIME)
     h.equal(h.RUNTIME, "SELECT NOT has_table_privilege(current_user,'public.orders','INSERT,UPDATE') AND has_column_privilege(current_user,'public.orders','grand_total_minor','UPDATE') AND NOT has_column_privilege(current_user,'public.order_line_items','membership_occurrence_key_snapshot','INSERT');", 't', 'actual_runtime_exact_effective_column_acl')

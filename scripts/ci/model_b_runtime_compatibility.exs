@@ -16,6 +16,7 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
     end
 
     {:ok, _} = Application.ensure_all_started(:ash_postgres)
+    Logger.configure(level: :warning)
 
     config = [
       username: System.fetch_env!("PGUSER"),
@@ -43,10 +44,11 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
 
       for {repo, index} <- Enum.with_index(repos) do
         original = Store.Repo.put_dynamic_repo(repo)
+        assert Store.Repo.get_dynamic_repo() == repo
 
         try do
           assert %{rows: [["model_b_runtime", "model_b_runtime"]]} =
-                   SQL.query!(Store.Repo, "SELECT current_user::text, session_user::text", [])
+                   query!("SELECT current_user::text, session_user::text", [])
 
           for repetition <- 1..2 do
             started = System.monotonic_time(:microsecond)
@@ -54,7 +56,7 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
             accepted(Enum.at(fixtures, index * 2 + repetition - 1))
 
             IO.puts(
-              "PASS actual_runtime_repo=#{inspect(repo)} repetition=#{repetition} legacy_snapshot_shipping_finalization_lifecycle_replay elapsed_us=#{System.monotonic_time(:microsecond) - started} memory_bytes=#{:erlang.memory(:total)} processes=#{:erlang.system_info(:process_count)}"
+              "PASS actual_runtime_repo=#{inspect(repo)} repetition=#{repetition} database_role=model_b_runtime legacy_snapshot_shipping_finalization_lifecycle_replay elapsed_us=#{System.monotonic_time(:microsecond) - started} memory_bytes=#{:erlang.memory(:total)} processes=#{:erlang.system_info(:process_count)}"
             )
           end
         after
@@ -139,8 +141,7 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
     end
 
     assert %{rows: [[1]]} =
-             SQL.query!(
-               Store.Repo,
+             query!(
                "SELECT count(*) FROM public.order_adjustments WHERE order_id=$1 AND kind='shipping'",
                [Ecto.UUID.dump!(order.id)]
              )
@@ -193,48 +194,35 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
     ])
   end
 
-  defp accepted(ids) do
-    id = ids["order"]
-
-    original =
-      SQL.query!(
-        Store.Repo,
-        "SELECT to_jsonb(o)-ARRAY['state','version','provider_setup_started_at','updated_at'] FROM public.orders o WHERE id=$1",
-        [Ecto.UUID.dump!(id)]
-      ).rows
-
-    assert {:ok, %{idempotent?: true}} = SnapshotWriter.write_priced_snapshot(id, output())
-    order = Ash.get!(Order, id, authorize?: false)
-
-    lifecycle(order, [
-      :begin_provider_setup,
-      :refresh_provider_setup,
-      :provider_setup_ready,
-      :mark_paid,
-      :mark_refunded
-    ])
-
-    assert SQL.query!(
-             Store.Repo,
-             "SELECT to_jsonb(o)-ARRAY['state','version','provider_setup_started_at','updated_at'] FROM public.orders o WHERE id=$1",
-             [Ecto.UUID.dump!(id)]
-           ).rows == original
-
-    for sequence <- [
-          [:begin_provider_setup, :mark_payment_failed],
-          [:begin_provider_setup, :cancel]
+  defp accepted(batch) do
+    for {key, sequence} <- [
+          {"paid",
+           [
+             :begin_provider_setup,
+             :refresh_provider_setup,
+             :provider_setup_ready,
+             :mark_paid,
+             :mark_refunded
+           ]},
+          {"failed", [:begin_provider_setup, :mark_payment_failed]},
+          {"cancelled", [:begin_provider_setup, :cancel]}
         ] do
-      # Separate legacy Orders prove every supported branch and action replay.
-      order =
-        Order
-        |> Ash.Changeset.for_create(
-          :create,
-          %{order_ref: "CI#{Ash.UUIDv7.generate()}"},
-          context: %{system?: true}
-        )
-        |> Ash.create!(domain: Store.Orders, authorize?: true)
+      id = batch[key]["order"]
 
+      original =
+        query!(
+          "SELECT to_jsonb(o)-ARRAY['state','version','provider_setup_started_at','updated_at'] FROM public.orders o WHERE id=$1",
+          [Ecto.UUID.dump!(id)]
+        ).rows
+
+      assert {:ok, %{idempotent?: true}} = SnapshotWriter.write_priced_snapshot(id, output())
+      order = Ash.get!(Order, id, authorize?: false)
       lifecycle(order, sequence)
+
+      assert query!(
+               "SELECT to_jsonb(o)-ARRAY['state','version','provider_setup_started_at','updated_at'] FROM public.orders o WHERE id=$1",
+               [Ecto.UUID.dump!(id)]
+             ).rows == original
     end
   end
 
@@ -246,6 +234,10 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
       assert replay.version == updated.version
       replay
     end)
+  end
+
+  defp query!(statement, params) do
+    SQL.query!(Store.Repo.get_dynamic_repo(), statement, params)
   end
 
   defp update(order, action, attrs) do

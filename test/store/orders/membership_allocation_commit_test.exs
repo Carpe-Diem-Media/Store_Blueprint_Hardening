@@ -580,12 +580,44 @@ defmodule Store.Orders.MembershipAllocationCommitTest do
 
   @tag :foundation_hardening
   test "raw SQL rejects explicit non-v7 allocation identities", %{repo: repo} do
-    for field <- [:set, :row_id, :instance, :evaluation] do
-      f = fixture!(repo) |> Map.put(field, Ecto.UUID.dump!(Ecto.UUID.generate()))
+    for field <- [:set, :row_id, :instance, :evaluation],
+        invalid <- [Ecto.UUID.generate(), "018f0000-0000-7000-0000-000000000001"] do
+      f = fixture!(repo) |> Map.put(field, Ecto.UUID.dump!(invalid))
 
       assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
                construct(repo, f, :complete)
     end
+  end
+
+  @tag :foundation_hardening
+  test "header occurrence SQL law is independent of the line occurrence guard", %{repo: repo} do
+    f = fixture!(repo)
+
+    repo.checkout(fn ->
+      SQL.query!(repo, "BEGIN", [])
+
+      try do
+        assert {:error,
+                %Postgrex.Error{
+                  postgres: %{
+                    code: :check_violation,
+                    constraint: "order_line_component_allocation_sets_occurrence_key_v7_check"
+                  }
+                }} =
+                 SQL.query(
+                   repo,
+                   """
+                   INSERT INTO public.order_line_component_allocation_sets
+                     (id, order_id, offer_revision_id, occurrence_key, target_fingerprint,
+                      allocation_fingerprint, pricing_fingerprint, allocation_rule_version, currency, tax_context)
+                   VALUES($1,$2,$3,$4,'target','allocation','pricing','v1','USD','{}')
+                   """,
+                   [f.set, f.order, f.revision, Ecto.UUID.dump!(Ecto.UUID.generate())]
+                 )
+      after
+        SQL.query!(repo, "ROLLBACK", [])
+      end
+    end)
   end
 
   @tag :foundation_hardening
@@ -714,6 +746,21 @@ defmodule Store.Orders.MembershipAllocationCommitTest do
   end
 
   @tag :foundation_hardening
+  test "marked writer repeats retain the immutability denial before unique conflicts", %{
+    repo: repo
+  } do
+    f = fixture!(repo)
+    assert {:ok, %{command: :commit}} = construct(repo, f, :complete)
+
+    assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
+             SQL.query(
+               repo,
+               "INSERT INTO public.order_line_items SELECT * FROM public.order_line_items WHERE id=$1",
+               [f.line]
+             )
+  end
+
+  @tag :foundation_hardening
   test "accepted legacy conflict replays remain no-op without admitting late content", %{
     repo: repo
   } do
@@ -727,7 +774,8 @@ defmodule Store.Orders.MembershipAllocationCommitTest do
                  """
                  INSERT INTO public.#{table}
                  SELECT (jsonb_populate_record(NULL::public.#{table}, to_jsonb(t) ||
-                   jsonb_build_object('id', public.uuid_generate_v7()))).*
+                   jsonb_build_object('id', public.uuid_generate_v7(),
+                   'membership_offer_revision_id_snapshot', NULL, 'membership_occurrence_key_snapshot', NULL))).*
                  FROM public.#{table} t WHERE order_id=$1
                  ON CONFLICT DO NOTHING
                  """,
@@ -745,7 +793,8 @@ defmodule Store.Orders.MembershipAllocationCommitTest do
                  """
                  INSERT INTO public.#{table}
                  SELECT (jsonb_populate_record(NULL::public.#{table}, to_jsonb(t) ||
-                   jsonb_build_object('id', public.uuid_generate_v7()))).*
+                   jsonb_build_object('id', public.uuid_generate_v7(),
+                   'membership_offer_revision_id_snapshot', NULL, 'membership_occurrence_key_snapshot', NULL))).*
                  FROM public.#{table} t WHERE order_id=$1
                  ON CONFLICT (#{keys}) DO UPDATE SET #{assignment}
                  """,

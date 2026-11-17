@@ -43,7 +43,8 @@ defmodule Store.Repo.Migrations.Jc274AllocationIntegrity do
         -- immutable UPDATE guard. Preserve the legacy create-only replay path.
         IF TG_OP = 'INSERT' THEN
           IF TG_TABLE_NAME = 'order_line_items' THEN
-            IF EXISTS (SELECT 1 FROM public.order_line_items WHERE order_id = oid AND line_no = NEW.line_no) THEN RETURN NEW; END IF;
+            IF NEW.membership_occurrence_key_snapshot IS NULL AND NEW.membership_offer_revision_id_snapshot IS NULL AND
+               EXISTS (SELECT 1 FROM public.order_line_items WHERE order_id = oid AND line_no = NEW.line_no) THEN RETURN NEW; END IF;
           ELSE
             IF EXISTS (SELECT 1 FROM public.order_adjustments WHERE order_id = oid AND
               (sequence_no = NEW.sequence_no OR (kind = 'shipping' AND NEW.kind = 'shipping'))) THEN RETURN NEW; END IF;
