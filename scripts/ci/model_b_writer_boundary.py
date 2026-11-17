@@ -125,6 +125,13 @@ def install():
                         '--shell', '/usr/sbin/nologin', identity], check=True)
     import pwd
     writer = pwd.getpwnam(WRITER)
+    # Hosted image /opt permissions are not an isolation guarantee. Seal the
+    # ancestor in this disposable VM before exposing any unprivileged process.
+    # Do not relax the closure audit or touch the runner-private source tree.
+    subprocess.run(['/usr/bin/stat', '-c', 'before %U:%G %a %n', '/opt'], check=True)
+    os.chown('/opt', 0, 0)
+    Path('/opt').chmod(0o755)
+    subprocess.run(['/usr/bin/stat', '-c', 'after %U:%G %a %n', '/opt'], check=True)
     ROOT.mkdir(mode=0o755)
     install_toolchain(data)
     for library in Path('_build/test/lib').iterdir():

@@ -54,6 +54,9 @@ links outside that closure reject installation. Files and directories are owned
 by root, with read/traverse/execute access and no unprivileged write access. The
 bootstrap checks ELF RPATH/RUNPATH and ldd dependencies, rejects missing libraries
 or writable/private dependency paths, and records namei/readlink/stat evidence.
+It also makes the disposable VM's `/opt` ancestor root-owned with mode 0755;
+an image-default writable ancestor must not permit replacement of the protected
+installation. This restriction is never applied to a workstation or shared host.
 System loader/libraries remain dependencies of the pinned runtime; their resolved
 paths and ancestors must be root-owned and non-writable by unprivileged accounts.
 
