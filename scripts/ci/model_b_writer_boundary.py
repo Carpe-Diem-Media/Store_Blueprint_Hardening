@@ -51,6 +51,7 @@ def install():
         '[ "$#" -eq 0 ] || exit 23\n'
         f'[ "$(/usr/bin/id -u)" -eq {writer.pw_uid} ] || exit 23\n'
         'exec /usr/bin/env -i HOME=/nonexistent PATH=/usr/bin:/bin LANG=C.UTF-8 '
+        + 'ERTS_BIN=' + shlex.quote(str(Path(data['erl']).parent) + '/') + ' '
         '/usr/bin/timeout --signal=KILL 15s '
         + shlex.quote(data['elixir'])
         + " --erl '+S 2:2' -pa '/opt/store-membership-writer-ci/lib/*/ebin' "
@@ -72,7 +73,7 @@ def verify_writer_boundary(h):
         raise RuntimeError('fixed isolated writer boundary is not implemented')
     bootstrap = subprocess.run(
         ['sudo', '-n', sys.executable, __file__, '--install'],
-        input=json.dumps(dict(password=h.PASSWORDS[h.WRITER], elixir=shutil.which('elixir'))),
+        input=json.dumps(dict(password=h.PASSWORDS[h.WRITER], elixir=shutil.which('elixir'), erl=shutil.which('erl'))),
         text=True, capture_output=True, timeout=30,
     )
     if bootstrap.returncode:
@@ -84,6 +85,11 @@ def verify_writer_boundary(h):
         result = subprocess.run(['sudo', '-n', '-u', identity, '--'] + command,
             text=True, capture_output=True, timeout=20, env=env)
         if (expected == 0 and result.returncode != 0) or (expected != 0 and result.returncode == 0):
+            diagnostic = result.stderr[-2000:]
+            for secret in list(h.PASSWORDS.values()) + [h.ADMIN_PASSWORD]:
+                if secret:
+                    diagnostic = diagnostic.replace(secret, '[REDACTED]')
+            print(f'Boundary diagnostic returncode={result.returncode}: {diagnostic}', flush=True)
             raise RuntimeError(f'OS boundary assertion failed for {identity}')
         return result
 
@@ -109,7 +115,8 @@ def verify_writer_boundary(h):
     run(RUNTIME, ['/usr/bin/env', 'SUDO_USER='+OPERATOR, 'STORE_SYSTEM=true'] + launch, expected=1)
     print('PASS missing_forged_authentication_and_arbitrary_arguments_denied', flush=True)
     # Exercise the exported release function inside an ordinary-runtime BEAM.
-    denied = run(RUNTIME, [shutil.which('elixir'), '--erl', '+S 2:2', '-pa',
+    denied = run(RUNTIME, ['/usr/bin/env', '-i', 'HOME=/nonexistent', 'PATH=/usr/bin:/bin',
+        'ERTS_BIN='+str(Path(shutil.which('erl')).parent)+'/', shutil.which('elixir'), '--erl', '+S 2:2', '-pa',
         str(ROOT / 'lib/*/ebin'), '-e',
         'case Store.Release.membership_writer_boundary_probe() do '
         '{:error, :writer_boundary_denied} -> System.halt(23); _ -> System.halt(1) end'], expected=1)
