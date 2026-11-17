@@ -70,60 +70,6 @@ defmodule Store.Repo.Migrations.Jc274AllocationIntegrity do
     """
 
     execute """
-    CREATE FUNCTION public.membership_allocation_validate_order(p_order_id uuid) RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
-    DECLARE s record; n integer;
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM public.order_line_items l
-        LEFT JOIN public.order_line_component_allocation_sets a ON a.order_id = l.order_id AND a.occurrence_key = l.membership_occurrence_key_snapshot
-        WHERE l.order_id = p_order_id AND l.membership_occurrence_key_snapshot IS NOT NULL AND a.id IS NULL
-      ) THEN RAISE EXCEPTION 'marked line has no accepted allocation' USING ERRCODE = 'check_violation'; END IF;
-      FOR s IN SELECT * FROM public.order_line_component_allocation_sets WHERE order_id = p_order_id LOOP
-        IF s.accepted_at IS NULL THEN RAISE EXCEPTION 'allocation set not accepted' USING ERRCODE = 'check_violation'; END IF;
-        IF NOT EXISTS (SELECT 1 FROM public.membership_offer_revisions r WHERE r.id = s.offer_revision_id AND r.status = 'accepted' AND r.currency = s.currency) THEN
-          RAISE EXCEPTION 'accepted offer revision or currency mismatch' USING ERRCODE = 'check_violation';
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM public.orders o WHERE o.id = s.order_id AND o.currency_code = s.currency AND o.totals_finalized_at IS NOT NULL) THEN
-          RAISE EXCEPTION 'order is not finalized in allocation currency' USING ERRCODE = 'check_violation';
-        END IF;
-        SELECT count(*) INTO n FROM public.order_line_component_allocations a WHERE a.allocation_set_id = s.id;
-        IF n < 1 OR n > 16 OR n <> (SELECT count(*) FROM public.membership_offer_revision_components c WHERE c.revision_id = s.offer_revision_id) THEN
-          RAISE EXCEPTION 'allocation manifest incomplete' USING ERRCODE = 'check_violation';
-        END IF;
-        IF EXISTS (
-          SELECT 1 FROM public.order_line_component_allocations a
-          JOIN public.order_line_items l ON l.id = a.order_line_item_id
-          JOIN public.membership_offer_revision_components c ON c.id = a.offer_component_id
-          WHERE a.allocation_set_id = s.id AND
-            (l.order_id <> s.order_id OR l.membership_occurrence_key_snapshot IS DISTINCT FROM s.occurrence_key OR
-             l.membership_offer_revision_id_snapshot IS DISTINCT FROM s.offer_revision_id OR c.revision_id <> s.offer_revision_id OR
-             c.gross_minor <> a.gross_minor OR l.currency <> s.currency OR
-             upper(trim(c.tax_treatment_key)) <> upper(trim(l.tax_category_snapshot)) OR
-             (a.discount_minor > 0 AND (s.source_eligibility_key IS NULL OR c.discount_eligibility_key <> s.source_eligibility_key)))
-        ) THEN RAISE EXCEPTION 'allocation identity, price, tax category or eligibility mismatch' USING ERRCODE = 'check_violation'; END IF;
-        IF EXISTS (
-          SELECT 1 FROM public.order_line_items l
-          LEFT JOIN public.order_line_component_allocations a ON a.order_line_item_id = l.id AND a.allocation_set_id = s.id
-          WHERE l.order_id = s.order_id AND l.membership_occurrence_key_snapshot = s.occurrence_key
-          GROUP BY l.id
-          HAVING count(a.id) = 0 OR coalesce(sum(a.gross_minor),0) <> l.line_total_minor OR
-                 coalesce(sum(a.discount_minor),0) <> l.discount_allocated_minor OR
-                 coalesce(sum(a.net_minor),0) <> l.net_line_total_minor OR
-                 coalesce(sum(a.tax_minor),0) <> l.tax_minor OR
-                 l.tax_rate_id_snapshot IS NULL OR l.tax_rate_code_snapshot IS NULL OR l.tax_rate_bps_snapshot IS NULL OR
-                 (l.net_line_total_minor = 0 AND l.tax_minor <> 0)
-        ) THEN RAISE EXCEPTION 'allocation line does not reconcile' USING ERRCODE = 'check_violation'; END IF;
-        IF (s.source_adjustment_id IS NULL) <> (s.source_eligibility_key IS NULL) OR
-           (s.source_adjustment_id IS NULL) <> (s.source_rule_version IS NULL) OR
-           (s.source_adjustment_id IS NULL AND EXISTS (SELECT 1 FROM public.order_line_component_allocations a WHERE a.allocation_set_id = s.id AND a.discount_minor > 0)) OR
-           (s.source_adjustment_id IS NOT NULL AND NOT EXISTS (
-             SELECT 1 FROM public.order_adjustments d WHERE d.id = s.source_adjustment_id AND d.order_id = s.order_id AND d.currency = s.currency AND d.source_kind IN ('coupon','promotion') AND d.source_id IS NOT NULL AND d.amount_minor < 0
-           )) THEN RAISE EXCEPTION 'discount source evidence invalid' USING ERRCODE = 'check_violation'; END IF;
-      END LOOP;
-    END $$
-    """
-
-    execute """
     CREATE FUNCTION public.membership_allocation_deferred_check() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
     DECLARE oid uuid;
     BEGIN
@@ -279,7 +225,6 @@ defmodule Store.Repo.Migrations.Jc274AllocationIntegrity do
     execute "DROP FUNCTION public.membership_allocation_no_truncate()"
     execute "DROP FUNCTION public.membership_allocation_immutable()"
     execute "DROP FUNCTION public.membership_allocation_deferred_check()"
-    execute "DROP FUNCTION public.membership_allocation_validate_order(uuid)"
     execute "DROP FUNCTION public.membership_allocation_lock_order()"
   end
 end

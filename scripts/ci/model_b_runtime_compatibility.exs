@@ -22,7 +22,7 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
       username: System.fetch_env!("PGUSER"),
       password: System.fetch_env!("PGPASSWORD"),
       hostname: "127.0.0.1",
-      port: 55433,
+      port: System.fetch_env!("PGPORT") |> String.to_integer(),
       database: "model_b_role_proof",
       pool: DBConnection.ConnectionPool,
       pool_size: 2,
@@ -34,7 +34,16 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
 
     pids =
       for repo <- repos do
-        Application.put_env(:store, repo, config)
+        repo_config =
+          if repo == Store.DirectRepo,
+            do:
+              Keyword.merge(config,
+                username: System.fetch_env!("MODEL_B_DIRECT_RUNTIME_USER"),
+                password: System.fetch_env!("MODEL_B_DIRECT_RUNTIME_PASSWORD")
+              ),
+            else: config
+
+        Application.put_env(:store, repo, repo_config)
         {:ok, pid} = repo.start_link()
         pid
       end
@@ -47,7 +56,12 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
         assert Store.Repo.get_dynamic_repo() == repo
 
         try do
-          assert %{rows: [["model_b_runtime", "model_b_runtime"]]} =
+          role =
+            if repo == Store.DirectRepo,
+              do: System.fetch_env!("MODEL_B_DIRECT_RUNTIME_USER"),
+              else: "model_b_runtime"
+
+          assert %{rows: [[^role, ^role]]} =
                    query!("SELECT current_user::text, session_user::text", [])
 
           for repetition <- 1..2 do
@@ -56,7 +70,7 @@ defmodule Store.CI.ModelBRuntimeCompatibility do
             accepted(Enum.at(fixtures, index * 2 + repetition - 1))
 
             IO.puts(
-              "PASS actual_runtime_repo=#{inspect(repo)} repetition=#{repetition} database_role=model_b_runtime legacy_snapshot_shipping_finalization_lifecycle_replay elapsed_us=#{System.monotonic_time(:microsecond) - started} memory_bytes=#{:erlang.memory(:total)} processes=#{:erlang.system_info(:process_count)}"
+              "PASS actual_runtime_repo=#{inspect(repo)} repetition=#{repetition} database_role=#{role} legacy_snapshot_shipping_finalization_lifecycle_replay elapsed_us=#{System.monotonic_time(:microsecond) - started} memory_bytes=#{:erlang.memory(:total)} processes=#{:erlang.system_info(:process_count)}"
             )
           end
         after

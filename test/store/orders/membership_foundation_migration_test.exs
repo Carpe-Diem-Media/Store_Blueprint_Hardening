@@ -6,6 +6,7 @@ defmodule Store.Orders.MembershipFoundationMigrationTest do
   use ExUnit.Case, async: false
 
   alias Ecto.Adapters.SQL
+  alias Store.Operations.AllocationRuntimeContract
   alias Store.TestSupport.IsolatedMigrationDatabase
   @moduletag :real_connections
 
@@ -30,6 +31,22 @@ defmodule Store.Orders.MembershipFoundationMigrationTest do
                )
 
       assert length(Ecto.Migrator.run(db.repo, path, :up, all: true, log: false)) == 9
+
+      assert length(Ecto.Migrator.run(db.repo, path, :down, to: 20_261_116_195_399, log: false)) ==
+               5
+
+      assert %{rows: [[true]]} =
+               SQL.query!(
+                 db.repo,
+                 "SELECT to_regprocedure('public.membership_allocation_validate_order(uuid)') IS NOT NULL",
+                 []
+               )
+
+      assert_raise RuntimeError, ~r/allocation triggers pending/, fn ->
+        AllocationRuntimeContract.guard_standard_migrations!(db.repo)
+      end
+
+      assert length(Ecto.Migrator.run(db.repo, path, :up, all: true, log: false)) == 5
     after
       IsolatedMigrationDatabase.stop!(db)
     end

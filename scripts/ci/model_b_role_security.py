@@ -20,10 +20,11 @@ import sys
 OWNER = "model_b_owner"
 MIGRATOR = "model_b_migrator"
 RUNTIME = "model_b_runtime"
+DIRECT_RUNTIME = "model_b_direct_runtime"
 WRITER = "model_b_allocation_writer"
 MAINTAINER = "model_b_pricing_maintainer"
 LOGINS = (MIGRATOR, RUNTIME, WRITER, MAINTAINER)
-PASSWORDS = {role: secrets.token_urlsafe(32) for role in LOGINS}
+PASSWORDS = {role: secrets.token_urlsafe(32) for role in LOGINS + (DIRECT_RUNTIME,)}
 ADMIN = os.environ.get("PGUSER", "")
 ADMIN_PASSWORD = os.environ.get("PGPASSWORD", "")
 ASSERTIONS = 0
@@ -81,7 +82,7 @@ def deny(role, statement, label):
 def bootstrap():
     # Only this disposable bootstrap operation uses the service administrator.
     statements = [f"CREATE ROLE {OWNER} NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS;"]
-    for role in LOGINS:
+    for role in LOGINS + (DIRECT_RUNTIME,):
         statements.append(
             f"CREATE ROLE {role} LOGIN NOINHERIT NOSUPERUSER NOCREATEROLE "
             f"NOCREATEDB NOREPLICATION NOBYPASSRLS PASSWORD '{PASSWORDS[role]}';"
@@ -91,7 +92,7 @@ def bootstrap():
         f"ALTER DATABASE model_b_role_proof OWNER TO {OWNER};",
         "REVOKE ALL ON DATABASE model_b_role_proof FROM PUBLIC;",
         "REVOKE ALL ON SCHEMA public FROM PUBLIC;",
-        f"GRANT CONNECT ON DATABASE model_b_role_proof TO {', '.join(LOGINS)};",
+        f"GRANT CONNECT ON DATABASE model_b_role_proof TO {', '.join(LOGINS + (DIRECT_RUNTIME,))};",
     ]
     sql(ADMIN, "\n".join(statements))
 

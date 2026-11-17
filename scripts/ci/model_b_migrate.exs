@@ -16,7 +16,7 @@ Application.put_env(:store, Store.Repo,
   username: System.fetch_env!("PGUSER"),
   password: System.fetch_env!("PGPASSWORD"),
   hostname: "127.0.0.1",
-  port: 55433,
+  port: System.fetch_env!("PGPORT") |> String.to_integer(),
   database: target,
   parameters: if(fixture?, do: [], else: [role: "model_b_owner"]),
   pool: DBConnection.ConnectionPool,
@@ -26,7 +26,14 @@ Application.put_env(:store, Store.Repo,
 
 {:ok, _, _} =
   Ecto.Migrator.with_repo(Store.Repo, fn repo ->
-    Ecto.Migrator.run(repo, Application.app_dir(:store, "priv/repo/migrations"), :up, all: true)
+    opts =
+      case System.get_env("MODEL_B_MIGRATION_STAGE") do
+        "baseline" -> [to: 20_261_116_193_823]
+        "preflight" -> [to: 20_261_116_195_330]
+        _ -> [all: true]
+      end
+
+    Ecto.Migrator.run(repo, Application.app_dir(:store, "priv/repo/migrations"), :up, opts)
   end)
 
 IO.puts("PASS Store migrations on job-owned target #{target}")

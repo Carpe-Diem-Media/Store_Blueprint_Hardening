@@ -12,7 +12,7 @@ import time
 
 def verify_allocations(h):
     env = os.environ.copy()
-    env.update(PGUSER=h.MIGRATOR, PGPASSWORD=h.PASSWORDS[h.MIGRATOR])
+    env.update(PGUSER=h.MIGRATOR, PGPASSWORD=h.PASSWORDS[h.MIGRATOR], MODEL_B_MIGRATION_STAGE="baseline")
     migration = subprocess.run(
         ["mix", "run", "--no-start", "scripts/ci/model_b_migrate.exs"],
         env=env, capture_output=True, text=True, timeout=600, check=False,
@@ -29,16 +29,24 @@ def verify_allocations(h):
     def owner(statement):
         return h.sql(h.MIGRATOR, f"SET ROLE {h.OWNER};\n" + statement)
 
+    from model_b_runtime_acl_security import legacy_write_cost
+    legacy_write_cost(owner, 'accepted_main')
+    env['MODEL_B_MIGRATION_STAGE'] = 'preflight'
+    staged = subprocess.run(['mix', 'run', '--no-start', 'scripts/ci/model_b_migrate.exs'],
+                            env=env, capture_output=True, text=True, timeout=180, check=False)
+    if staged.returncode:
+        raise RuntimeError('allocation pre-trigger staging failed')
+
     owner(f"""
-      GRANT USAGE ON SCHEMA public TO {h.RUNTIME}, {h.WRITER}, {h.MAINTAINER};
+      GRANT USAGE ON SCHEMA public TO {h.RUNTIME}, {h.DIRECT_RUNTIME}, {h.WRITER}, {h.MAINTAINER};
       GRANT SELECT ON public.orders, public.order_line_items, public.order_adjustments,
-        public.order_line_component_allocation_sets, public.order_line_component_allocations,
         public.membership_offer_revisions, public.membership_offer_revision_components,
-        public.tax_rates, public.promotions, public.coupons TO {h.RUNTIME}, {h.WRITER};
+        public.tax_rates, public.promotions, public.coupons TO {h.RUNTIME}, {h.DIRECT_RUNTIME}, {h.WRITER};
+      GRANT SELECT ON public.order_line_component_allocation_sets, public.order_line_component_allocations TO {h.WRITER};
       -- Exact frozen Model B v1.1 legacy column lists. No table-level DML.
-      GRANT INSERT(id,state,order_ref,checkout_key,user_id,shipping_rate_id,shipping_rate_code,shipping_quote_hash,shipping_quote_currency_code,shipping_quote_amount_minor,shipping_weight_grams,shipping_method_code,shipping_rule_id,shipping_zone_id,shipping_effective_from,shipping_effective_to,currency_code,items_subtotal_minor,shipping_total_minor,grand_total_minor,totals_finalized_at,shipping_cost_minor_original,shipping_cost_minor_effective,free_shipping_applied,free_shipping_reason,shipping_tax_minor,tax_total_minor,shipping_country_code,shipping_region_code,shipping_postal_code,shipping_recipient_name,shipping_address_line1,shipping_address_line2,shipping_city,shipping_phone,tax_as_of,version,provider_setup_started_at,inserted_at,updated_at), UPDATE(state,shipping_rate_id,shipping_rate_code,shipping_quote_hash,shipping_quote_currency_code,shipping_quote_amount_minor,shipping_weight_grams,shipping_method_code,shipping_rule_id,shipping_zone_id,shipping_effective_from,shipping_effective_to,currency_code,items_subtotal_minor,shipping_total_minor,grand_total_minor,totals_finalized_at,shipping_cost_minor_original,shipping_cost_minor_effective,free_shipping_applied,free_shipping_reason,shipping_tax_minor,tax_total_minor,shipping_country_code,shipping_region_code,shipping_postal_code,shipping_recipient_name,shipping_address_line1,shipping_address_line2,shipping_city,shipping_phone,tax_as_of,version,provider_setup_started_at,updated_at) ON public.orders TO {h.RUNTIME};
-      GRANT INSERT(id,order_id,line_no,currency,quantity,unit_price_minor,line_total_minor,sku_snapshot,product_title_snapshot,variant_title_snapshot,variant_id_snapshot,subscription_plan_id_snapshot,subscription_plan_revision_id_snapshot,subscription_plan_key_snapshot,subscription_interval_unit_snapshot,subscription_interval_count_snapshot,discount_allocated_minor,net_line_total_minor,tax_category_snapshot,tax_rate_id_snapshot,tax_rate_code_snapshot,tax_rate_bps_snapshot,tax_minor,inserted_at,updated_at) ON public.order_line_items TO {h.RUNTIME};
-      GRANT INSERT(id,order_id,sequence_no,currency,kind,amount_minor,reason,source_kind,source_code,source_id,precedence_rank,inserted_at,updated_at) ON public.order_adjustments TO {h.RUNTIME};
+      GRANT INSERT(id,state,order_ref,checkout_key,user_id,shipping_rate_id,shipping_rate_code,shipping_quote_hash,shipping_quote_currency_code,shipping_quote_amount_minor,shipping_weight_grams,shipping_method_code,shipping_rule_id,shipping_zone_id,shipping_effective_from,shipping_effective_to,currency_code,items_subtotal_minor,shipping_total_minor,grand_total_minor,totals_finalized_at,shipping_cost_minor_original,shipping_cost_minor_effective,free_shipping_applied,free_shipping_reason,shipping_tax_minor,tax_total_minor,shipping_country_code,shipping_region_code,shipping_postal_code,shipping_recipient_name,shipping_address_line1,shipping_address_line2,shipping_city,shipping_phone,tax_as_of,version,provider_setup_started_at,inserted_at,updated_at), UPDATE(state,shipping_rate_id,shipping_rate_code,shipping_quote_hash,shipping_quote_currency_code,shipping_quote_amount_minor,shipping_weight_grams,shipping_method_code,shipping_rule_id,shipping_zone_id,shipping_effective_from,shipping_effective_to,currency_code,items_subtotal_minor,shipping_total_minor,grand_total_minor,totals_finalized_at,shipping_cost_minor_original,shipping_cost_minor_effective,free_shipping_applied,free_shipping_reason,shipping_tax_minor,tax_total_minor,shipping_country_code,shipping_region_code,shipping_postal_code,shipping_recipient_name,shipping_address_line1,shipping_address_line2,shipping_city,shipping_phone,tax_as_of,version,provider_setup_started_at,updated_at) ON public.orders TO {h.RUNTIME}, {h.DIRECT_RUNTIME};
+      GRANT INSERT(id,order_id,line_no,currency,quantity,unit_price_minor,line_total_minor,sku_snapshot,product_title_snapshot,variant_title_snapshot,variant_id_snapshot,subscription_plan_id_snapshot,subscription_plan_revision_id_snapshot,subscription_plan_key_snapshot,subscription_interval_unit_snapshot,subscription_interval_count_snapshot,discount_allocated_minor,net_line_total_minor,tax_category_snapshot,tax_rate_id_snapshot,tax_rate_code_snapshot,tax_rate_bps_snapshot,tax_minor,inserted_at,updated_at) ON public.order_line_items TO {h.RUNTIME}, {h.DIRECT_RUNTIME};
+      GRANT INSERT(id,order_id,sequence_no,currency,kind,amount_minor,reason,source_kind,source_code,source_id,precedence_rank,inserted_at,updated_at) ON public.order_adjustments TO {h.RUNTIME}, {h.DIRECT_RUNTIME};
       GRANT INSERT(id,order_id,line_no,currency,quantity,unit_price_minor,line_total_minor,
         sku_snapshot,product_title_snapshot,discount_allocated_minor,net_line_total_minor,
         tax_category_snapshot,tax_rate_id_snapshot,tax_rate_code_snapshot,tax_rate_bps_snapshot,
@@ -56,15 +64,13 @@ def verify_allocations(h):
       GRANT SELECT, UPDATE(code,rate_basis_points,active) ON public.tax_rates TO {h.MAINTAINER};
       GRANT EXECUTE ON FUNCTION public.lock_membership_acceptance_sources(uuid,uuid) TO {h.WRITER};
       GRANT EXECUTE ON FUNCTION public.lock_membership_acceptance_manifest(uuid,uuid[]) TO {h.WRITER};
-      DO $$ DECLARE p record; BEGIN
-        FOR p IN SELECT oid::regprocedure AS signature FROM pg_catalog.pg_proc
-          WHERE pronamespace='public'::regnamespace AND proname LIKE 'membership_allocation_%'
-        LOOP
-          EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', p.signature);
-          EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO {h.RUNTIME}, {h.WRITER}', p.signature);
-        END LOOP;
-      END $$;
+      GRANT EXECUTE ON FUNCTION public.membership_allocation_lock_orders(uuid[],uuid),
+        public.membership_allocation_validate_order(uuid) TO {h.WRITER};
     """)
+
+    from model_b_runtime_acl_security import prepare_contract
+    prepare_contract(h, owner, env)
+    legacy_write_cost(owner, 'allocation_triggers')
 
     def fixture(bps=0, region=None):
         f = json.loads(owner("SELECT json_build_object(" + ",".join(
@@ -370,6 +376,8 @@ def verify_allocations(h):
     h.equal(h.RUNTIME, "SELECT NOT has_table_privilege(current_user,'public.orders','INSERT,UPDATE') AND has_column_privilege(current_user,'public.orders','grand_total_minor','UPDATE') AND NOT has_column_privilege(current_user,'public.order_line_items','membership_occurrence_key_snapshot','INSERT');", 't', 'actual_runtime_exact_effective_column_acl')
     runtime_env = connection_env(h.RUNTIME)
     runtime_env['MODEL_B_ACCEPTED_FIXTURES'] = json.dumps(accepted_fixtures)
+    runtime_env['MODEL_B_DIRECT_RUNTIME_USER'] = h.DIRECT_RUNTIME
+    runtime_env['MODEL_B_DIRECT_RUNTIME_PASSWORD'] = h.PASSWORDS[h.DIRECT_RUNTIME]
     runtime = subprocess.run(['mix', 'run', '--no-start', 'scripts/ci/model_b_runtime_compatibility.exs'],
         text=True, capture_output=True, env=runtime_env, timeout=120, check=False)
     output = runtime.stdout + runtime.stderr
@@ -399,7 +407,7 @@ def verify_fixture_regressions(h):
     env.update(PGUSER=role, PGPASSWORD=password, PGDATABASE="model_b_fixture_tests",
         STORE_TEST_DATABASE_USERNAME=role, STORE_TEST_DATABASE_PASSWORD=password,
         STORE_TEST_DATABASE_NAME="model_b_fixture_tests", STORE_TEST_DATABASE_HOST="127.0.0.1",
-        STORE_TEST_DATABASE_PORT="55433")
+        STORE_TEST_DATABASE_PORT=os.environ["PGPORT"])
     commands = [
         ["mix", "run", "--no-start", "scripts/ci/model_b_migrate.exs"],
         ["mix", "run", "-e", 'Mix.Tasks.Test.run(["test/store/orders/membership_allocation_sql_test.exs", "test/store/orders/membership_allocation_commit_test.exs", "test/store/orders/membership_foundation_migration_test.exs", "test/store/orders/membership_line_integrity_test.exs", "--include", "real_connections"])'],

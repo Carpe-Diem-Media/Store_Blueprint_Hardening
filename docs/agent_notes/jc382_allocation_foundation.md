@@ -91,3 +91,26 @@ credential isolation or production readiness.
 - Two generated latest Ash snapshots record the new UUIDv7 checks; the five
   original snapshots are retained.
 - This note records scope, execution plan, limitations and resource reviews.
+
+## Authorized ACL correction plan
+
+Master Gate comment 874b4758-8ddf-400b-9f51-3e66b1d7fe18 authorizes this correction.
+The supported topology uses a separate NOLOGIN object owner and two authenticated
+runtime configurations with the exact frozen column ACLs. No deployment role names
+are assumed. Ordinary runtime gets only SELECT on the new tables and EXECUTE on
+the invoker router/validator. The supported release path stages schema and helpers,
+then checks the actual roles before installing triggers. Standard release migration
+entrypoints reject pending allocation triggers. The validator moves to the existing
+pre-trigger helper migration, preserving all nine identities and rollback guards.
+
+Execution plan:
+
+1. Reproduce missing preflight, owner-role rejection and unknown-role failures.
+2. Add a read-only catalog preflight, staged owner-only migration interface and
+   the operator-reviewed four-grant SQL file. Keep baseline Orders ACLs unchanged.
+3. Replace runtime-wide CI function grants with the same documented SQL file.
+4. Test missing grants with 42501, deferred COMMIT rollback, narrow restoration,
+   independent Repo/DirectRepo logins and all existing writer/lock regressions.
+5. Run focused checks locally against disposable PG18 before at most two CI heads.
+6. Record exact evidence and STOP for independent Master Gate. No production roles
+   or shared ownership change as part of this work.
