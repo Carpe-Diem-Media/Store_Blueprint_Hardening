@@ -60,6 +60,17 @@ installation. This restriction is never applied to a workstation or shared host.
 System loader/libraries remain dependencies of the pinned runtime; their resolved
 paths and ancestors must be root-owned and non-writable by unprivileged accounts.
 
+ELF search directories are candidates, not required libraries. An absent optional
+RPATH/RUNPATH directory, including `/usr/local/lib64`, is accepted only within the
+allowed prefixes after checking every existing ancestor and traversed symlink.
+The audit does not create it. Existing search directories remain subject to the
+strict ownership/traversal audit. Writable ancestry, private/unapproved paths and
+symlink escapes reject, including when the final directory is absent. Failures
+identify the ELF object and search entry. Actual executables and ldd-resolved
+libraries must exist and pass strict protection checks; unresolved required
+libraries remain fatal. Disposable fixtures exercise these distinctions, including
+a real ELF whose required fixture library is removed before its second ldd check.
+
 Both the fixed launcher and the direct-runtime BEAM test use this installation,
 fixed ERTS_BIN/ERL_ROOTDIR and a cleared environment. They run from the protected
 installation directory. CI first proves that the runtime UID can execute the

@@ -2,9 +2,12 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path('/opt/store-membership-writer-ci')
 RUNTIME = 'model_b_runtime_os'
@@ -47,6 +50,126 @@ def protected_path(path):
     return resolved
 
 
+def protected_search_directory(path):
+    """Allow missing search candidates, checking every traversed real ancestor.
+
+    Walk links explicitly: resolving only the final destination would conceal a
+    writable or unapproved intermediate directory in a chain of symlinks.
+    Required executable/library paths still use strict protected_path instead.
+    """
+    roots = (TOOLCHAIN, Path('/usr'), Path('/lib'))
+    budget = [40]
+
+    def allowed(candidate, ancestor=False):
+        return any(candidate.is_relative_to(root) or
+                   (ancestor and root.is_relative_to(candidate)) for root in roots)
+
+    def walk(candidate):
+        if not candidate.is_absolute() or '$' in str(candidate):
+            raise RuntimeError(f'unsupported ELF search path: {candidate}')
+        current = Path('/')
+        for part in candidate.parts[1:]:
+            current = current.parent if part == '..' else current / part
+            if not allowed(current, ancestor=True):
+                raise RuntimeError(f'untrusted ELF search path: {current}')
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                continue
+            if info.st_uid != 0:
+                raise RuntimeError(f'ELF search path is not root-owned: {current}')
+            if stat.S_ISLNK(info.st_mode):
+                budget[0] -= 1
+                if budget[0] < 0:
+                    raise RuntimeError('ELF search path symlink limit exceeded')
+                target = Path(os.readlink(current))
+                current = walk(target if target.is_absolute() else current.parent / target)
+                if not allowed(current):
+                    raise RuntimeError(f'ELF search symlink escapes allowed prefixes: {current}')
+            elif not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022 or not info.st_mode & 0o001:
+                raise RuntimeError(f'ELF search ancestor is writable or not traversable: {current}')
+        return current
+
+    resolved = walk(path)
+    if not allowed(resolved):
+        raise RuntimeError(f'ELF search path escapes allowed prefixes: {resolved}')
+    # Check / and all actual ancestors as well as the traversed link chain.
+    existing = resolved
+    while not existing.exists():
+        existing = existing.parent
+    protected_path(existing)
+    return protected_path(resolved) if resolved.exists() else resolved
+
+
+def linked_dependencies(target, linked):
+    """Required ldd results never inherit optional-search-directory semantics."""
+    if 'not found' in linked.stdout or (linked.returncode and
+            'not a dynamic executable' not in linked.stdout + linked.stderr and
+            'statically linked' not in linked.stdout + linked.stderr):
+        raise RuntimeError(f'unresolved required ELF dependency: {target}')
+    return {str(protected_path(Path(value)))
+            for value in re.findall(r'(/[^\s()]+)', linked.stdout)}
+
+
+def verify_audit_cases():
+    """Real root-owned disposable fixtures, before exposing the writer process."""
+    def reject(action, label):
+        try:
+            action()
+        except (RuntimeError, FileNotFoundError):
+            print(f'PASS ELF_audit rejected={label}', flush=True)
+        else:
+            raise RuntimeError(f'ELF audit failed to reject {label}')
+
+    optional = Path('/usr/local/lib64')
+    was_absent = not optional.exists()
+    protected_search_directory(optional)
+    if optional.exists() == was_absent:
+        raise RuntimeError('optional search directory was unexpectedly created/removed')
+    print(f'PASS ELF_audit optional_usr_local_lib64 absent={was_absent}', flush=True)
+    with tempfile.TemporaryDirectory(prefix='.audit-', dir=TOOLCHAIN) as directory:
+        fixture = Path(directory)
+        fixture.chmod(0o755)
+        protected_search_directory(fixture)
+        protected_search_directory(fixture / 'absent/child')
+        print('PASS ELF_audit existing_trusted_and_absent_optional_directories', flush=True)
+        writable = fixture / 'writable'
+        writable.mkdir(mode=0o755)
+        writable.chmod(0o777)
+        reject(lambda: protected_search_directory(writable), 'writable_directory')
+        reject(lambda: protected_search_directory(writable / 'absent'), 'absent_under_writable_ancestor')
+        reject(lambda: protected_search_directory(Path('/tmp/untrusted-elf-search')), 'unapproved_prefix')
+        reject(lambda: protected_search_directory(Path('relative/search')), 'relative_search_path')
+        reject(lambda: protected_search_directory(Path('/usr/$UNEXPANDED')), 'unexpanded_search_token')
+        escape = fixture / 'escape'
+        escape.symlink_to('/tmp')
+        reject(lambda: protected_search_directory(escape / 'absent'), 'symlink_escape')
+        redirect = fixture / 'redirect'
+        redirect.symlink_to(writable)
+        reject(lambda: protected_search_directory(redirect / 'absent'), 'writable_symlink_intermediate')
+        reject(lambda: protected_path(fixture / 'missing.so'), 'strict_missing_dependency')
+        # A real ELF first resolves its fixture library, then loses that library.
+        # No program is executed; ldd must report the unresolved DT_NEEDED entry.
+        library = fixture / 'libmodel_b_audit_fixture.so'
+        executable = fixture / 'required-library-probe'
+        subprocess.run(['/usr/bin/cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(library)],
+            input='int model_b_audit_fixture(void) { return 0; }', text=True,
+            capture_output=True, timeout=10, check=True)
+        subprocess.run(['/usr/bin/cc', '-x', 'c', '-', '-L'+str(fixture),
+            '-Wl,-rpath,'+str(fixture), '-lmodel_b_audit_fixture', '-o', str(executable)],
+            input='extern int model_b_audit_fixture(void); int main(void) { return model_b_audit_fixture(); }',
+            text=True, capture_output=True, timeout=10, check=True)
+        linked = subprocess.run(['/usr/bin/ldd', str(executable)],
+                                text=True, capture_output=True, timeout=5, check=False)
+        linked_dependencies(executable, linked)
+        library.unlink()
+        linked = subprocess.run(['/usr/bin/ldd', str(executable)],
+                                text=True, capture_output=True, timeout=5, check=False)
+        if 'libmodel_b_audit_fixture.so => not found' not in linked.stdout:
+            raise RuntimeError('missing-library ELF fixture did not exercise ldd not found')
+        reject(lambda: linked_dependencies(executable, linked), 'actual_ldd_missing_required_library')
+
+
 def install_toolchain(data):
     sources = [(Path(data['elixir_root']), TOOLCHAIN / 'elixir'),
                (Path(data['otp_root']), OTP)]
@@ -74,6 +197,7 @@ def install_toolchain(data):
             if not path.is_symlink():
                 mode = path.stat().st_mode
                 path.chmod(0o555 if path.is_dir() or mode & 0o111 else 0o444)
+    verify_audit_cases()
     count = 0
     dependencies = set()
     for path in TOOLCHAIN.rglob('*'):
@@ -88,21 +212,18 @@ def install_toolchain(data):
         count += 1
         dynamic = subprocess.run(['/usr/bin/readelf', '-d', str(target)],
                                  text=True, capture_output=True, timeout=5, check=True).stdout
-        import re
         for paths in re.findall(r'\((?:RPATH|RUNPATH)\).*\[(.*?)\]', dynamic):
             for value in paths.split(':'):
                 value = value.replace('${ORIGIN}', str(target.parent)).replace('$ORIGIN', str(target.parent))
-                if not value or '$' in value or not Path(value).is_absolute():
-                    raise RuntimeError('unsupported dynamic toolchain search path')
-                protected_path(Path(value))
+                try:
+                    if not value:
+                        raise RuntimeError('empty dynamic search path')
+                    protected_search_directory(Path(value))
+                except (RuntimeError, OSError, ValueError) as error:
+                    raise RuntimeError(f'ELF={target} search_path={value}: {error}') from error
         linked = subprocess.run(['/usr/bin/ldd', str(target)], text=True,
                                 capture_output=True, timeout=5, check=False)
-        if 'not found' in linked.stdout or (linked.returncode and
-                'not a dynamic executable' not in linked.stdout + linked.stderr and
-                'statically linked' not in linked.stdout + linked.stderr):
-            raise RuntimeError(f'unresolved toolchain runtime dependency: {target}')
-        for value in re.findall(r'(/[^\s()]+)', linked.stdout):
-            dependencies.add(str(protected_path(Path(value))))
+        dependencies.update(linked_dependencies(target, linked))
     for command in ('/bin/sh', '/usr/bin/env', '/usr/bin/timeout', '/usr/bin/id',
                     '/usr/bin/dirname', '/usr/bin/basename', '/usr/bin/readlink'):
         protected_path(Path(command))
