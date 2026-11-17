@@ -5,6 +5,7 @@ credential isolation. All provisioning remains inside the job-owned PG18 service
 """
 import json
 import os
+import secrets
 import subprocess
 import time
 
@@ -222,3 +223,35 @@ def verify_allocations(h):
         if maintenance.poll() is None:
             send(maintenance,'ROLLBACK;\\q');maintenance.communicate(timeout=5)
     print('PASS actual_restricted_writer_SQL_COMMIT_and_lock_integration; trusted_evaluator_invocation=NOT_TESTED; process_isolation=NOT_TESTED',flush=True)
+
+
+def verify_fixture_regressions(h):
+    # A trusted CI fixture harness is distinct from every Model B principal.
+    # It owns only disposable test databases and cannot assume the protected owner.
+    role = "model_b_fixture_harness"
+    password = secrets.token_urlsafe(32)
+    h.PASSWORDS[role] = password
+    h.sql(h.ADMIN, f"""
+      CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEROLE CREATEDB NOREPLICATION NOBYPASSRLS PASSWORD '{password}';
+      CREATE DATABASE model_b_fixture_tests OWNER {role};
+      REVOKE ALL ON DATABASE model_b_fixture_tests FROM PUBLIC;
+    """)
+    env = os.environ.copy()
+    env.update(PGUSER=role, PGPASSWORD=password, PGDATABASE="model_b_fixture_tests",
+        STORE_TEST_DATABASE_USERNAME=role, STORE_TEST_DATABASE_PASSWORD=password,
+        STORE_TEST_DATABASE_NAME="model_b_fixture_tests", STORE_TEST_DATABASE_HOST="127.0.0.1",
+        STORE_TEST_DATABASE_PORT="55433")
+    commands = [
+        ["mix", "run", "--no-start", "scripts/ci/model_b_migrate.exs"],
+        ["mix", "run", "-e", 'Mix.Tasks.Test.run(["test/store/orders/membership_allocation_sql_test.exs", "test/store/orders/membership_allocation_commit_test.exs", "--include", "real_connections"])'],
+    ]
+    for command in commands:
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=180, check=False)
+        output = result.stdout + result.stderr
+        for secret in list(h.PASSWORDS.values()) + [h.ADMIN_PASSWORD]:
+            if secret:
+                output = output.replace(secret, "[REDACTED]")
+        print(output, flush=True)
+        if result.returncode:
+            raise RuntimeError("non-superuser disposable fixture regression gate failed")
+    print("PASS existing_SQL_COMMIT_lifecycle_and_blank_region_suite_under_non_superuser_fixture_harness", flush=True)

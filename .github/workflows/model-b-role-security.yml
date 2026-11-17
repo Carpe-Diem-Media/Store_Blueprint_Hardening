@@ -85,13 +85,3 @@ jobs:
           PGPASSWORD: postgres
           MODEL_B_CI_DISPOSABLE: "true"
         run: python3 scripts/ci/model_b_role_security.py
-      - name: Existing SQL and COMMIT regressions in disposable fixture databases
-        env:
-          STORE_TEST_DATABASE_USERNAME: postgres
-          STORE_TEST_DATABASE_PASSWORD: postgres
-          STORE_TEST_DATABASE_NAME: model_b_role_proof
-          STORE_TEST_DATABASE_HOST: 127.0.0.1
-          STORE_TEST_DATABASE_PORT: 55433
-        run: >-
-          mix run -e 'Mix.Tasks.Test.run(["test/store/orders/membership_allocation_sql_test.exs",
-          "test/store/orders/membership_allocation_commit_test.exs", "--include", "real_connections"])'
