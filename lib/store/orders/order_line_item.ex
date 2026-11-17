@@ -66,6 +66,11 @@ defmodule Store.Orders.OrderLineItem do
       public?(true)
     end
 
+    attribute :membership_occurrence_key_snapshot, Ash.Type.UUIDv7 do
+      allow_nil?(true)
+      public?(true)
+    end
+
     attribute :subscription_plan_id_snapshot, :uuid do
       allow_nil?(true)
       public?(true)
@@ -147,6 +152,13 @@ defmodule Store.Orders.OrderLineItem do
       public?(true)
       attribute_writable?(true)
     end
+
+    belongs_to :membership_offer_revision_snapshot, Store.Pricing.MembershipOfferRevision do
+      source_attribute(:membership_offer_revision_id_snapshot)
+      allow_nil?(true)
+      public?(true)
+      attribute_writable?(true)
+    end
   end
 
   identities do
@@ -217,10 +229,25 @@ defmodule Store.Orders.OrderLineItem do
 
     references do
       reference(:subscription_plan_revision_snapshot, on_delete: :restrict)
+      reference(:membership_offer_revision_snapshot, on_delete: :restrict)
+    end
+
+    check_constraints do
+      check_constraint(
+        :membership_occurrence_key_snapshot,
+        "order_line_items_membership_evidence_check",
+        check:
+          "(membership_offer_revision_id_snapshot IS NULL AND membership_occurrence_key_snapshot IS NULL) OR (membership_offer_revision_id_snapshot IS NOT NULL AND membership_occurrence_key_snapshot IS NOT NULL AND quantity = 1 AND substring(membership_occurrence_key_snapshot::text FROM 15 FOR 1) = '7' AND substring(membership_occurrence_key_snapshot::text FROM 20 FOR 1) IN ('8','9','a','b'))"
+      )
     end
 
     custom_indexes do
       index([:order_id], name: "order_line_items_order_id_index")
+
+      index([:order_id, :membership_occurrence_key_snapshot],
+        name: "order_line_items_membership_occurrence_index"
+      )
+
       index([:tax_rate_id_snapshot], name: "order_line_items_tax_rate_id_snapshot_index")
       index([:variant_id_snapshot], name: "order_line_items_variant_id_snapshot_index")
 

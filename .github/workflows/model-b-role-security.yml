@@ -9,7 +9,10 @@ on:
       - jc-274-2j-commerce-component-allocations
     paths:
       - .github/workflows/model-b-role-security.yml
-      - scripts/ci/model_b_role_security.py
+      - scripts/ci/model_b*.py
+      - scripts/ci/model_b*.exs
+      - priv/repo/migrations/**
+      - test/store/orders/membership_allocation*.exs
 
 permissions:
   contents: read
@@ -18,7 +21,7 @@ jobs:
   role_security:
     name: model_b_role_security
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:18
@@ -33,8 +36,38 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 56380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      MIX_ENV: test
     steps:
       - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        id: setup-beam
+        with:
+          version-file: .tool-versions
+          version-type: strict
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.mix
+          key: ${{ runner.os }}-model-b-${{ steps.setup-beam.outputs.otp-version }}-${{ steps.setup-beam.outputs.elixir-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-beam-static-${{ steps.setup-beam.outputs.otp-version }}-${{ steps.setup-beam.outputs.elixir-version }}-
+      - name: Fetch build dependencies
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
       - name: Ensure PostgreSQL client
         shell: bash
         run: |
@@ -52,3 +85,13 @@ jobs:
           PGPASSWORD: postgres
           MODEL_B_CI_DISPOSABLE: "true"
         run: python3 scripts/ci/model_b_role_security.py
+      - name: Existing SQL and COMMIT regressions in disposable fixture databases
+        env:
+          STORE_TEST_DATABASE_USERNAME: postgres
+          STORE_TEST_DATABASE_PASSWORD: postgres
+          STORE_TEST_DATABASE_NAME: model_b_role_proof
+          STORE_TEST_DATABASE_HOST: 127.0.0.1
+          STORE_TEST_DATABASE_PORT: 55433
+        run: >-
+          mix run -e 'Mix.Tasks.Test.run(["test/store/orders/membership_allocation_sql_test.exs",
+          "test/store/orders/membership_allocation_commit_test.exs", "--include", "real_connections"])'

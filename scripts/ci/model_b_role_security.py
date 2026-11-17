@@ -198,11 +198,13 @@ def main():
     bootstrap()
     migrate()
     verify()
+    from model_b_allocation_lock_security import verify_allocations
+    verify_allocations(sys.modules[__name__])
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as output:
             output.write(f"Model B role capability proof passed {ASSERTIONS} assertions on PostgreSQL 18.\n\n")
-            output.write("Actual restricted logins verified. Financial acceptance, application compatibility and OS credential isolation were not tested.\n")
+            output.write("Actual restricted logins verified. Restricted-writer SQL COMMIT and lock integration tested; trusted evaluator invocation, complete application compatibility and OS credential isolation remain unverified.\n")
 
 
 if __name__ == "__main__":
