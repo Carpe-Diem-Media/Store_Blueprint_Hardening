@@ -5,7 +5,7 @@ defmodule Store.Repo.Migrations.Jc274AllocationTriggerCorrection do
   def up do
     execute """
     CREATE OR REPLACE FUNCTION public.membership_allocation_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
-    DECLARE destination_order uuid;
+    DECLARE destination_order uuid; revision uuid;
     BEGIN
       IF TG_TABLE_NAME = 'order_line_component_allocation_sets' THEN
         PERFORM public.membership_allocation_lock_orders(ARRAY[OLD.order_id], OLD.offer_revision_id);
@@ -27,7 +27,10 @@ defmodule Store.Repo.Migrations.Jc274AllocationTriggerCorrection do
       ELSE
         destination_order := OLD.order_id;
         IF TG_OP = 'UPDATE' THEN destination_order := NEW.order_id; END IF;
-        PERFORM public.membership_allocation_lock_orders(ARRAY[OLD.order_id, destination_order]);
+        IF TG_TABLE_NAME = 'order_line_items' THEN
+          revision := OLD.membership_offer_revision_id_snapshot;
+        END IF;
+        PERFORM public.membership_allocation_lock_orders(ARRAY[OLD.order_id, destination_order], revision);
         IF EXISTS (SELECT 1 FROM public.order_line_component_allocation_sets WHERE order_id IN (OLD.order_id, destination_order)) THEN
           RAISE EXCEPTION 'accepted order content is immutable' USING ERRCODE = 'check_violation';
         END IF;

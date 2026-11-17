@@ -3,11 +3,15 @@ defmodule Store.Repo.Migrations.Jc274MembershipLockHelpers do
 
   def up do
     execute """
-    CREATE FUNCTION public.lock_membership_acceptance_sources(p_order_id uuid, p_offer_revision_id uuid)
+    CREATE FUNCTION public.lock_membership_acceptance_manifest(p_order_id uuid, p_offer_revision_ids uuid[])
     RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+    DECLARE n integer; locked integer;
     BEGIN
-      IF p_order_id IS NULL OR p_offer_revision_id IS NULL THEN
-        RAISE EXCEPTION 'exact order and offer required for acceptance locks' USING ERRCODE = 'check_violation';
+      n := cardinality(p_offer_revision_ids);
+      IF p_order_id IS NULL OR n IS NULL OR n NOT BETWEEN 1 AND 16 OR
+         array_position(p_offer_revision_ids, NULL) IS NOT NULL OR
+         n <> (SELECT count(DISTINCT id) FROM unnest(p_offer_revision_ids) id) THEN
+        RAISE EXCEPTION 'exact bounded order and offers required for acceptance locks' USING ERRCODE = 'check_violation';
       END IF;
       PERFORM set_config('lock_timeout', '1s', true);
       PERFORM set_config('statement_timeout', '5s', true);
@@ -17,15 +21,29 @@ defmodule Store.Repo.Migrations.Jc274MembershipLockHelpers do
       LOCK TABLE public.promotions IN SHARE MODE;
       LOCK TABLE public.coupons IN SHARE MODE;
       PERFORM 1 FROM public.membership_offer_revisions
-        WHERE id = p_offer_revision_id AND status = 'accepted' FOR UPDATE;
-      IF NOT FOUND THEN
+        WHERE id = ANY(p_offer_revision_ids) AND status = 'accepted' ORDER BY id FOR UPDATE;
+      GET DIAGNOSTICS locked = ROW_COUNT;
+      IF locked <> n THEN
         RAISE EXCEPTION 'accepted offer missing for acceptance locks' USING ERRCODE = 'check_violation';
       END IF;
       PERFORM 1 FROM public.orders WHERE id = p_order_id FOR UPDATE;
       IF NOT FOUND THEN
         RAISE EXCEPTION 'order missing for acceptance locks' USING ERRCODE = 'check_violation';
       END IF;
-      PERFORM 1 FROM public.order_line_items WHERE order_id = p_order_id AND membership_offer_revision_id_snapshot = p_offer_revision_id ORDER BY id FOR UPDATE;
+      PERFORM 1 FROM public.order_line_items WHERE order_id = p_order_id AND membership_offer_revision_id_snapshot = ANY(p_offer_revision_ids) ORDER BY id FOR UPDATE;
+    END $$
+    """
+
+    execute "REVOKE ALL ON FUNCTION public.lock_membership_acceptance_manifest(uuid, uuid[]) FROM PUBLIC"
+
+    # A transaction accepting multiple occurrences prelocks its complete bounded
+    # revision manifest through the manifest helper before constructing any line.
+    # Later exact-revision trigger calls reacquire locks already held by that tx.
+    execute """
+    CREATE FUNCTION public.lock_membership_acceptance_sources(p_order_id uuid, p_offer_revision_id uuid)
+    RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+    BEGIN
+      PERFORM public.lock_membership_acceptance_manifest(p_order_id, ARRAY[p_offer_revision_id]);
     END $$
     """
 
@@ -48,6 +66,9 @@ defmodule Store.Repo.Migrations.Jc274MembershipLockHelpers do
       END IF;
       revision := p_revision;
       IF revision IS NULL THEN
+        -- Only unscoped legacy/adjustment routing reaches this branch. An
+        -- adjustment has no occurrence FK, so multiple possible revisions must
+        -- reject; component children always supply their set's exact revision.
         SELECT count(DISTINCT id), (array_agg(DISTINCT id ORDER BY id))[1] INTO n, revision FROM (
           SELECT offer_revision_id AS id FROM public.order_line_component_allocation_sets WHERE order_id = oid
           UNION
@@ -76,5 +97,6 @@ defmodule Store.Repo.Migrations.Jc274MembershipLockHelpers do
 
     execute "DROP FUNCTION public.membership_allocation_lock_orders(uuid[], uuid)"
     execute "DROP FUNCTION public.lock_membership_acceptance_sources(uuid, uuid)"
+    execute "DROP FUNCTION public.lock_membership_acceptance_manifest(uuid, uuid[])"
   end
 end

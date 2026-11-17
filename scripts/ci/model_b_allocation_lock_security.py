@@ -52,6 +52,7 @@ def verify_allocations(h):
         ON public.order_line_component_allocations TO {h.WRITER};
       GRANT SELECT, UPDATE(code,rate_basis_points,active) ON public.tax_rates TO {h.MAINTAINER};
       GRANT EXECUTE ON FUNCTION public.lock_membership_acceptance_sources(uuid,uuid) TO {h.WRITER};
+      GRANT EXECUTE ON FUNCTION public.lock_membership_acceptance_manifest(uuid,uuid[]) TO {h.WRITER};
       DO $$ DECLARE p record; BEGIN
         FOR p IN SELECT oid::regprocedure AS signature FROM pg_catalog.pg_proc
           WHERE pronamespace='public'::regnamespace AND proname LIKE 'membership_allocation_%'
@@ -113,7 +114,7 @@ def verify_allocations(h):
           SAVEPOINT child;
           INSERT INTO public.order_line_component_allocations(id,allocation_set_id,order_line_item_id,offer_component_id,
             component_instance_id,evaluation_line_id,gross_minor,discount_minor,net_minor,tax_minor)
-          VALUES(public.uuid_generate_v7(),'{f['set']}','{f['line']}','{f['component']}',
+          VALUES(public.uuid_generate_v7(),'{f['set']}','{f.get('row_line',f['line'])}','{f.get('row_component',f['component'])}',
             '{f['instance']}','{f['evaluation']}',100,0,100,{f['tax']});
           RELEASE SAVEPOINT child;
         """ + (f"UPDATE public.order_line_component_allocation_sets SET accepted_at=now() WHERE id='{f['set']}';" if accept else "")
@@ -134,6 +135,7 @@ def verify_allocations(h):
     f = fixture()
     for role in (h.RUNTIME, h.MAINTAINER):
         h.deny(role, f"SELECT public.lock_membership_acceptance_sources('{f['order']}','{f['revision']}');", "actual_acceptance_helper")
+        h.deny(role, f"SELECT public.lock_membership_acceptance_manifest('{f['order']}',ARRAY['{f['revision']}'::uuid]);", "bounded_manifest_helper")
     for table in ('orders','tax_rates'):
         h.equal(h.WRITER, f"SELECT NOT has_any_column_privilege(current_user,'public.{table}','UPDATE');", 't', f"no_{table}_update_columns")
         h.deny(h.WRITER, f"SELECT * FROM public.{table} FOR UPDATE;", f"direct_{table}_update_lock")
@@ -142,6 +144,7 @@ def verify_allocations(h):
     h.deny(h.WRITER, "UPDATE public.tax_rates SET rate_basis_points=0;", 'actual_source_update')
     h.equal(h.WRITER, f"SELECT pg_get_userbyid(proowner)='{h.OWNER}' AND prosecdef AND proconfig @> ARRAY['search_path=pg_catalog, pg_temp'] FROM pg_proc WHERE oid='public.lock_membership_acceptance_sources(uuid,uuid)'::regprocedure;", 't', 'fixed_helper_owner_and_path')
     h.equal(h.WRITER, "SELECT bool_and(NOT prosecdef) FROM pg_proc WHERE pronamespace='public'::regnamespace AND proname LIKE 'membership_allocation_%';", 't', 'integrity_guards_remain_invokers')
+    h.equal(h.WRITER, f"SELECT pg_get_userbyid(proowner)='{h.OWNER}' AND prosecdef AND proconfig @> ARRAY['search_path=pg_catalog, pg_temp'] FROM pg_proc WHERE oid='public.lock_membership_acceptance_manifest(uuid,uuid[])'::regprocedure;", 't', 'bounded_helper_owner_and_path')
     for bps in (0,1500):
         f=fixture(bps)
         h.equal(h.WRITER, 'BEGIN;'+construction(f)+f"COMMIT; SELECT count(*) FROM public.order_line_component_allocation_sets WHERE id='{f['set']}' AND accepted_at IS NOT NULL;", '1', f'actual_writer_complete_COMMIT_bps_{bps}')
@@ -158,8 +161,18 @@ def verify_allocations(h):
     first, second = fixture(), fixture(1500)
     second.update(order=first['order'], line_no=2)
     owner(f"UPDATE public.orders SET items_subtotal_minor=200,grand_total_minor=215,tax_total_minor=15 WHERE id='{first['order']}';")
-    multi_sql = 'BEGIN;' + construction(first,accept=False) + construction(second,accept=False)
-    multi_sql += f"UPDATE public.order_line_component_allocation_sets SET accepted_at=now() WHERE id IN ('{first['set']}','{second['set']}'); COMMIT;"
+    def prelock(a,b,reverse=False):
+        revisions=[a['revision'],b['revision']]
+        if reverse: revisions.reverse()
+        return f"SELECT public.lock_membership_acceptance_manifest('{a['order']}',ARRAY[" + ','.join(f"'{revision}'::uuid" for revision in revisions) + ']);'
+
+    def accept_both(a,b):
+        # One statement transitions both complete sets before AFTER-row checks
+        # validate the Order. No constructing set is committed or guard relaxed.
+        return f"UPDATE public.order_line_component_allocation_sets SET accepted_at=now() WHERE id IN ('{a['set']}','{b['set']}');"
+
+    multi_sql = 'BEGIN;' + prelock(first,second) + construction(first,accept=False) + construction(second,accept=False)
+    multi_sql += accept_both(first,second) + 'COMMIT;'
     multi_result = subprocess.run(['psql','-XqAt','-v','ON_ERROR_STOP=1'],
         input=multi_sql,text=True,capture_output=True,env=connection_env(h.WRITER),timeout=20)
     if multi_result.returncode:
@@ -168,6 +181,28 @@ def verify_allocations(h):
             raise RuntimeError('two-occurrence child INSERT rejected: exact offer required for acceptance locks')
         raise RuntimeError('two-occurrence restricted writer transaction failed')
     h.equal(h.RUNTIME, f"SELECT count(*) FROM public.order_line_component_allocations a JOIN public.order_line_component_allocation_sets s ON s.id=a.allocation_set_id JOIN public.order_line_items l ON l.id=a.order_line_item_id JOIN public.membership_offer_revision_components c ON c.id=a.offer_component_id WHERE s.order_id='{first['order']}' AND s.accepted_at IS NOT NULL AND s.offer_revision_id=l.membership_offer_revision_id_snapshot AND s.offer_revision_id=c.revision_id AND s.occurrence_key=l.membership_occurrence_key_snapshot;", '2', 'two_occurrences_bind_exact_distinct_revisions')
+
+    def pair():
+        a,b=fixture(),fixture(1500)
+        b.update(order=a['order'],line_no=2)
+        owner(f"UPDATE public.orders SET items_subtotal_minor=200,grand_total_minor=215,tax_total_minor=15 WHERE id='{a['order']}';")
+        return a,b
+
+    def adjustment(f):
+        return f"INSERT INTO public.order_adjustments(id,order_id,sequence_no,currency,kind,amount_minor,inserted_at,updated_at) VALUES(public.uuid_generate_v7(),'{f['order']}',1,'USD','discount',0,now(),now());"
+
+    f=fixture()
+    h.equal(h.WRITER,'BEGIN;'+construction(f,accept=False)+adjustment(f)+f"UPDATE public.order_line_component_allocation_sets SET accepted_at=now() WHERE id='{f['set']}'; COMMIT;SELECT count(*) FROM public.order_adjustments WHERE order_id='{f['order']}';",'1','single_revision_adjustment_lock_route')
+    a,b=pair()
+    rejection('BEGIN;'+prelock(a,b)+construction(a,accept=False)+construction(b,accept=False)+adjustment(a)+accept_both(a,b)+'COMMIT;','ambiguous_adjustment_revision')
+    h.equal(h.RUNTIME,f"SELECT count(*) FROM public.order_line_component_allocations a JOIN public.order_line_component_allocation_sets s ON s.id=a.allocation_set_id WHERE s.order_id='{a['order']}';",'0','ambiguous_adjustment_rolls_back_both_occurrences')
+    for key in ('row_line','row_component'):
+        a,b=pair()
+        b[key]=a['line' if key=='row_line' else 'component']
+        rejection('BEGIN;'+prelock(a,b)+construction(a,accept=False)+construction(b,accept=False)+accept_both(a,b)+'COMMIT;',f'cross_occurrence_{key}')
+        h.equal(h.RUNTIME,f"SELECT count(*) FROM public.order_line_items WHERE order_id='{a['order']}';",'0',f'rollback_cross_occurrence_{key}')
+    for invalid in ("ARRAY[]::uuid[]",f"ARRAY['{first['revision']}'::uuid,'{first['revision']}'::uuid]", "array_fill(NULL::uuid,ARRAY[17])"):
+        rejection(f"BEGIN;SELECT public.lock_membership_acceptance_manifest('{first['order']}',{invalid}); COMMIT;",'invalid_bounded_revision_manifest')
 
     def live(role):
         p = subprocess.Popen(['psql','-XqAt','-v','ON_ERROR_STOP=1','-v','VERBOSITY=sqlstate'],
@@ -185,6 +220,35 @@ def verify_allocations(h):
             if line==expected:return
             if p.poll() is not None:break
         raise RuntimeError('restricted connection synchronization failed')
+
+    # Competing writers supply reversed manifests. The helper locks offer rows
+    # in binary UUID order before the Order; the losing writer cannot append to
+    # accepted evidence after the producer commits.
+    a,b=pair()
+    producer,contender=live(h.WRITER),live(h.WRITER)
+    try:
+        send(producer,'BEGIN;'+prelock(a,b)+construction(a,accept=False)+construction(b,accept=False)+"SELECT 'READY';")
+        wait_line(producer,'READY')
+        send(contender,'SELECT pg_backend_pid();')
+        pid=contender.stdout.readline().strip()
+        if not pid.isdigit():raise RuntimeError('missing competing writer backend identity')
+        send(contender,'BEGIN;'+prelock(a,b,reverse=True)+construction(a,accept=False)+construction(b,accept=False)+accept_both(a,b)+'COMMIT;')
+        deadline=time.monotonic()+2
+        while time.monotonic()<deadline:
+            if h.sql(h.RUNTIME,f'SELECT cardinality(pg_blocking_pids({pid}))>0;')=='t':break
+            time.sleep(.02)
+        else:raise RuntimeError('competing writer did not exhibit a lock wait')
+        print('PASS competing_writer_reversed_manifest_observable_lock_wait',flush=True)
+        send(producer,accept_both(a,b)+"COMMIT; SELECT 'COMMITTED';")
+        wait_line(producer,'COMMITTED')
+        _,error=contender.communicate(timeout=5)
+        if contender.returncode==0 or '23514' not in error:
+            raise RuntimeError('competing writer bypassed accepted Order immutability')
+        h.equal(h.RUNTIME,f"SELECT count(*) FROM public.order_line_component_allocations a JOIN public.order_line_component_allocation_sets s ON s.id=a.allocation_set_id WHERE s.order_id='{a['order']}' AND s.accepted_at IS NOT NULL;",'2','competing_writer_preserves_two_immutable_allocations')
+    finally:
+        for process in (producer,contender):
+            if process.poll() is None:
+                process.kill();process.communicate(timeout=5)
 
     f=fixture()
     holder=live(h.WRITER)
