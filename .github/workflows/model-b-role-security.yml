@@ -1,0 +1,54 @@
+name: Model B role security
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      # Temporary capability-proof trigger. Remove this branch before PR review.
+      - jc-274-2j-commerce-component-allocations
+    paths:
+      - .github/workflows/model-b-role-security.yml
+      - scripts/ci/model_b_role_security.py
+
+permissions:
+  contents: read
+
+jobs:
+  role_security:
+    name: model_b_role_security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:18
+        ports:
+          - 55433:5432
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: model_b_role_proof
+        options: >-
+          --health-cmd "pg_isready -U postgres -d model_b_role_proof"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure PostgreSQL client
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+      - name: Verify disposable Model B roles under their actual logins
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 55433
+          PGDATABASE: model_b_role_proof
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          MODEL_B_CI_DISPOSABLE: "true"
+        run: python3 scripts/ci/model_b_role_security.py
