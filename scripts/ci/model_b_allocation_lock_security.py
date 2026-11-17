@@ -104,7 +104,7 @@ def verify_allocations(h):
             sku_snapshot,product_title_snapshot,discount_allocated_minor,net_line_total_minor,tax_category_snapshot,
             tax_rate_id_snapshot,tax_rate_code_snapshot,tax_rate_bps_snapshot,tax_minor,
             membership_offer_revision_id_snapshot,membership_occurrence_key_snapshot,inserted_at,updated_at)
-          VALUES('{f['line']}','{f['order']}',1,'USD',1,100,100,'CI','Membership',0,100,'STANDARD',
+          VALUES('{f['line']}','{f['order']}',{f.get('line_no',1)},'USD',1,100,100,'CI','Membership',0,100,'STANDARD',
             '{f['rate']}','R{f['rate']}',{f['bps']},{f['tax']},'{f['revision']}','{f['occurrence']}',now(),now());
           INSERT INTO public.order_line_component_allocation_sets(id,order_id,offer_revision_id,occurrence_key,
             target_fingerprint,allocation_fingerprint,pricing_fingerprint,allocation_rule_version,currency,tax_context,accepted_at)
@@ -153,6 +153,21 @@ def verify_allocations(h):
     rejection('BEGIN;'+construction(f)+'COMMIT;','blank_rate_region_with_NULL_destination')
     owner(f"UPDATE public.orders SET shipping_region_code='' WHERE id='{f['order']}';")
     h.equal(h.WRITER,'BEGIN;'+construction(f)+f"COMMIT; SELECT count(*) FROM public.order_line_component_allocation_sets WHERE id='{f['set']}';",'1','blank_region_matches_blank_destination')
+
+    # Frozen 2H scopes sets by (Order, occurrence), not by Order alone.
+    first, second = fixture(), fixture(1500)
+    second.update(order=first['order'], line_no=2)
+    owner(f"UPDATE public.orders SET items_subtotal_minor=200,grand_total_minor=215,tax_total_minor=15 WHERE id='{first['order']}';")
+    multi_sql = 'BEGIN;' + construction(first,accept=False) + construction(second,accept=False)
+    multi_sql += f"UPDATE public.order_line_component_allocation_sets SET accepted_at=now() WHERE id IN ('{first['set']}','{second['set']}'); COMMIT;"
+    multi_result = subprocess.run(['psql','-XqAt','-v','ON_ERROR_STOP=1'],
+        input=multi_sql,text=True,capture_output=True,env=connection_env(h.WRITER),timeout=20)
+    if multi_result.returncode:
+        if 'exact offer required for acceptance locks' in multi_result.stderr:
+            print('RED restricted_writer_two_occurrences: NULL revision inference inspected unrelated Order occurrences',flush=True)
+            raise RuntimeError('two-occurrence child INSERT rejected: exact offer required for acceptance locks')
+        raise RuntimeError('two-occurrence restricted writer transaction failed')
+    h.equal(h.RUNTIME, f"SELECT count(*) FROM public.order_line_component_allocations a JOIN public.order_line_component_allocation_sets s ON s.id=a.allocation_set_id JOIN public.order_line_items l ON l.id=a.order_line_item_id JOIN public.membership_offer_revision_components c ON c.id=a.offer_component_id WHERE s.order_id='{first['order']}' AND s.accepted_at IS NOT NULL AND s.offer_revision_id=l.membership_offer_revision_id_snapshot AND s.offer_revision_id=c.revision_id AND s.occurrence_key=l.membership_occurrence_key_snapshot;", '2', 'two_occurrences_bind_exact_distinct_revisions')
 
     def live(role):
         p = subprocess.Popen(['psql','-XqAt','-v','ON_ERROR_STOP=1','-v','VERBOSITY=sqlstate'],
