@@ -1,5 +1,6 @@
 """Job-local OS and fixed-command proof. Never provisions workstation identities."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -173,11 +174,85 @@ def verify_audit_cases():
         reject(lambda: linked_dependencies(executable, linked), 'actual_ldd_missing_required_library')
 
 
+def exclude_optional_test_engine(source, copied):
+    """OTP-28.3 Makefile makes this test engine optional, unlike crypto.so.
+
+    crypto:on_load loads crypto.so. engine_SUITE explicitly loads the test
+    engine; the fixed writer/Postgrex SCRAM path never requests an engine.
+    """
+    relative = Path('lib/crypto-5.8/priv/lib/otp_test_engine.so')
+    engine = copied / relative
+    if (list(copied.rglob('otp_test_engine.so')) != [engine]
+            or engine.is_symlink() or not engine.is_file()
+            or (source / relative).is_symlink()):
+        raise RuntimeError('expected exactly one pinned optional OTP test engine')
+
+    def inventory(root):
+        return {p.relative_to(root): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in root.rglob('*') if p.is_file() and not p.is_symlink()}
+
+    before = inventory(copied)
+    original = hashlib.sha256((source / relative).read_bytes()).hexdigest()
+    nif = relative.with_name('crypto.so')
+    if nif not in before or before[relative] != original:
+        raise RuntimeError('required crypto NIF missing or test engine copy differs')
+    # Examine every ELF before pruning. No required object may depend on the
+    # omitted engine, even if a future pinned installation changes its linkage.
+    for path in copied.rglob('*'):
+        if not path.is_file() or path.is_symlink():
+            continue
+        with path.open('rb') as file:
+            if file.read(4) != b'\x7fELF':
+                continue
+        dynamic = subprocess.run(['/usr/bin/readelf', '-d', str(path)],
+                                 text=True, capture_output=True, timeout=5, check=True).stdout
+        if path == engine:
+            print(f'optional_engine ELF={path}\n{dynamic}', flush=True)
+        elif any('otp_test_engine' in needed for needed in
+                 re.findall(r'\(NEEDED\).*\[(.*?)\]', dynamic)):
+            raise RuntimeError(f'required ELF references optional test engine: {path}')
+    engine.unlink()
+    after = inventory(copied)
+    if (set(before) - set(after) != {relative}
+            or after != {p: digest for p, digest in before.items() if p != relative}
+            or hashlib.sha256((source / relative).read_bytes()).hexdigest() != original):
+        raise RuntimeError('optional engine exclusion changed another file or source')
+    print(f'PASS excluded_exactly_one_optional_engine={relative} '
+          f'source_unchanged=True remaining_files_unchanged={len(after)} required_crypto_NIF_preserved=True',
+          flush=True)
+
+
+def verify_required_crypto_nif():
+    """A real unprivileged BEAM must fail when its required NIF is absent."""
+    nif = OTP / 'lib/crypto-5.8/priv/lib/crypto.so'
+    saved = nif.with_suffix('.so.negative-control')
+    digest = hashlib.sha256(nif.read_bytes()).hexdigest()
+    nif.rename(saved)
+    try:
+        result = subprocess.run(['sudo', '-n', '-u', RUNTIME, '--',
+            '/usr/bin/env', '-i', 'HOME=/nonexistent', 'PATH=/usr/bin:/bin',
+            'ERTS_BIN='+str(OTP / 'bin')+'/', 'ERL_ROOTDIR='+str(OTP),
+            str(ELIXIR), '--erl', '+S 2:2', '-e',
+            'true = :code.priv_dir(:crypto) == ~c"'+str(nif.parent.parent)+'"; '
+            'false = File.exists?("'+str(nif)+'"); '
+            'try do :crypto.hash(:sha256, "abc"); System.halt(1) '
+            'rescue UndefinedFunctionError -> IO.puts("REQUIRED_CRYPTO_NIF_DENIED") end'],
+            text=True, capture_output=True, timeout=15)
+        if result.returncode != 0 or 'REQUIRED_CRYPTO_NIF_DENIED' not in result.stdout.splitlines():
+            raise RuntimeError('missing required crypto NIF did not produce expected failure')
+    finally:
+        saved.rename(nif)
+    if hashlib.sha256(protected_path(nif).read_bytes()).hexdigest() != digest:
+        raise RuntimeError('required crypto NIF was not restored unchanged')
+    print('PASS actual_unprivileged_BEAM_missing_required_crypto_NIF_denied restored_unchanged=True', flush=True)
+
+
 def install_toolchain(data):
     sources = [(Path(data['elixir_root']), TOOLCHAIN / 'elixir'),
                (Path(data['otp_root']), OTP)]
     for source, destination in sources:
         shutil.copytree(source, destination, symlinks=True)
+    exclude_optional_test_engine(Path(data['otp_root']), OTP)
     # Preserve only links within the copied installation closure. Rewrite
     # absolute source-prefix links as relative links to the protected copy.
     for _, destination in sources:
@@ -235,6 +310,7 @@ def install_toolchain(data):
     subprocess.run(['/usr/bin/namei', '-l', str(ELIXIR)], check=True)
     subprocess.run(['/usr/bin/readlink', '-f', str(ELIXIR)], check=True)
     subprocess.run(['/usr/bin/stat', '-c', '%U:%G %a %n', str(ELIXIR), str(OTP / 'bin/erl')], check=True)
+    verify_required_crypto_nif()
 
 
 def install():
@@ -344,6 +420,13 @@ def verify_writer_boundary(h):
         label='installed_BEAM_executes')
     if version.stdout.splitlines() != [toolchain['elixir_version'], str(OTP), toolchain['otp_major']]:
         raise RuntimeError('relocated toolchain version/root mismatch')
+    crypto = run(RUNTIME, beam + ['-e',
+        'true = Base.encode16(:crypto.hash(:sha256, "abc"), case: :lower) == '
+        '"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"; '
+        '32 = byte_size(:crypto.strong_rand_bytes(32)); IO.puts("CRYPTO_HASH_RANDOM_OK")'],
+        label='installed_crypto_hash_and_random')
+    if crypto.stdout.splitlines() != ['CRYPTO_HASH_RANDOM_OK']:
+        raise RuntimeError('relocated crypto smoke markers missing')
     for identity in (RUNTIME, OPERATOR, WRITER):
         writable = run(identity, ['/usr/bin/find', str(TOOLCHAIN), '-writable', '-print', '-quit'])
         if writable.stdout:

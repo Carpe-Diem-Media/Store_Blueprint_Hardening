@@ -71,6 +71,28 @@ libraries must exist and pass strict protection checks; unresolved required
 libraries remain fatal. Disposable fixtures exercise these distinctions, including
 a real ELF whose required fixture library is removed before its second ldd check.
 
+The pinned OTP 28.3 copy omits exactly
+`lib/crypto-5.8/priv/lib/otp_test_engine.so`. Upstream's
+[crypto Makefile](https://github.com/erlang/otp/blob/OTP-28.3/lib/crypto/c_src/Makefile.in)
+builds this optional test engine separately behind `DISABLE_OTP_TEST_ENGINE`.
+The [engine test suite](https://github.com/erlang/otp/blob/OTP-28.3/lib/crypto/test/engine_SUITE.erl)
+explicitly loads engines; normal
+[crypto startup](https://github.com/erlang/otp/blob/OTP-28.3/lib/crypto/src/crypto.erl)
+loads the required `crypto.so` NIF. The fixed Store probe and installed Postgrex
+SCRAM path use hashing, random bytes and HMAC, with no engine-loading calls.
+This omission applies only to this fixed CI probe, not arbitrary crypto workloads.
+
+Before omission, bootstrap requires the exact single regular test-engine file,
+records its ELF dynamic entries and rejects any other ELF's DT_NEEDED reference
+to it. SHA-256 inventories prove that only this copied file was removed, every
+other regular file including crypto NIFs remains unchanged, and the setup-beam
+source engine remains unchanged. `/opt/local/lib64` is neither created nor trusted.
+All remaining files receive the existing complete ownership, symlink, search-path
+and resolved-library audits. An unprivileged BEAM negative control temporarily
+removes only the copied required `crypto.so`, requires the crypto call to fail,
+then restores and verifies its exact bytes before any writer launch. The relocated
+runtime must also produce a known SHA-256 digest and 32 random bytes successfully.
+
 Both the fixed launcher and the direct-runtime BEAM test use this installation,
 fixed ERTS_BIN/ERL_ROOTDIR and a cleared environment. They run from the protected
 installation directory. CI first proves that the runtime UID can execute the
