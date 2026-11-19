@@ -1,0 +1,424 @@
+"""Actual Store schema/trigger integration under the disposable Model B logins.
+
+Fixture source consistency is tested, not trusted evaluator invocation or OS
+credential isolation. All provisioning remains inside the job-owned PG18 service.
+"""
+import json
+import os
+import secrets
+import subprocess
+import time
+
+
+def verify_allocations(h):
+    env = os.environ.copy()
+    env.update(PGUSER=h.MIGRATOR, PGPASSWORD=h.PASSWORDS[h.MIGRATOR], MODEL_B_MIGRATION_STAGE="baseline")
+    migration = subprocess.run(
+        ["mix", "run", "--no-start", "scripts/ci/model_b_migrate.exs"],
+        env=env, capture_output=True, text=True, timeout=600, check=False,
+    )
+    if migration.returncode:
+        diagnostic = migration.stderr + migration.stdout
+        for secret in list(h.PASSWORDS.values()) + [h.ADMIN_PASSWORD]:
+            if secret:
+                diagnostic = diagnostic.replace(secret, "[REDACTED]")
+        print(diagnostic[-6000:], flush=True)
+        raise RuntimeError("actual Store migration failed under isolated migrator")
+    print("PASS actual Store schema migrated under owner by migrator login", flush=True)
+
+    def owner(statement):
+        return h.sql(h.MIGRATOR, f"SET ROLE {h.OWNER};\n" + statement)
+
+    from model_b_runtime_acl_security import legacy_write_cost
+    legacy_write_cost(owner, 'accepted_main')
+    env['MODEL_B_MIGRATION_STAGE'] = 'preflight'
+    staged = subprocess.run(['mix', 'run', '--no-start', 'scripts/ci/model_b_migrate.exs'],
+                            env=env, capture_output=True, text=True, timeout=180, check=False)
+    if staged.returncode:
+        raise RuntimeError('allocation pre-trigger staging failed')
+
+    owner(f"""
+      GRANT USAGE ON SCHEMA public TO {h.RUNTIME}, {h.DIRECT_RUNTIME}, {h.WRITER}, {h.MAINTAINER};
+      GRANT SELECT ON public.orders, public.order_line_items, public.order_adjustments,
+        public.membership_offer_revisions, public.membership_offer_revision_components,
+        public.tax_rates, public.promotions, public.coupons TO {h.RUNTIME}, {h.DIRECT_RUNTIME}, {h.WRITER};
+      GRANT SELECT ON public.order_line_component_allocation_sets, public.order_line_component_allocations TO {h.WRITER};
+      -- Exact frozen Model B v1.1 legacy column lists. No table-level DML.
+      GRANT INSERT(id,state,order_ref,checkout_key,user_id,shipping_rate_id,shipping_rate_code,shipping_quote_hash,shipping_quote_currency_code,shipping_quote_amount_minor,shipping_weight_grams,shipping_method_code,shipping_rule_id,shipping_zone_id,shipping_effective_from,shipping_effective_to,currency_code,items_subtotal_minor,shipping_total_minor,grand_total_minor,totals_finalized_at,shipping_cost_minor_original,shipping_cost_minor_effective,free_shipping_applied,free_shipping_reason,shipping_tax_minor,tax_total_minor,shipping_country_code,shipping_region_code,shipping_postal_code,shipping_recipient_name,shipping_address_line1,shipping_address_line2,shipping_city,shipping_phone,tax_as_of,version,provider_setup_started_at,inserted_at,updated_at), UPDATE(state,shipping_rate_id,shipping_rate_code,shipping_quote_hash,shipping_quote_currency_code,shipping_quote_amount_minor,shipping_weight_grams,shipping_method_code,shipping_rule_id,shipping_zone_id,shipping_effective_from,shipping_effective_to,currency_code,items_subtotal_minor,shipping_total_minor,grand_total_minor,totals_finalized_at,shipping_cost_minor_original,shipping_cost_minor_effective,free_shipping_applied,free_shipping_reason,shipping_tax_minor,tax_total_minor,shipping_country_code,shipping_region_code,shipping_postal_code,shipping_recipient_name,shipping_address_line1,shipping_address_line2,shipping_city,shipping_phone,tax_as_of,version,provider_setup_started_at,updated_at) ON public.orders TO {h.RUNTIME}, {h.DIRECT_RUNTIME};
+      GRANT INSERT(id,order_id,line_no,currency,quantity,unit_price_minor,line_total_minor,sku_snapshot,product_title_snapshot,variant_title_snapshot,variant_id_snapshot,subscription_plan_id_snapshot,subscription_plan_revision_id_snapshot,subscription_plan_key_snapshot,subscription_interval_unit_snapshot,subscription_interval_count_snapshot,discount_allocated_minor,net_line_total_minor,tax_category_snapshot,tax_rate_id_snapshot,tax_rate_code_snapshot,tax_rate_bps_snapshot,tax_minor,inserted_at,updated_at) ON public.order_line_items TO {h.RUNTIME}, {h.DIRECT_RUNTIME};
+      GRANT INSERT(id,order_id,sequence_no,currency,kind,amount_minor,reason,source_kind,source_code,source_id,precedence_rank,inserted_at,updated_at) ON public.order_adjustments TO {h.RUNTIME}, {h.DIRECT_RUNTIME};
+      GRANT INSERT(id,order_id,line_no,currency,quantity,unit_price_minor,line_total_minor,
+        sku_snapshot,product_title_snapshot,discount_allocated_minor,net_line_total_minor,
+        tax_category_snapshot,tax_rate_id_snapshot,tax_rate_code_snapshot,tax_rate_bps_snapshot,
+        tax_minor,membership_offer_revision_id_snapshot,membership_occurrence_key_snapshot,
+        inserted_at,updated_at) ON public.order_line_items TO {h.WRITER};
+      GRANT INSERT(id,order_id,sequence_no,currency,kind,amount_minor,inserted_at,updated_at)
+        ON public.order_adjustments TO {h.WRITER};
+      GRANT INSERT(id,order_id,offer_revision_id,occurrence_key,target_fingerprint,
+        allocation_fingerprint,pricing_fingerprint,allocation_rule_version,currency,tax_context,accepted_at)
+        ON public.order_line_component_allocation_sets TO {h.WRITER};
+      GRANT UPDATE(accepted_at) ON public.order_line_component_allocation_sets TO {h.WRITER};
+      GRANT INSERT(id,allocation_set_id,order_line_item_id,offer_component_id,component_instance_id,
+        evaluation_line_id,gross_minor,discount_minor,net_minor,tax_minor)
+        ON public.order_line_component_allocations TO {h.WRITER};
+      GRANT SELECT, UPDATE(code,rate_basis_points,active) ON public.tax_rates TO {h.MAINTAINER};
+      GRANT EXECUTE ON FUNCTION public.lock_membership_acceptance_sources(uuid,uuid) TO {h.WRITER};
+      GRANT EXECUTE ON FUNCTION public.lock_membership_acceptance_manifest(uuid,uuid[]) TO {h.WRITER};
+      GRANT EXECUTE ON FUNCTION public.membership_allocation_lock_orders(uuid[],uuid),
+        public.membership_allocation_validate_order(uuid) TO {h.WRITER};
+    """)
+
+    from model_b_runtime_acl_security import prepare_contract
+    prepare_contract(h, owner, env)
+    legacy_write_cost(owner, 'allocation_triggers')
+
+    def fixture(bps=0, region=None):
+        f = json.loads(owner("SELECT json_build_object(" + ",".join(
+            f"'{key}',public.uuid_generate_v7()" for key in
+            ("order", "revision", "component", "definition", "line", "set", "occurrence", "rate", "instance", "evaluation")
+        ) + ");"))
+        f.update(bps=bps, tax=(100*bps+5000)//10000)
+        source_region = "NULL" if region is None else "''"
+        owner(f"""
+          BEGIN;
+          INSERT INTO public.orders(id,order_ref,currency_code,totals_finalized_at,shipping_country_code,tax_as_of,
+            items_subtotal_minor,grand_total_minor,tax_total_minor)
+            VALUES('{f['order']}','CI{f['order']}','USD',now(),'US',now(),100,{100+f['tax']},{f['tax']});
+          INSERT INTO public.tax_rates(id,code,country_code,region_code,product_tax_category,rate_basis_points,
+            active,shipping_taxable,precedence_rank,inserted_at,updated_at)
+            VALUES('{f['rate']}','R{f['rate']}','US',{source_region},'STANDARD',{bps},true,true,100,now(),now());
+          INSERT INTO public.membership_offer_revisions(id,offer_key,revision,currency)
+            VALUES('{f['revision']}','CI{f['revision']}',1,'USD');
+          INSERT INTO public.membership_offer_revision_components(id,revision_id,definition_key,gross_minor,
+            discount_eligibility_key,tax_treatment_key)
+            VALUES('{f['component']}','{f['revision']}','{f['definition']}',100,'member','STANDARD');
+          UPDATE public.membership_offer_revisions SET status='accepted',accepted_at=now(),
+            fingerprint=public.membership_offer_revision_manifest_fingerprint(id) WHERE id='{f['revision']}';
+          COMMIT;
+        """)
+        return f
+
+    def construction(f, empty=False, accept=True):
+        context = "'{}'::jsonb" if empty else f"""(
+          SELECT jsonb_build_object('version','membership-tax-v1','tax_enabled',true,
+            'order_id',o.id,'occurrence_key','{f['occurrence']}'::uuid,'currency','USD',
+            'country','US','region',upper(btrim(o.shipping_region_code)),'as_of',o.tax_as_of,
+            'lines',jsonb_build_array(jsonb_build_object('line_id',l.id,'category','STANDARD',
+              'rate_id',r.id,'rate_code',r.code,'rate_bps',r.rate_basis_points,
+              'tax_minor',l.tax_minor,'net_minor',100,'source',to_jsonb(r)-'inserted_at'-'updated_at')))
+          FROM public.orders o JOIN public.order_line_items l ON l.order_id=o.id
+          JOIN public.tax_rates r ON r.id=l.tax_rate_id_snapshot WHERE l.id='{f['line']}'
+        )"""
+        return f"""
+          INSERT INTO public.order_line_items(id,order_id,line_no,currency,quantity,unit_price_minor,line_total_minor,
+            sku_snapshot,product_title_snapshot,discount_allocated_minor,net_line_total_minor,tax_category_snapshot,
+            tax_rate_id_snapshot,tax_rate_code_snapshot,tax_rate_bps_snapshot,tax_minor,
+            membership_offer_revision_id_snapshot,membership_occurrence_key_snapshot,inserted_at,updated_at)
+          VALUES('{f['line']}','{f['order']}',{f.get('line_no',1)},'USD',1,100,100,'CI','Membership',0,100,'STANDARD',
+            '{f['rate']}','R{f['rate']}',{f['bps']},{f['tax']},'{f['revision']}','{f['occurrence']}',now(),now());
+          INSERT INTO public.order_line_component_allocation_sets(id,order_id,offer_revision_id,occurrence_key,
+            target_fingerprint,allocation_fingerprint,pricing_fingerprint,allocation_rule_version,currency,tax_context,accepted_at)
+          VALUES('{f['set']}','{f['order']}','{f['revision']}','{f['occurrence']}',
+            'target','allocation','pricing','v1','USD',{context},NULL);
+          SAVEPOINT child;
+          INSERT INTO public.order_line_component_allocations(id,allocation_set_id,order_line_item_id,offer_component_id,
+            component_instance_id,evaluation_line_id,gross_minor,discount_minor,net_minor,tax_minor)
+          VALUES(public.uuid_generate_v7(),'{f['set']}','{f.get('row_line',f['line'])}','{f.get('row_component',f['component'])}',
+            '{f['instance']}','{f['evaluation']}',100,0,100,{f['tax']});
+          RELEASE SAVEPOINT child;
+        """ + (f"UPDATE public.order_line_component_allocation_sets SET accepted_at=now() WHERE id='{f['set']}';" if accept else "")
+
+    def connection_env(role):
+        result = {k:v for k,v in os.environ.items() if not k.startswith('PG')}
+        result.update(PGHOST='127.0.0.1', PGPORT=os.environ['PGPORT'], PGDATABASE='model_b_role_proof',
+                      PGUSER=role, PGPASSWORD=h.PASSWORDS[role], PGCONNECT_TIMEOUT='5')
+        return result
+
+    def rejection(statement, label, role=None):
+        role = role or h.WRITER
+        result = subprocess.run(['psql','-XqAt','-v','ON_ERROR_STOP=1','-v','VERBOSITY=sqlstate'],
+            input=statement, text=True, capture_output=True, env=connection_env(role), timeout=20)
+        if result.returncode == 0 or '23514' not in result.stderr:
+            raise RuntimeError(f"expected writer COMMIT check_violation: {label}")
+        print(f"PASS principal={role} rejected_COMMIT={label}", flush=True)
+
+    f = fixture()
+    for role in (h.RUNTIME, h.MAINTAINER):
+        h.deny(role, f"SELECT public.lock_membership_acceptance_sources('{f['order']}','{f['revision']}');", "actual_acceptance_helper")
+        h.deny(role, f"SELECT public.lock_membership_acceptance_manifest('{f['order']}',ARRAY['{f['revision']}'::uuid]);", "bounded_manifest_helper")
+    for table in ('orders','tax_rates'):
+        h.equal(h.WRITER, f"SELECT NOT has_any_column_privilege(current_user,'public.{table}','UPDATE');", 't', f"no_{table}_update_columns")
+        h.deny(h.WRITER, f"SELECT * FROM public.{table} FOR UPDATE;", f"direct_{table}_update_lock")
+        h.deny(h.WRITER, f"SELECT * FROM public.{table} FOR SHARE;", f"direct_{table}_share_lock")
+    h.deny(h.WRITER, "UPDATE public.orders SET grand_total_minor=0;", 'actual_financial_update')
+    h.deny(h.WRITER, "UPDATE public.tax_rates SET rate_basis_points=0;", 'actual_source_update')
+    h.equal(h.WRITER, f"SELECT pg_get_userbyid(proowner)='{h.OWNER}' AND prosecdef AND proconfig @> ARRAY['search_path=pg_catalog, pg_temp'] FROM pg_proc WHERE oid='public.lock_membership_acceptance_sources(uuid,uuid)'::regprocedure;", 't', 'fixed_helper_owner_and_path')
+    h.equal(h.WRITER, "SELECT bool_and(NOT prosecdef) FROM pg_proc WHERE pronamespace='public'::regnamespace AND proname LIKE 'membership_allocation_%';", 't', 'integrity_guards_remain_invokers')
+    h.equal(h.WRITER, f"SELECT pg_get_userbyid(proowner)='{h.OWNER}' AND prosecdef AND proconfig @> ARRAY['search_path=pg_catalog, pg_temp'] FROM pg_proc WHERE oid='public.lock_membership_acceptance_manifest(uuid,uuid[])'::regprocedure;", 't', 'bounded_helper_owner_and_path')
+    for bps in (0,1500):
+        f=fixture(bps)
+        h.equal(h.WRITER, 'BEGIN;'+construction(f)+f"COMMIT; SELECT count(*) FROM public.order_line_component_allocation_sets WHERE id='{f['set']}' AND accepted_at IS NOT NULL;", '1', f'actual_writer_complete_COMMIT_bps_{bps}')
+    for empty, accept, label in ((True,True,'empty_tax_context'),(False,False,'unaccepted_set')):
+        f=fixture()
+        rejection('BEGIN;'+construction(f,empty=empty,accept=accept)+'COMMIT;',label)
+        h.equal(h.RUNTIME, f"SELECT count(*) FROM public.order_line_items WHERE order_id='{f['order']}';", '0', f'rollback_{label}')
+    f=fixture(region='')
+    rejection('BEGIN;'+construction(f)+'COMMIT;','blank_rate_region_with_NULL_destination')
+    owner(f"UPDATE public.orders SET shipping_region_code='' WHERE id='{f['order']}';")
+    h.equal(h.WRITER,'BEGIN;'+construction(f)+f"COMMIT; SELECT count(*) FROM public.order_line_component_allocation_sets WHERE id='{f['set']}';",'1','blank_region_matches_blank_destination')
+
+    # Frozen 2H scopes sets by (Order, occurrence), not by Order alone.
+    first, second = fixture(), fixture(1500)
+    second.update(order=first['order'], line_no=2)
+    owner(f"UPDATE public.orders SET items_subtotal_minor=200,grand_total_minor=215,tax_total_minor=15 WHERE id='{first['order']}';")
+    def prelock(a,b,reverse=False):
+        revisions=[a['revision'],b['revision']]
+        if reverse: revisions.reverse()
+        return f"SELECT public.lock_membership_acceptance_manifest('{a['order']}',ARRAY[" + ','.join(f"'{revision}'::uuid" for revision in revisions) + ']);'
+
+    def accept_both(a,b):
+        # One statement transitions both complete sets before AFTER-row checks
+        # validate the Order. No constructing set is committed or guard relaxed.
+        return f"UPDATE public.order_line_component_allocation_sets SET accepted_at=now() WHERE id IN ('{a['set']}','{b['set']}');"
+
+    multi_sql = 'BEGIN;' + prelock(first,second) + construction(first,accept=False) + construction(second,accept=False)
+    multi_sql += accept_both(first,second) + 'COMMIT;'
+    multi_result = subprocess.run(['psql','-XqAt','-v','ON_ERROR_STOP=1'],
+        input=multi_sql,text=True,capture_output=True,env=connection_env(h.WRITER),timeout=20)
+    if multi_result.returncode:
+        if 'exact offer required for acceptance locks' in multi_result.stderr:
+            print('RED restricted_writer_two_occurrences: NULL revision inference inspected unrelated Order occurrences',flush=True)
+            raise RuntimeError('two-occurrence child INSERT rejected: exact offer required for acceptance locks')
+        raise RuntimeError('two-occurrence restricted writer transaction failed')
+    h.equal(h.RUNTIME, f"SELECT count(*) FROM public.order_line_component_allocations a JOIN public.order_line_component_allocation_sets s ON s.id=a.allocation_set_id JOIN public.order_line_items l ON l.id=a.order_line_item_id JOIN public.membership_offer_revision_components c ON c.id=a.offer_component_id WHERE s.order_id='{first['order']}' AND s.accepted_at IS NOT NULL AND s.offer_revision_id=l.membership_offer_revision_id_snapshot AND s.offer_revision_id=c.revision_id AND s.occurrence_key=l.membership_occurrence_key_snapshot;", '2', 'two_occurrences_bind_exact_distinct_revisions')
+
+    def pair():
+        a,b=fixture(),fixture(1500)
+        b.update(order=a['order'],line_no=2)
+        owner(f"UPDATE public.orders SET items_subtotal_minor=200,grand_total_minor=215,tax_total_minor=15 WHERE id='{a['order']}';")
+        return a,b
+
+    def adjustment(f):
+        return f"INSERT INTO public.order_adjustments(id,order_id,sequence_no,currency,kind,amount_minor,inserted_at,updated_at) VALUES(public.uuid_generate_v7(),'{f['order']}',1,'USD','discount',0,now(),now());"
+
+    f=fixture()
+    h.equal(h.WRITER,'BEGIN;'+construction(f,accept=False)+adjustment(f)+f"UPDATE public.order_line_component_allocation_sets SET accepted_at=now() WHERE id='{f['set']}'; COMMIT;SELECT count(*) FROM public.order_adjustments WHERE order_id='{f['order']}';",'1','single_revision_adjustment_lock_route')
+    a,b=pair()
+    rejection('BEGIN;'+prelock(a,b)+construction(a,accept=False)+construction(b,accept=False)+adjustment(a)+accept_both(a,b)+'COMMIT;','ambiguous_adjustment_revision')
+    h.equal(h.RUNTIME,f"SELECT count(*) FROM public.order_line_component_allocations a JOIN public.order_line_component_allocation_sets s ON s.id=a.allocation_set_id WHERE s.order_id='{a['order']}';",'0','ambiguous_adjustment_rolls_back_both_occurrences')
+    for key in ('row_line','row_component'):
+        a,b=pair()
+        b[key]=a['line' if key=='row_line' else 'component']
+        rejection('BEGIN;'+prelock(a,b)+construction(a,accept=False)+construction(b,accept=False)+accept_both(a,b)+'COMMIT;',f'cross_occurrence_{key}')
+        h.equal(h.RUNTIME,f"SELECT count(*) FROM public.order_line_items WHERE order_id='{a['order']}';",'0',f'rollback_cross_occurrence_{key}')
+    draft, missing = owner("SELECT public.uuid_generate_v7();"), owner("SELECT public.uuid_generate_v7();")
+    owner(f"INSERT INTO public.membership_offer_revisions(id,offer_key,revision,currency) VALUES('{draft}','CI{draft}',1,'USD');")
+    for label, invalid in (
+        ('empty', "ARRAY[]::uuid[]"),
+        ('null_manifest', "NULL::uuid[]"),
+        ('null_revision', f"ARRAY['{first['revision']}'::uuid,NULL::uuid]"),
+        ('duplicate', f"ARRAY['{first['revision']}'::uuid,'{first['revision']}'::uuid]"),
+        ('missing', f"ARRAY['{first['revision']}'::uuid,'{missing}'::uuid]"),
+        ('unaccepted', f"ARRAY['{first['revision']}'::uuid,'{draft}'::uuid]"),
+    ):
+        rejection(f"BEGIN;SELECT public.lock_membership_acceptance_manifest('{first['order']}',{invalid}); COMMIT;",f'invalid_revision_manifest_{label}')
+
+    # The component bound is per occurrence, not a distinct-revision Order cap.
+    manifests = [fixture() for _ in range(17)]
+    revision_array = 'ARRAY[' + ','.join(f"'{f['revision']}'::uuid" for f in reversed(manifests)) + ']'
+    manifest_lock = f"SELECT public.lock_membership_acceptance_manifest('{manifests[0]['order']}',{revision_array});"
+    started = time.monotonic()
+    h.equal(h.WRITER, 'BEGIN;'+manifest_lock+"COMMIT;SELECT 17;", '17', 'seventeen_accepted_revision_manifest_COMMIT')
+    elapsed = time.monotonic() - started
+    if elapsed >= 10:
+        raise RuntimeError('17-revision manifest exceeded existing transaction budget')
+    print(f'PASS principal={h.WRITER} seventeen_revision_COMMIT_elapsed_seconds={elapsed:.3f}',flush=True)
+
+    def live(role):
+        p = subprocess.Popen(['psql','-XqAt','-v','ON_ERROR_STOP=1','-v','VERBOSITY=sqlstate'],
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=connection_env(role))
+        return p
+
+    def send(p, text):
+        p.stdin.write(text+'\n');p.stdin.flush()
+
+    def wait_line(p, expected):
+        # Each session has server-enforced statement/idle bounds, plus final
+        # communicate timeouts. No unbounded server-side lock wait is admitted.
+        for _ in range(5):
+            line=p.stdout.readline().strip()
+            if line==expected:return
+            if p.poll() is not None:break
+        raise RuntimeError('restricted connection synchronization failed')
+
+    # An independent owner connection probes each tuple with NOWAIT. It must
+    # find all 17 locked by the actual writer, not merely see helper success.
+    holder = live(h.WRITER)
+    try:
+        send(holder,'BEGIN;'+manifest_lock+"SELECT 'READY';")
+        wait_line(holder,'READY')
+        owner(f"""
+          DO $$ DECLARE candidate_id uuid; locked integer := 0; BEGIN
+            FOR candidate_id IN SELECT id FROM public.membership_offer_revisions
+              WHERE id=ANY({revision_array}) ORDER BY id LOOP
+              BEGIN
+                PERFORM 1 FROM public.membership_offer_revisions WHERE id=candidate_id FOR UPDATE NOWAIT;
+                RAISE EXCEPTION 'manifest revision was not locked by writer';
+              EXCEPTION WHEN lock_not_available THEN locked := locked + 1;
+              END;
+            END LOOP;
+            IF locked <> 17 THEN RAISE EXCEPTION 'expected all 17 revision locks'; END IF;
+          END $$;
+        """)
+        print(f'PASS principal={h.WRITER} all_seventeen_offer_rows_locked_independent_NOWAIT_probe',flush=True)
+        send(holder,"COMMIT;SELECT 'COMMITTED';")
+        wait_line(holder,'COMMITTED')
+    finally:
+        if holder.poll() is None:
+            holder.kill();holder.communicate(timeout=5)
+
+    # Competing writers supply reversed manifests. The helper locks offer rows
+    # in binary UUID order before the Order; the losing writer cannot append to
+    # accepted evidence after the producer commits.
+    a,b=pair()
+    producer,contender=live(h.WRITER),live(h.WRITER)
+    try:
+        send(producer,'BEGIN;'+prelock(a,b)+construction(a,accept=False)+construction(b,accept=False)+"SELECT 'READY';")
+        wait_line(producer,'READY')
+        send(contender,'SELECT pg_backend_pid();')
+        pid=contender.stdout.readline().strip()
+        if not pid.isdigit():raise RuntimeError('missing competing writer backend identity')
+        send(contender,'BEGIN;'+prelock(a,b,reverse=True)+construction(a,accept=False)+construction(b,accept=False)+accept_both(a,b)+'COMMIT;')
+        deadline=time.monotonic()+2
+        while time.monotonic()<deadline:
+            if h.sql(h.RUNTIME,f'SELECT cardinality(pg_blocking_pids({pid}))>0;')=='t':break
+            time.sleep(.02)
+        else:raise RuntimeError('competing writer did not exhibit a lock wait')
+        print('PASS competing_writer_reversed_manifest_observable_lock_wait',flush=True)
+        send(producer,accept_both(a,b)+"COMMIT; SELECT 'COMMITTED';")
+        wait_line(producer,'COMMITTED')
+        _,error=contender.communicate(timeout=5)
+        if contender.returncode==0 or '23514' not in error:
+            raise RuntimeError('competing writer bypassed accepted Order immutability')
+        h.equal(h.RUNTIME,f"SELECT count(*) FROM public.order_line_component_allocations a JOIN public.order_line_component_allocation_sets s ON s.id=a.allocation_set_id WHERE s.order_id='{a['order']}' AND s.accepted_at IS NOT NULL;",'2','competing_writer_preserves_two_immutable_allocations')
+    finally:
+        for process in (producer,contender):
+            if process.poll() is None:
+                process.kill();process.communicate(timeout=5)
+
+    f=fixture()
+    holder=live(h.WRITER)
+    try:
+        send(holder, f"BEGIN; SELECT public.lock_membership_acceptance_sources('{f['order']}','{f['revision']}'); SELECT 'READY';")
+        wait_line(holder,'READY')
+        for role, statement in (
+            (h.MAINTAINER,f"UPDATE public.tax_rates SET code=code WHERE id='{f['rate']}';"),
+            (h.RUNTIME,f"UPDATE public.orders SET version=version+1 WHERE id='{f['order']}';"),
+        ):
+            waiter=live(role)
+            try:
+                send(waiter,"SET statement_timeout='3s'; SELECT pg_backend_pid();")
+                pid=waiter.stdout.readline().strip()
+                if not pid.isdigit():raise RuntimeError('missing waiter backend identity')
+                send(waiter, statement)
+                deadline=time.monotonic()+2
+                while time.monotonic()<deadline:
+                    if h.sql(h.RUNTIME,f'SELECT cardinality(pg_blocking_pids({pid}))>0;')=='t':break
+                    time.sleep(.02)
+                else:raise RuntimeError('no observable restricted-principal lock wait')
+                print(f'PASS principal={role} observable_helper_lock_wait',flush=True)
+                # Rollback releases every source/Order lock and lets the blocked
+                # maintenance/runtime write complete on its own connection.
+                send(holder,"ROLLBACK; SELECT 'RELEASED';")
+                wait_line(holder,'RELEASED')
+                send(waiter,'\\q')
+                _,err=waiter.communicate(timeout=5)
+                if waiter.returncode:raise RuntimeError('waiting mutation failed after lock release')
+                send(holder,f"BEGIN; SELECT public.lock_membership_acceptance_sources('{f['order']}','{f['revision']}'); SELECT 'READY';")
+                wait_line(holder,'READY')
+            finally:
+                if waiter.poll() is None:waiter.kill();waiter.communicate()
+        send(holder,"ROLLBACK; SELECT 'RELEASED';")
+        wait_line(holder,'RELEASED')
+        h.equal(h.WRITER,f"BEGIN;SELECT public.lock_membership_acceptance_sources('{f['order']}','{f['revision']}'); SELECT current_setting('lock_timeout')||','||current_setting('statement_timeout')||','||current_setting('idle_in_transaction_session_timeout')||','||current_setting('transaction_timeout');ROLLBACK;", '1s,5s,5s,10s','bounded_transaction_timeouts')
+    finally:
+        if holder.poll() is None:
+            send(holder,'ROLLBACK;\\q');holder.communicate(timeout=5)
+    maintenance=live(h.MAINTAINER)
+    try:
+        send(maintenance, f"BEGIN; SET idle_in_transaction_session_timeout='5s'; UPDATE public.tax_rates SET code=code WHERE id='{f['rate']}'; SELECT 'READY';")
+        wait_line(maintenance,'READY')
+        result=subprocess.run(['psql','-XqAt','-v','ON_ERROR_STOP=1','-v','VERBOSITY=sqlstate'],
+            input=f"BEGIN; SELECT public.lock_membership_acceptance_sources('{f['order']}','{f['revision']}'); COMMIT;",
+            text=True,capture_output=True,env=connection_env(h.WRITER),timeout=5)
+        if result.returncode==0 or '55P03' not in result.stderr:
+            raise RuntimeError('expected bounded helper source lock_timeout')
+        print(f'PASS principal={h.WRITER} source_lock_timeout_rolls_back',flush=True)
+    finally:
+        if maintenance.poll() is None:
+            send(maintenance,'ROLLBACK;\\q');maintenance.communicate(timeout=5)
+    accepted_fixtures = []
+    for _ in range(4):
+        batch = {}
+        for disposition in ('paid', 'failed', 'cancelled'):
+            f = fixture()
+            owner(adjustment(f))
+            h.equal(h.WRITER, 'BEGIN;'+construction(f)+'COMMIT; SELECT 1;', '1', 'runtime_compatibility_accepted_fixture')
+            batch[disposition] = f
+        accepted_fixtures.append(batch)
+    for table in ('order_line_component_allocation_sets', 'order_line_component_allocations'):
+        h.equal(h.RUNTIME, f"SELECT NOT has_any_column_privilege(current_user,'public.{table}','INSERT,UPDATE') AND NOT has_table_privilege(current_user,'public.{table}','DELETE');", 't', f'actual_runtime_no_{table}_writes')
+    h.deny(h.RUNTIME, "INSERT INTO public.order_line_items(membership_occurrence_key_snapshot) VALUES(public.uuid_generate_v7());", 'actual_runtime_marker_insert')
+    h.deny(h.RUNTIME, "SELECT public.lock_membership_acceptance_sources(NULL,NULL);", 'actual_runtime_helper')
+    for f in (f for batch in accepted_fixtures for f in batch.values()):
+        rejection(f"UPDATE public.orders SET grand_total_minor=grand_total_minor+1 WHERE id='{f['order']}';", 'actual_runtime_accepted_financial_update', h.RUNTIME)
+        rejection(f"INSERT INTO public.order_line_items(id,order_id,line_no,currency,quantity,unit_price_minor,line_total_minor,inserted_at,updated_at) VALUES(public.uuid_generate_v7(),'{f['order']}',99,'USD',1,100,100,now(),now());", 'actual_runtime_accepted_late_line', h.RUNTIME)
+    h.equal(h.RUNTIME, "SELECT NOT has_table_privilege(current_user,'public.orders','INSERT,UPDATE') AND has_column_privilege(current_user,'public.orders','grand_total_minor','UPDATE') AND NOT has_column_privilege(current_user,'public.order_line_items','membership_occurrence_key_snapshot','INSERT');", 't', 'actual_runtime_exact_effective_column_acl')
+    runtime_env = connection_env(h.RUNTIME)
+    runtime_env['MODEL_B_ACCEPTED_FIXTURES'] = json.dumps(accepted_fixtures)
+    runtime_env['MODEL_B_DIRECT_RUNTIME_USER'] = h.DIRECT_RUNTIME
+    runtime_env['MODEL_B_DIRECT_RUNTIME_PASSWORD'] = h.PASSWORDS[h.DIRECT_RUNTIME]
+    runtime = subprocess.run(['mix', 'run', '--no-start', 'scripts/ci/model_b_runtime_compatibility.exs'],
+        text=True, capture_output=True, env=runtime_env, timeout=120, check=False)
+    output = runtime.stdout + runtime.stderr
+    for secret in list(h.PASSWORDS.values()) + [h.ADMIN_PASSWORD]:
+        if secret:
+            output = output.replace(secret, '[REDACTED]')
+    print(output[-12000:], flush=True)
+    if runtime.returncode:
+        raise RuntimeError('actual runtime legacy compatibility failed')
+    h.equal(h.MIGRATOR, "SELECT count(*) FROM pg_stat_activity WHERE application_name='jc382_runtime_compatibility';", '0', 'runtime_connection_cleanup')
+
+    print('PASS actual_restricted_writer_SQL_COMMIT_and_lock_integration; trusted_evaluator_invocation=NOT_TESTED; process_isolation=NOT_TESTED',flush=True)
+
+
+def verify_fixture_regressions(h):
+    # A trusted CI fixture harness is distinct from every Model B principal.
+    # It owns only disposable test databases and cannot assume the protected owner.
+    role = "model_b_fixture_harness"
+    password = secrets.token_urlsafe(32)
+    h.PASSWORDS[role] = password
+    h.sql(h.ADMIN, f"""
+      CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEROLE CREATEDB NOREPLICATION NOBYPASSRLS PASSWORD '{password}';
+      CREATE DATABASE model_b_fixture_tests OWNER {role};
+      REVOKE ALL ON DATABASE model_b_fixture_tests FROM PUBLIC;
+    """)
+    env = os.environ.copy()
+    env.update(PGUSER=role, PGPASSWORD=password, PGDATABASE="model_b_fixture_tests",
+        STORE_TEST_DATABASE_USERNAME=role, STORE_TEST_DATABASE_PASSWORD=password,
+        STORE_TEST_DATABASE_NAME="model_b_fixture_tests", STORE_TEST_DATABASE_HOST="127.0.0.1",
+        STORE_TEST_DATABASE_PORT=os.environ["PGPORT"])
+    commands = [
+        ["mix", "run", "--no-start", "scripts/ci/model_b_migrate.exs"],
+        ["mix", "run", "-e", 'Mix.Tasks.Test.run(["test/store/orders/membership_allocation_sql_test.exs", "test/store/orders/membership_allocation_commit_test.exs", "test/store/orders/membership_foundation_migration_test.exs", "test/store/orders/membership_line_integrity_test.exs", "--include", "real_connections"])'],
+    ]
+    for command in commands:
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=180, check=False)
+        output = result.stdout + result.stderr
+        for secret in list(h.PASSWORDS.values()) + [h.ADMIN_PASSWORD]:
+            if secret:
+                output = output.replace(secret, "[REDACTED]")
+        print(output, flush=True)
+        if result.returncode:
+            raise RuntimeError("non-superuser disposable fixture regression gate failed")
+    print("PASS existing_SQL_COMMIT_lifecycle_and_blank_region_suite_under_non_superuser_fixture_harness", flush=True)

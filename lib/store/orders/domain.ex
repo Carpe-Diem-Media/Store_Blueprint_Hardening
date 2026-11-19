@@ -33,6 +33,8 @@ defmodule Store.Orders do
   resources do
     resource(Store.Orders.Order)
     resource(Store.Orders.OrderLineItem)
+    resource(Store.Orders.OrderLineComponentAllocationSet)
+    resource(Store.Orders.OrderLineComponentAllocation)
     resource(Store.Orders.OrderAdjustment)
     resource(Store.Orders.RefundAdjustment)
     resource(Store.Orders.InventoryReservation)

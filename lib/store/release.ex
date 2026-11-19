@@ -4,7 +4,22 @@ defmodule Store.Release do
   """
 
   alias Ecto.Migrator
+  alias Store.Operations.AllocationRuntimeContract
   alias Store.Operations.Health
+
+  @doc """
+  Stages the allocation foundation, then checks both runtime principals before
+  installing triggers. Requires an operator-only migration URL and NOLOGIN owner.
+  Missing ACLs fail closed; this entrypoint never grants privileges.
+  """
+  @spec migrate_allocation_foundation() :: map()
+  def migrate_allocation_foundation do
+    ensure_loaded!()
+    url = System.fetch_env!("STORE_MIGRATION_DATABASE_URL")
+    owner = System.fetch_env!("STORE_MIGRATION_OWNER")
+    configs = Enum.map([Store.Repo, Store.DirectRepo], &Application.fetch_env!(:store, &1))
+    AllocationRuntimeContract.migrate!(configs, [url: url], owner)
+  end
 
   @spec migrate() :: map()
   def migrate do
@@ -92,6 +107,7 @@ defmodule Store.Release do
   defp run_repo_migrations(repo) do
     {:ok, _, migrated_versions} =
       Migrator.with_repo(repo, fn migration_repo ->
+        AllocationRuntimeContract.guard_standard_migrations!(migration_repo)
         Migrator.run(migration_repo, :up, all: true)
       end)
 

@@ -81,7 +81,7 @@ If both URLs are the same (single-Postgres deployments without PgBouncer in fron
   - `STORE_TRUSTED_PROXY_HEADERS`
 - For clustered deploys, release script behavior in `rel/env.sh.eex` uses:
   - `STORE_CLUSTER_TRANSPORT` (`inet6` default, `inet` optional)
-  - `DNS_CLUSTER_QUERY` fallback from Railway private domain vars
+  - explicit `DNS_CLUSTER_QUERY` for service discovery
 - Cloudflare/edge policy should avoid caching authenticated, cart, checkout, and order flows.
 
 ## Repository Compose contract
