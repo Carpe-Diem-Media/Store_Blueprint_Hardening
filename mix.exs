@@ -82,7 +82,7 @@ defmodule Store.MixProject do
        app: false,
        compile: false,
        depth: 1},
-      {:swoosh, ">= 1.26.3 and < 2.0.0-0"},
+      {:swoosh, ">= 1.30.0 and < 2.0.0-0"},
       {:oban, "~> 2.0"},
       {:req, "~> 0.7.0"},
       {:sentry, "~> 13.0"},
@@ -99,7 +99,8 @@ defmodule Store.MixProject do
       {:bandit, ">= 1.14.1 and < 2.0.0-0"},
       # Security floors for transitive HTTP/authentication runtime packages.
       {:mint, ">= 1.11.0 and < 2.0.0-0"},
-      {:plug, ">= 1.19.5 and < 2.0.0-0"},
+      {:plug, ">= 1.20.4 and < 2.0.0-0"},
+      {:idna, ">= 8.0.0 and < 9.0.0"},
       {:plug_crypto, ">= 2.2.1 and < 3.0.0-0"},
       {:hpax, ">= 1.0.4 and < 2.0.0-0"},
       {:thousand_island, ">= 1.5.0 and < 2.0.0-0"},
