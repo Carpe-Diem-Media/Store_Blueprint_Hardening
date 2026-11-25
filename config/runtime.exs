@@ -22,6 +22,20 @@ end
 
 config :store, StoreWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+if config_env() in [:dev, :test] do
+  config :store, :payments,
+    paystack: [
+      restricted_key: System.get_env("STORE_PAYSTACK_TEST_RESTRICTED_KEY"),
+      webhook_signing_secret: System.get_env("STORE_PAYSTACK_TEST_WEBHOOK_SIGNING_SECRET")
+    ]
+end
+
+if config_env() == :dev and System.get_env("STORE_PAYSTACK_SANDBOX_CHECKOUT") == "1" do
+  config :store, :payments,
+    enabled_providers: [:paystack],
+    default_purchase_provider_for_ui: :paystack
+end
+
 if config_env() == :prod do
   optional_env = fn env ->
     case System.get_env(env) do

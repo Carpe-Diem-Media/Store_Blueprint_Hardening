@@ -5,6 +5,7 @@ defmodule StoreWeb.CartCheckoutLiveTest do
   require Ash.Query
   import Phoenix.LiveViewTest
 
+  alias AshAuthentication.Plug.Helpers
   alias Store.Carts.Facade, as: CartsFacade
   alias Store.Carts.Inputs.CartItemInput
   alias Store.Carts.Queries.CartLoadQuery
@@ -13,12 +14,14 @@ defmodule StoreWeb.CartCheckoutLiveTest do
   alias Store.Checkout.Inputs.{CheckoutShippingInput, CheckoutStartInput}
   alias Store.Orders
   alias Store.Orders.Order
+  alias Store.Payments.PaymentIntent
   alias Store.Pricing.TaxRate
   alias Store.Repo
   alias Store.Shipping.Facade, as: ShippingFacade
   alias Store.Shipping.Inputs.QuoteRequest
   alias Store.Shipping.{ShippingMethod, ShippingRateRule, ShippingZone}
   alias Store.TestFixtures
+  alias Store.TestSupport.StripeAPIStub
 
   setup do
     previous = Application.get_env(:store, :live_warm_load_jitter_ms)
@@ -135,7 +138,7 @@ defmodule StoreWeb.CartCheckoutLiveTest do
     assert html =~ "Continue To Payment"
   end
 
-  test "payment return route is read-only and does not mutate order state", %{conn: conn} do
+  test "PAY-INV-005: a forged Paystack return cannot start or settle payment", %{conn: conn} do
     %{variant_id: variant_id} = published_product_fixture()
     token = Ash.UUIDv7.generate()
     conn = with_cart_token(conn, token)
@@ -146,10 +149,22 @@ defmodule StoreWeb.CartCheckoutLiveTest do
     assert {:ok, start_input} = CheckoutStartInput.new(%{})
     assert {:ok, start_result} = Checkout.start_from_cart(nil, token, start_input)
 
-    {:ok, view, _html} = live(conn, "/checkout/return?checkout_key=#{start_result.checkout_key}")
+    configure_purchase_provider!(:paystack, [:paystack])
+    reference = "checkout-" <> String.replace(start_result.order_id, "-", "")
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        "/checkout/return?checkout_key=#{start_result.checkout_key}&reference=#{reference}&status=success"
+      )
+
     html = render_until(view, "Payment return received.")
 
     assert html =~ "Payment return received. This page is read-only"
+    refute has_element?(view, "#pay-now")
+
+    assert render_click(view, "create_payment_intent", %{"provider" => "paystack"}) =~
+             "Payment return received. This page is read-only"
 
     assert {:ok, [order]} =
              Order
@@ -157,6 +172,7 @@ defmodule StoreWeb.CartCheckoutLiveTest do
              |> Ash.read(domain: Store.Orders, authorize?: false)
 
     assert order.state == :pending_payment
+    assert Repo.get_by(PaymentIntent, order_id: start_result.order_id) == nil
   end
 
   test "checkout live shows explicit out-of-stock message on finalize failure", %{conn: conn} do
@@ -183,6 +199,123 @@ defmodule StoreWeb.CartCheckoutLiveTest do
 
     assert render(view) =~
              "One or more items are no longer available. Review your cart and try again."
+  end
+
+  test "two checkout tabs use the configured Paystack gateway and reuse the redirect", %{
+    conn: conn
+  } do
+    buyer = TestFixtures.register_user!(email: TestFixtures.unique_email("paystack_live_buyer"))
+    checkout = setup_checkout_with_shipping!(buyer, {"ZA", "WC", "8001", "ZAR"})
+    reference = "checkout-" <> String.replace(checkout.order_id, "-", "")
+    url = "https://checkout.paystack.com/test-liveview"
+    test_pid = self()
+
+    plug = fn %{method: "POST", request_path: "/transaction/initialize"} = conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert %{"currency" => "ZAR", "reference" => ^reference} = Jason.decode!(body)
+      send(test_pid, {:paystack_initialized, reference})
+
+      Plug.Conn.send_resp(
+        Plug.Conn.put_resp_content_type(conn, "application/json"),
+        200,
+        Jason.encode!(%{
+          "status" => true,
+          "data" => %{
+            "reference" => reference,
+            "authorization_url" => url,
+            "access_code" => "test-liveview"
+          }
+        })
+      )
+    end
+
+    configure_purchase_provider!(:paystack, [:stripe, :paystack],
+      paystack: [restricted_key: "rk_test_fixture", request_options: [plug: plug]]
+    )
+
+    conn = conn |> with_cart_token(checkout.token) |> Helpers.store_in_session(buyer)
+    {:ok, view, _html} = live(conn, "/checkout?checkout_key=#{checkout.checkout_key}")
+    _html = render_until(view, "Finalize Totals")
+    assert view |> element("#finalize-totals") |> render_click() =~ "Totals finalized"
+
+    {:ok, other_tab, _html} = live(conn, "/checkout?checkout_key=#{checkout.checkout_key}")
+    _html = render_until(other_tab, "Continue To Payment")
+
+    assert {:error, {:redirect, %{to: ^url}}} =
+             view |> element("#pay-now") |> render_click(%{"provider" => "stripe"})
+
+    assert_receive {:paystack_initialized, ^reference}
+
+    assert {:error, {:redirect, %{to: ^url}}} =
+             other_tab |> element("#pay-now") |> render_click()
+
+    refute_received {:paystack_initialized, _}
+
+    assert %PaymentIntent{provider: :paystack, provider_request_reference: ^reference} =
+             Repo.get_by!(PaymentIntent, order_id: checkout.order_id)
+  end
+
+  test "checkout Pay still starts Stripe checkout when Stripe is configured",
+       %{conn: conn} = context do
+    StripeAPIStub.setup_default(context)
+    configure_purchase_provider!(:stripe, [:stripe])
+    checkout = setup_checkout_with_shipping!()
+    conn = with_cart_token(conn, checkout.token)
+    {:ok, view, _html} = live(conn, "/checkout?checkout_key=#{checkout.checkout_key}")
+    _html = render_until(view, "Finalize Totals")
+    assert view |> element("#finalize-totals") |> render_click() =~ "Totals finalized"
+
+    assert {:error, {:redirect, %{to: "https://checkout.stripe.test/session/" <> _}}} =
+             view |> element("#pay-now") |> render_click()
+
+    assert %PaymentIntent{provider: :stripe} =
+             Repo.get_by!(PaymentIntent, order_id: checkout.order_id)
+  end
+
+  test "digital checkout collects billing location and never renders shipping controls", %{
+    conn: conn
+  } do
+    buyer = TestFixtures.register_user!(email: TestFixtures.unique_email("digital_buyer"))
+    %{variant_id: variant_id} = published_product_fixture("ZAR", :digital)
+    create_pricing_rules!("ZA", "WC", "ZAR")
+    token = Ash.UUIDv7.generate()
+    {:ok, add} = CartItemInput.new(%{"variant_id" => variant_id, "qty" => 1})
+    assert {:ok, _} = CartsFacade.add_item_for_user(buyer, token, add)
+    {:ok, start} = CheckoutStartInput.new(%{})
+    assert {:ok, checkout} = Checkout.start_from_cart(buyer, token, start)
+
+    conn = conn |> with_cart_token(token) |> Helpers.store_in_session(buyer)
+    {:ok, view, _html} = live(conn, "/checkout?checkout_key=#{checkout.checkout_key}")
+    _html = render_until(view, "Finalize Totals")
+
+    refute has_element?(view, "form[phx-submit=set_shipping]")
+    refute has_element?(view, "#checkout-shipping-total")
+    assert has_element?(view, "#pay-now[disabled]")
+
+    assert view
+           |> form("#digital-billing", %{
+             "billing_country_code" => "ZA",
+             "billing_region_code" => "WC"
+           })
+           |> render_submit() =~ "ZAR 21.60"
+
+    refute has_element?(view, "form[phx-submit=set_shipping]")
+    refute has_element?(view, "#pay-now[disabled]")
+  end
+
+  test "checkout cannot start payment using a disabled default gateway", %{conn: conn} do
+    checkout = setup_checkout_with_shipping!()
+    configure_purchase_provider!(:paystack, [:stripe])
+    conn = with_cart_token(conn, checkout.token)
+    {:ok, view, _html} = live(conn, "/checkout?checkout_key=#{checkout.checkout_key}")
+    _html = render_until(view, "Finalize Totals")
+    assert view |> element("#finalize-totals") |> render_click() =~ "Totals finalized"
+    assert has_element?(view, "#pay-now[disabled]")
+
+    assert render_click(view, "create_payment_intent", %{"provider" => "stripe"}) =~
+             "Payment is currently unavailable."
+
+    assert Repo.get_by(PaymentIntent, order_id: checkout.order_id) == nil
   end
 
   test "/checkout static pass emits zero-query mount telemetry and expired pending checkout updates live",
@@ -246,7 +379,7 @@ defmodule StoreWeb.CartCheckoutLiveTest do
     |> Plug.Test.put_req_cookie("cart_token", token)
   end
 
-  defp published_product_fixture do
+  defp published_product_fixture(currency \\ "USD", kind \\ :simple) do
     admin = TestFixtures.register_user!(email: TestFixtures.unique_email("phase20_live_admin"))
     _role = TestFixtures.assign_role!(admin, :admin)
 
@@ -259,8 +392,9 @@ defmodule StoreWeb.CartCheckoutLiveTest do
         %{
           slug: slug,
           title: "Phase 20 Live Product",
+          product_kind: kind,
           base_variant_sku: "P20-LIVE-#{System.unique_integer([:positive])}",
-          base_variant_currency_code: "USD",
+          base_variant_currency_code: currency,
           base_variant_price_minor: 2_000,
           base_variant_stock_on_hand: 25
         }
@@ -275,23 +409,26 @@ defmodule StoreWeb.CartCheckoutLiveTest do
     %{slug: published.slug, title: published.title, variant_id: published.default_variant_id}
   end
 
-  defp setup_checkout_with_shipping! do
-    %{variant_id: variant_id} = published_product_fixture()
+  defp setup_checkout_with_shipping!(
+         buyer \\ nil,
+         {country, region, postal, currency} \\ {"US", "CA", "94105", "USD"}
+       ) do
+    %{variant_id: variant_id} = published_product_fixture(currency)
     token = Ash.UUIDv7.generate()
-    actor = %{cart_token: token}
-    _shipping_setup = create_pricing_rules!()
+    actor = buyer || %{cart_token: token}
+    _shipping_setup = create_pricing_rules!(country, region, currency)
 
     assert {:ok, add_input} = CartItemInput.new(%{"variant_id" => variant_id, "qty" => 1})
-    assert {:ok, _cart} = CartsFacade.add_item_for_user(nil, token, add_input)
+    assert {:ok, _cart} = CartsFacade.add_item_for_user(buyer, token, add_input)
     assert {:ok, start_input} = CheckoutStartInput.new(%{})
-    assert {:ok, start_result} = Checkout.start_from_cart(nil, token, start_input)
+    assert {:ok, start_result} = Checkout.start_from_cart(buyer, token, start_input)
 
     selection =
       quote_selection!(%{
-        destination_country_code: "US",
-        destination_region_code: "CA",
-        destination_postal_code: "94105",
-        currency_code: "USD",
+        destination_country_code: country,
+        destination_region_code: region,
+        destination_postal_code: postal,
+        currency_code: currency,
         shipping_weight_grams: 0
       })
 
@@ -300,9 +437,9 @@ defmodule StoreWeb.CartCheckoutLiveTest do
                "recipient_name" => "Jane Customer",
                "address_line1" => "1 Main St",
                "city" => "San Francisco",
-               "country_code" => "US",
-               "region_code" => "CA",
-               "postal_code" => "94105",
+               "country_code" => country,
+               "region_code" => region,
+               "postal_code" => postal,
                "phone" => "555-555-1212",
                "quote_hash" => selection.quote_hash,
                "shipping_method_code" => selection.shipping_method_code
@@ -319,7 +456,17 @@ defmodule StoreWeb.CartCheckoutLiveTest do
     }
   end
 
-  defp create_pricing_rules! do
+  defp configure_purchase_provider!(provider, enabled, extra \\ []) do
+    previous = Application.get_env(:store, :payments, [])
+
+    config =
+      Keyword.merge(extra, default_purchase_provider_for_ui: provider, enabled_providers: enabled)
+
+    Application.put_env(:store, :payments, Keyword.merge(previous, config))
+    on_exit(fn -> Application.put_env(:store, :payments, previous) end)
+  end
+
+  defp create_pricing_rules!(country, region, currency) do
     unique = System.unique_integer([:positive])
     method_code = "GROUND-#{unique}"
 
@@ -336,7 +483,12 @@ defmodule StoreWeb.CartCheckoutLiveTest do
       ShippingZone
       |> Ash.Changeset.for_create(
         :create,
-        %{code: "US-CA-#{unique}", country_code: "US", region_code: "CA", active: true},
+        %{
+          code: "#{country}-#{region}-#{unique}",
+          country_code: country,
+          region_code: region,
+          active: true
+        },
         context: %{system?: true}
       )
       |> Ash.create!(domain: Store.Shipping, authorize?: false, context: %{system?: true})
@@ -349,7 +501,7 @@ defmodule StoreWeb.CartCheckoutLiveTest do
           code: "GROUND_RULE_#{unique}",
           shipping_zone_id: zone.id,
           shipping_method_id: method.id,
-          currency: "USD",
+          currency: currency,
           shipping_cost_minor: 500,
           active: true,
           precedence_rank: 10
@@ -363,9 +515,9 @@ defmodule StoreWeb.CartCheckoutLiveTest do
       |> Ash.Changeset.for_create(
         :create,
         %{
-          code: "CA-STANDARD-#{unique}",
-          country_code: "US",
-          region_code: "CA",
+          code: "#{region}-STANDARD-#{unique}",
+          country_code: country,
+          region_code: region,
           product_tax_category: "STANDARD",
           rate_basis_points: 800,
           shipping_taxable: true,

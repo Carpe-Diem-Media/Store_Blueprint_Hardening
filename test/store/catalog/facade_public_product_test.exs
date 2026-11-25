@@ -33,6 +33,18 @@ defmodule Store.Catalog.FacadePublicProductTest do
     assert is_list(detail.availability_matrix)
   end
 
+  test "published digital variations remain purchasable with zero physical stock" do
+    digital = published_product_fixture(:digital, 0)
+    physical = published_product_fixture(:simple, 0)
+
+    for {product, status, reason} <- [{digital, :ok, nil}, {physical, :error, :out_of_stock}] do
+      {:ok, query} = ProductDetailQuery.new(%{slug: product.slug, selection: %{}})
+
+      assert {:ok, %{resolution: %{status: ^status, reason: ^reason}}} =
+               CatalogFacade.get_product_detail_for_public(nil, query)
+    end
+  end
+
   test "get_product_detail_for_public emits catalog detail telemetry with repo and payload diagnostics" do
     %{slug: slug} = published_product_fixture()
     parent = self()
@@ -165,7 +177,7 @@ defmodule Store.Catalog.FacadePublicProductTest do
     assert Map.has_key?(product.default_variant, :price_minor)
   end
 
-  defp published_product_fixture do
+  defp published_product_fixture(kind \\ :simple, stock \\ 10) do
     admin = TestFixtures.register_user!(email: TestFixtures.unique_email("shop_public_admin"))
     _role = TestFixtures.assign_role!(admin, :admin)
     slug = "shop-public-#{System.unique_integer([:positive])}"
@@ -179,10 +191,11 @@ defmodule Store.Catalog.FacadePublicProductTest do
         %{
           slug: slug,
           title: title,
+          product_kind: kind,
           base_variant_sku: "SHOP-PUBLIC-#{System.unique_integer([:positive])}",
           base_variant_currency_code: "USD",
           base_variant_price_minor: 2_000,
-          base_variant_stock_on_hand: 10
+          base_variant_stock_on_hand: stock
         }
       )
       |> Ash.create!(domain: Store.Catalog, actor: admin)

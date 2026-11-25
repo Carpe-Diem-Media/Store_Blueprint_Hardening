@@ -313,7 +313,9 @@ defmodule Store.Fulfillment do
   end
 
   defp fetch_order_line_items(order_id) do
-    query = OrderLineItem |> Ash.Query.filter(expr(order_id == ^order_id))
+    query =
+      OrderLineItem
+      |> Ash.Query.filter(expr(order_id == ^order_id and digital_only_snapshot == false))
 
     case Ash.read(query, domain: Store.Orders, authorize?: false, context: %{system?: true}) do
       {:ok, line_items} -> {:ok, line_items}

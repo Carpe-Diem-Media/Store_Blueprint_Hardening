@@ -6,6 +6,7 @@ defmodule StoreWeb.WebhookController do
   alias Store.Payments.Facade, as: PaymentsFacade
   alias Store.Payments.Inputs.WebhookReceiptIngestInput
   alias Store.Payments.Providers
+  alias Store.Payments.WebhookReceipt
   alias Store.Support.Errors.Error
   alias Store.Workers.ProcessRefundWebhookReceiptWorker
   alias Store.Workers.ProcessWebhookReceiptWorker
@@ -28,8 +29,21 @@ defmodule StoreWeb.WebhookController do
       {:ok, conn, normalized_provider, receipt_id} ->
         conn =
           conn
-          |> put_status(:accepted)
+          |> put_status(acknowledgement_status(normalized_provider))
           |> json(%{data: %{webhook_receipt_id: receipt_id}})
+
+        PaymentIngressTelemetry.emit_response(
+          :webhook,
+          normalized_provider,
+          started_at,
+          conn.status,
+          :ok
+        )
+
+        conn
+
+      {:ignore, conn, normalized_provider} ->
+        conn = send_resp(conn, 200, "")
 
         PaymentIngressTelemetry.emit_response(
           :webhook,
@@ -108,10 +122,14 @@ defmodule StoreWeb.WebhookController do
            ) do
       {:ok, conn, normalized_provider, receipt_result.receipt.id}
     else
+      :ignore -> {:ignore, conn, telemetry_provider}
       {:error, error} -> {:error, telemetry_provider, error}
       {:discard, reason} -> {:discard, telemetry_provider, reason}
     end
   end
+
+  defp acknowledgement_status(:paystack), do: :ok
+  defp acknowledgement_status(_provider), do: :accepted
 
   defp extract_raw_body(conn) do
     case conn.assigns[:raw_body] do
@@ -141,6 +159,9 @@ defmodule StoreWeb.WebhookController do
         canonical_receipt.provider_idempotency_key ||
           "#{provider}:#{canonical_receipt.provider_event_id}"
 
+      {stored_body, stored_headers} =
+        receipt_evidence(provider, raw_body, headers, canonical_receipt)
+
       with {:ok, input} <-
              WebhookReceiptIngestInput.new(%{
                provider: provider,
@@ -151,12 +172,31 @@ defmodule StoreWeb.WebhookController do
                provider_event_id: canonical_receipt.provider_event_id,
                event_type: canonical_receipt.event_type,
                verified_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
-               raw_body: raw_body,
-               headers: headers
+               raw_body: stored_body,
+               headers: stored_headers
              }) do
         PaymentsFacade.ingest_webhook_receipt_for_system(input)
       end
     end)
+  end
+
+  defp receipt_evidence(:paystack, _raw_body, _headers, canonical_receipt),
+    do: {Jason.encode!(canonical_receipt.raw_payload), %{}}
+
+  defp receipt_evidence(_provider, raw_body, headers, _canonical_receipt),
+    do: {raw_body, headers}
+
+  # A resend also repairs a receipt left without an Oban job by an interrupted handoff.
+  defp enqueue_processing_job(
+         %{
+           receipt: %WebhookReceipt{provider: :paystack, processing_status: status} = receipt,
+           duplicate?: true
+         },
+         event_type,
+         route
+       )
+       when status != "processed" do
+    enqueue_processing_job(%{receipt: receipt}, event_type, route)
   end
 
   defp enqueue_processing_job(%{receipt: receipt, duplicate?: true}, _event_type, route) do

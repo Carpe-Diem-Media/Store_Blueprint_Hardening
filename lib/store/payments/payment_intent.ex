@@ -130,6 +130,7 @@ defmodule Store.Payments.PaymentIntent do
       transition(:mark_requires_action, from: :submitted, to: :requires_action)
       transition(:mark_succeeded, from: :submitted, to: :succeeded)
       transition(:mark_succeeded, from: :requires_action, to: :succeeded)
+      transition(:recover_verified_paystack_checkout, from: :created, to: :succeeded)
       transition(:correct_to_succeeded, from: :failed, to: :succeeded)
       transition(:mark_failed, from: :submitted, to: :failed)
       transition(:mark_failed, from: :requires_action, to: :failed)
@@ -314,6 +315,27 @@ defmodule Store.Payments.PaymentIntent do
       change({Store.Support.Governance.TransitionState, target: :succeeded})
     end
 
+    update :recover_verified_paystack_checkout do
+      description(
+        "Applies verified Paystack payment when the checkout initialize response was lost."
+      )
+
+      public?(false)
+      require_atomic?(false)
+      accept([])
+
+      change(
+        filter(
+          expr(
+            provider == :paystack and purpose == :order_checkout and
+              not is_nil(provider_request_reference) and provider_request_reference != ""
+          )
+        )
+      )
+
+      change({Store.Support.Governance.TransitionState, target: :succeeded})
+    end
+
     update :mark_failed do
       require_atomic?(false)
       accept([])
@@ -431,6 +453,10 @@ defmodule Store.Payments.PaymentIntent do
 
     policy action(:correct_to_succeeded) do
       access_type(:runtime)
+      authorize_if(context_equals(:system?, true))
+    end
+
+    policy action(:recover_verified_paystack_checkout) do
       authorize_if(context_equals(:system?, true))
     end
 

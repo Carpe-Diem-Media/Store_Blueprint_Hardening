@@ -9,6 +9,10 @@ defmodule StoreWeb.PaymentCallbackControllerTest do
   alias Store.Payments.{PaymentIntent, WebhookReceipt}
   alias Store.Workers.ProcessWebhookReceiptWorker
 
+  setup do
+    {:ok, initial_receipt_count: webhook_receipt_count()}
+  end
+
   test "callback controller stores receipt, enqueues payment webhook worker, and is enqueue-only",
        %{
          conn: conn
@@ -42,7 +46,10 @@ defmodule StoreWeb.PaymentCallbackControllerTest do
     assert :pending_payment == fetch_order!(order.id).state
   end
 
-  test "callback rejects missing stripe signature", %{conn: conn} do
+  test "callback rejects missing stripe signature", %{
+    conn: conn,
+    initial_receipt_count: initial_receipt_count
+  } do
     order = create_order!()
     payment_intent = create_submitted_payment_intent!(order.id)
     raw_body = stripe_payment_event_raw_body(payment_intent, "evt_callback_missing_sig")
@@ -54,10 +61,13 @@ defmodule StoreWeb.PaymentCallbackControllerTest do
 
     assert %{"errors" => %{"code" => "PAYMENT_SIGNATURE_MISSING"}} = json_response(conn, 401)
     refute_enqueued(worker: ProcessWebhookReceiptWorker)
-    assert webhook_receipt_count() == 0
+    assert webhook_receipt_count() == initial_receipt_count
   end
 
-  test "callback signature verification is bound to raw body bytes", %{conn: conn} do
+  test "callback signature verification is bound to raw body bytes", %{
+    conn: conn,
+    initial_receipt_count: initial_receipt_count
+  } do
     order = create_order!()
     payment_intent = create_submitted_payment_intent!(order.id)
 
@@ -73,10 +83,13 @@ defmodule StoreWeb.PaymentCallbackControllerTest do
 
     assert %{"errors" => %{"code" => "PAYMENT_SIGNATURE_INVALID"}} = json_response(conn, 401)
     refute_enqueued(worker: ProcessWebhookReceiptWorker)
-    assert webhook_receipt_count() == 0
+    assert webhook_receipt_count() == initial_receipt_count
   end
 
-  test "callback rejects unknown provider before persistence", %{conn: conn} do
+  test "callback rejects unknown provider before persistence", %{
+    conn: conn,
+    initial_receipt_count: initial_receipt_count
+  } do
     raw_body = Jason.encode!(%{"id" => "evt_callback_unknown_provider"})
 
     conn =
@@ -86,7 +99,7 @@ defmodule StoreWeb.PaymentCallbackControllerTest do
 
     assert %{"errors" => %{"code" => "PAYMENT_PROVIDER_UNSUPPORTED"}} = json_response(conn, 400)
     refute_enqueued(worker: ProcessWebhookReceiptWorker)
-    assert webhook_receipt_count() == 0
+    assert webhook_receipt_count() == initial_receipt_count
   end
 
   test "callback ingest emits persist, enqueue, and response telemetry", %{conn: conn} do

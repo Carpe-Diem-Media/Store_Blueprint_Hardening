@@ -7,7 +7,7 @@ defmodule Store.Catalog.StockFastPath do
 
   import Ecto.Query
 
-  alias Store.Catalog.InventoryItem
+  alias Store.Catalog.{InventoryItem, Product, Variant}
   alias Store.Repo
   alias Store.Support.Errors.Error
 
@@ -114,18 +114,23 @@ defmodule Store.Catalog.StockFastPath do
 
   defp load_qty_from_db(variant_ids) do
     rows =
-      InventoryItem
-      |> where([item], item.variant_id in ^variant_ids)
+      Variant
+      |> join(:inner, [variant], product in Product, on: variant.product_id == product.id)
+      |> join(:left, [variant, _product], item in InventoryItem,
+        on: item.variant_id == variant.id
+      )
+      |> where([variant], variant.id in ^variant_ids)
       |> select(
-        [item],
-        {item.variant_id, item.stock_on_hand, item.reserved_count, item.allow_oversell}
+        [variant, product, item],
+        {variant.id, product.product_kind, item.stock_on_hand, item.reserved_count,
+         item.allow_oversell}
       )
       |> Repo.all()
 
     base_map =
-      Map.new(rows, fn {variant_id, stock_on_hand, reserved_count, allow_oversell} ->
+      Map.new(rows, fn {variant_id, product_kind, stock_on_hand, reserved_count, allow_oversell} ->
         qty =
-          if allow_oversell do
+          if product_kind == :digital or allow_oversell == true do
             :infinite
           else
             max((stock_on_hand || 0) - (reserved_count || 0), 0)

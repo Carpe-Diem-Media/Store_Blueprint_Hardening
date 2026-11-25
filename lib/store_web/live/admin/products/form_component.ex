@@ -56,6 +56,16 @@ defmodule StoreWeb.Admin.Products.FormComponent do
         <.input field={@form[:title]} type="text" label="Title" required />
         <.input field={@form[:subtitle]} type="text" label="Subtitle" />
         <.input field={@form[:description]} type="textarea" label="Description" />
+        <.input
+          field={@form[:product_kind]}
+          type="select"
+          label="Product type"
+          options={[
+            {"Physical", :simple},
+            {"Digital download", :digital},
+            {"Subscription", :subscription}
+          ]}
+        />
 
         <div :if={@action == :new} class="mt-4 space-y-3 rounded-xl border border-base-300 p-4">
           <p class="text-sm font-medium">Default Variant</p>

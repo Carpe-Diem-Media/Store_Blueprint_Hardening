@@ -119,14 +119,14 @@ defmodule Store.Checkout do
 
   @spec finalize_totals(map() | nil, String.t(), CheckoutFinalizeInput.t()) ::
           {:ok, map()} | {:error, Error.t()}
-  def finalize_totals(actor, checkout_key, %CheckoutFinalizeInput{} = _input)
+  def finalize_totals(actor, checkout_key, %CheckoutFinalizeInput{} = input)
       when is_binary(checkout_key) do
     started_at = System.monotonic_time()
 
     {result, repo_stats} =
       RepoStats.capture(fn ->
         with {:ok, checkout} <- traced_finalize_checkout_context(actor, checkout_key) do
-          do_finalize_totals(actor, checkout_key, checkout)
+          do_finalize_totals(actor, checkout_key, checkout, input)
         end
       end)
 
@@ -138,12 +138,17 @@ defmodule Store.Checkout do
     {:error, Error.new("VALIDATION_ERROR", "checkout_key and finalize input are required")}
   end
 
-  defp do_finalize_totals(actor, checkout_key, %{order: %Order{totals_finalized_at: %DateTime{}}}) do
+  defp do_finalize_totals(
+         actor,
+         checkout_key,
+         %{order: %Order{totals_finalized_at: %DateTime{}}},
+         _input
+       ) do
     get_checkout_for_user(actor, checkout_key)
   end
 
-  defp do_finalize_totals(_actor, _checkout_key, checkout) do
-    case ensure_priced_snapshot_and_reservations(checkout) do
+  defp do_finalize_totals(_actor, _checkout_key, checkout, input) do
+    case ensure_priced_snapshot_and_reservations(checkout, input) do
       {:ok, %{already_finalized?: true} = finalized_checkout} ->
         checkout_summary_from_context(finalized_checkout)
 
@@ -279,6 +284,7 @@ defmodule Store.Checkout do
         sku_snapshot: variant && variant.sku,
         product_title_snapshot: product && product.title,
         variant_title_snapshot: variant && variant.title,
+        digital_only_snapshot: match?(%Product{product_kind: :digital}, product),
         quantity: quantity,
         unit_price_minor: unit_price,
         net_line_total_minor: line_total,
@@ -580,8 +586,7 @@ defmodule Store.Checkout do
     end
   end
 
-  defp write_priced_snapshot(
-         order_id,
+  defp priced_snapshot_output(
          locked_items,
          variants_by_id,
          products_by_id,
@@ -608,6 +613,7 @@ defmodule Store.Checkout do
           sku_snapshot: variant.sku,
           product_title_snapshot: product.title,
           variant_title_snapshot: variant.title,
+          digital_only_snapshot: product.product_kind == :digital,
           quantity: item.qty,
           unit_price_minor: unit_price_minor,
           line_total_minor: line_total,
@@ -627,7 +633,7 @@ defmodule Store.Checkout do
 
     subtotal_minor = Enum.reduce(lines, 0, &(&1.line_total_minor + &2))
 
-    output = %{
+    %{
       currency: currency,
       subtotal_minor: subtotal_minor,
       discount_total_minor: 0,
@@ -636,8 +642,6 @@ defmodule Store.Checkout do
       line_allocations: Enum.map(lines, &%{line_id: &1.line_id, discount_minor: 0}),
       applied_adjustments: []
     }
-
-    Store.Orders.write_priced_snapshot(order_id, output)
   end
 
   defp quote_request_attrs(country_code, region_code, postal_code, currency, weight_grams) do
@@ -650,16 +654,19 @@ defmodule Store.Checkout do
     }
   end
 
-  defp reserve_items(locked_items) do
-    Enum.map(locked_items, fn item ->
-      %{variant_id: item.variant_id, quantity: item.qty}
-    end)
+  defp reserve_items(line_items) do
+    for item <- line_items, not item.digital_only_snapshot do
+      %{variant_id: item.variant_id_snapshot, quantity: item.quantity}
+    end
   end
 
-  defp ensure_priced_snapshot_and_reservations(%{
-         draft: %CheckoutDraft{} = draft,
-         order: %Order{} = order
-       }) do
+  defp ensure_priced_snapshot_and_reservations(
+         %{
+           draft: %CheckoutDraft{} = draft,
+           order: %Order{} = order
+         },
+         input
+       ) do
     Repo.transaction(fn ->
       locked_cart = lock_checkout_cart!(draft.cart_id, draft.cart_version)
       locked_items = lock_cart_items(locked_cart.id)
@@ -668,7 +675,7 @@ defmodule Store.Checkout do
       :ok = ensure_cart_not_empty!(locked_items)
 
       if is_nil(locked_order.totals_finalized_at) do
-        build_checkout_finalize_context(draft, locked_order, locked_cart, locked_items)
+        build_checkout_finalize_context(draft, locked_order, locked_cart, locked_items, input)
       else
         load_already_finalized_checkout(draft, locked_order)
       end
@@ -680,7 +687,7 @@ defmodule Store.Checkout do
     end
   end
 
-  defp ensure_priced_snapshot_and_reservations(_checkout) do
+  defp ensure_priced_snapshot_and_reservations(_checkout, _input) do
     {:error, Error.new("VALIDATION_ERROR", "checkout context is required")}
   end
 
@@ -702,7 +709,7 @@ defmodule Store.Checkout do
     end
   end
 
-  defp build_checkout_finalize_context(draft, locked_order, locked_cart, locked_items) do
+  defp build_checkout_finalize_context(draft, locked_order, locked_cart, locked_items, input) do
     {variants_by_id, products_by_id} = catalog_maps(locked_items)
     :ok = ensure_published_sellables!(locked_items, variants_by_id, products_by_id)
     plans_by_item_id = resolve_subscription_plans_for_items!(locked_items)
@@ -716,7 +723,36 @@ defmodule Store.Checkout do
         revisions_by_plan_id
       )
 
-    shipping_weight_grams = shipping_weight_grams_for_items(locked_items, variants_by_id)
+    priced =
+      priced_snapshot_output(
+        locked_items,
+        variants_by_id,
+        products_by_id,
+        plans_by_item_id,
+        revisions_by_plan_id,
+        currency
+      )
+
+    if digital_only?(priced.lines) do
+      finalize_digital_checkout(draft, locked_order, priced, input)
+    else
+      build_shipping_finalize_context(draft, locked_order, locked_cart, locked_items, %{
+        variants: variants_by_id,
+        products: products_by_id,
+        plans: plans_by_item_id,
+        priced: priced
+      })
+    end
+  end
+
+  defp build_shipping_finalize_context(draft, locked_order, locked_cart, locked_items, catalog) do
+    %{variants: variants_by_id, products: products_by_id, plans: plans_by_item_id, priced: priced} =
+      catalog
+
+    currency = priced.currency
+
+    shipping_weight_grams =
+      shipping_weight_grams_for_items(locked_items, variants_by_id, products_by_id)
 
     shipping_quote_request =
       quote_request_attrs(
@@ -727,15 +763,7 @@ defmodule Store.Checkout do
         shipping_weight_grams
       )
 
-    case write_finalize_snapshot_and_reservations(
-           locked_order,
-           locked_items,
-           variants_by_id,
-           products_by_id,
-           plans_by_item_id,
-           revisions_by_plan_id,
-           currency
-         ) do
+    case write_finalize_snapshot_and_reservations(locked_order.id, priced) do
       {:ok, snapshot, reservation_result} ->
         %{
           draft: draft,
@@ -761,32 +789,82 @@ defmodule Store.Checkout do
     end
   end
 
-  defp write_finalize_snapshot_and_reservations(
-         locked_order,
-         locked_items,
-         variants_by_id,
-         products_by_id,
-         plans_by_item_id,
-         revisions_by_plan_id,
-         currency
-       ) do
+  defp write_finalize_snapshot_and_reservations(order_id, priced) do
     with {:ok, snapshot} <-
-           write_priced_snapshot(
-             locked_order.id,
-             locked_items,
-             variants_by_id,
-             products_by_id,
-             plans_by_item_id,
-             revisions_by_plan_id,
-             currency
-           ),
+           Store.Orders.write_priced_snapshot(order_id, priced),
          {:ok, reservation_result} <-
            Store.Orders.reserve_inventory_for_checkout(
-             locked_order.id,
-             reserve_items(locked_items)
+             order_id,
+             reserve_items(snapshot.line_items)
            ) do
       {:ok, snapshot, reservation_result}
     end
+  end
+
+  defp digital_only?(items), do: items != [] and Enum.all?(items, & &1.digital_only_snapshot)
+
+  defp finalize_digital_checkout(draft, order, priced, input) do
+    with {:ok, tax} <- evaluate_digital_tax(priced, input),
+         {:ok, %{idempotent?: false, line_items: lines}} <-
+           Store.Orders.write_priced_snapshot(order.id, with_line_tax(priced, tax)),
+         {:ok, %{order: order, idempotent?: false}} <-
+           Store.Orders.write_tax_shipping_snapshot(order.id, tax, location: :billing),
+         {:ok, order} <- finalize_order_totals(order, tax) do
+      %{draft: draft, order: order, line_items: lines, already_finalized?: true}
+    else
+      {:error, reason} ->
+        Repo.rollback(reason)
+
+      {:ok, %{idempotent?: true}} ->
+        Repo.rollback(Error.new("STALE_RECORD", "checkout delivery changed; restart checkout"))
+    end
+  end
+
+  defp evaluate_digital_tax(priced, %CheckoutFinalizeInput{
+         billing_country_code: country,
+         billing_region_code: region
+       })
+       when is_binary(country) and is_binary(region) do
+    with {:ok, rates} <- traced_fetch_tax_rates(country) do
+      TaxShippingEvaluator.evaluate(%{
+        as_of: DateTime.utc_now() |> DateTime.truncate(:microsecond),
+        currency: priced.currency,
+        destination_country_code: country,
+        destination_region_code: region,
+        subtotal_minor: priced.subtotal_minor,
+        shipping_weight_grams: 0,
+        lines:
+          Enum.map(
+            priced.lines,
+            &Map.take(&1, [:line_id, :line_no, :net_line_total_minor, :tax_category_snapshot])
+          ),
+        shipping_rates: [],
+        tax_rates: Enum.map(rates, &tax_rate_candidate/1),
+        shipping_enabled?: false,
+        tax_enabled?: true
+      })
+    end
+  end
+
+  defp evaluate_digital_tax(_priced, _input),
+    do: {:error, Error.new("INVALID_ADDRESS", "billing country and region are required")}
+
+  defp with_line_tax(priced, tax) do
+    tax_by_line = Map.new(tax.line_taxes, &{&1.line_no, &1})
+
+    lines =
+      Enum.map(priced.lines, fn line ->
+        tax_line = Map.fetch!(tax_by_line, line.line_no)
+
+        Map.merge(line, %{
+          tax_minor: tax_line.tax_minor,
+          tax_rate_id_snapshot: tax_line.tax_rate_id,
+          tax_rate_code_snapshot: tax_line.tax_rate_code,
+          tax_rate_bps_snapshot: tax_line.tax_rate_bps
+        })
+      end)
+
+    %{priced | lines: lines}
   end
 
   defp checkout_context_for_user(actor, checkout_key) do
@@ -848,7 +926,10 @@ defmodule Store.Checkout do
   defp build_checkout_summary(%{draft: draft, order: order} = checkout, line_items) do
     item_count = Enum.reduce(line_items, 0, &(&1.quantity + &2))
     items_subtotal = Enum.reduce(line_items, 0, &(&1.net_line_total_minor + &2))
-    shipping_quote_options = shipping_quote_options_for_summary(checkout)
+    shipping_required? = not digital_only?(line_items)
+
+    shipping_quote_options =
+      if shipping_required?, do: shipping_quote_options_for_summary(checkout), else: []
 
     {:ok,
      %{
@@ -860,6 +941,9 @@ defmodule Store.Checkout do
        order_id: order.id,
        order_ref: order.order_ref,
        state: order.state,
+       shipping_required?: shipping_required?,
+       billing_country_code: order.billing_country_code,
+       billing_region_code: order.billing_region_code,
        shipping_rate_code: order.shipping_rate_code,
        shipping_method_code: order.shipping_method_code,
        shipping_quote_hash: order.shipping_quote_hash,
@@ -971,8 +1055,8 @@ defmodule Store.Checkout do
   end
 
   defp quote_options_for_checkout(checkout, input) do
-    with {:ok, currency} <- checkout_currency(checkout),
-         weight_grams <- shipping_weight_grams_for_checkout(checkout),
+    with {:ok, weight_grams} <- checkout_shipping_weight(checkout),
+         {:ok, currency} <- checkout_currency(checkout),
          request_attrs =
            quote_request_attrs(
              input.country_code,
@@ -992,6 +1076,25 @@ defmodule Store.Checkout do
        }}
     end
   end
+
+  defp checkout_shipping_weight(%{order: %Order{billing_country_code: country}})
+       when is_binary(country),
+       do: shipping_not_applicable()
+
+  defp checkout_shipping_weight(%{draft: draft}) do
+    with {:ok, items} <- cart_items_by_checkout_draft(draft) do
+      {variants, products} = catalog_maps(items)
+
+      if items != [] and Enum.all?(items, &digital_cart_item?(&1, variants, products)) do
+        shipping_not_applicable()
+      else
+        {:ok, shipping_weight_grams_for_items(items, variants, products)}
+      end
+    end
+  end
+
+  defp shipping_not_applicable,
+    do: {:error, Error.new("VALIDATION_ERROR", "Digital-only checkout does not require shipping")}
 
   defp ensure_quote_options_present([_ | _]), do: :ok
 
@@ -1129,8 +1232,8 @@ defmodule Store.Checkout do
 
   defp shipping_weight_grams_for_checkout(%{draft: %CheckoutDraft{} = draft}) do
     with {:ok, cart_items} <- cart_items_by_checkout_draft(draft),
-         {variants_by_id, _products_by_id} <- catalog_maps(cart_items) do
-      shipping_weight_grams_for_items(cart_items, variants_by_id)
+         {variants_by_id, products_by_id} <- catalog_maps(cart_items) do
+      shipping_weight_grams_for_items(cart_items, variants_by_id, products_by_id)
     else
       _ -> 0
     end
@@ -1138,10 +1241,22 @@ defmodule Store.Checkout do
 
   defp shipping_weight_grams_for_checkout(_checkout), do: 0
 
-  defp shipping_weight_grams_for_items(cart_items, variants_by_id) do
+  defp shipping_weight_grams_for_items(cart_items, variants_by_id, products_by_id) do
     Enum.reduce(cart_items, 0, fn item, acc ->
-      acc + cart_item_shipping_weight(item, variants_by_id)
+      if digital_cart_item?(item, variants_by_id, products_by_id),
+        do: acc,
+        else: acc + cart_item_shipping_weight(item, variants_by_id)
     end)
+  end
+
+  defp digital_cart_item?(item, variants, products) do
+    case Map.get(variants, item.variant_id) do
+      %Variant{product_id: product_id} ->
+        match?(%Product{product_kind: :digital}, Map.get(products, product_id))
+
+      nil ->
+        false
+    end
   end
 
   defp cart_item_shipping_weight(item, variants_by_id) do

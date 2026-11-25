@@ -61,6 +61,11 @@ defmodule Store.Orders.OrderLineItem do
       public?(true)
     end
 
+    attribute :digital_only_snapshot, :boolean do
+      allow_nil?(false)
+      default(false)
+    end
+
     attribute :variant_id_snapshot, :uuid do
       allow_nil?(true)
       public?(true)
@@ -207,6 +212,7 @@ defmodule Store.Orders.OrderLineItem do
         :product_title_snapshot,
         :variant_title_snapshot,
         :variant_id_snapshot,
+        :digital_only_snapshot,
         :subscription_plan_id_snapshot,
         :subscription_plan_revision_id_snapshot,
         :subscription_plan_key_snapshot,

@@ -801,9 +801,12 @@ defmodule Store.Carts.Facade do
     end
   end
 
-  defp ensure_subscription_plan_compatibility(_variant_id, :simple, nil), do: :ok
+  defp ensure_subscription_plan_compatibility(_variant_id, kind, nil)
+       when kind in [:simple, :digital],
+       do: :ok
 
-  defp ensure_subscription_plan_compatibility(_variant_id, :simple, _plan_id) do
+  defp ensure_subscription_plan_compatibility(_variant_id, kind, _plan_id)
+       when kind in [:simple, :digital] do
     {:error,
      Error.new("VALIDATION_ERROR", "subscription_plan_id is only valid for subscription products")}
   end

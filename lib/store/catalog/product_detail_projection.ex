@@ -42,7 +42,7 @@ defmodule Store.Catalog.ProductDetailProjection do
 
   @spec fetch(Product.t()) :: {:ok, payload()} | {:error, Error.t()}
   def fetch(%Product{id: product_id} = product) when is_binary(product_id) do
-    AvailabilityCache.fetch(product_id, fn -> {:ok, build_payload(product_id)} end)
+    AvailabilityCache.fetch(product_id, fn -> {:ok, build_payload(product)} end)
     |> normalize_cache_result()
     |> case do
       {:ok, payload} ->
@@ -113,10 +113,10 @@ defmodule Store.Catalog.ProductDetailProjection do
     |> Map.put(:images, images)
   end
 
-  defp build_payload(product_id) do
+  defp build_payload(%Product{id: product_id, product_kind: kind}) do
     options = load_options(product_id)
     values_by_option_id = load_values_by_option_id(Enum.map(options, & &1.id))
-    variant_rows = load_variant_rows(product_id, options)
+    variant_rows = load_variant_rows(product_id, options, kind == :digital)
     variant_indexes = build_variant_indexes(variant_rows)
 
     option_lookup = Map.new(options, &{&1.slug, &1})
@@ -191,7 +191,7 @@ defmodule Store.Catalog.ProductDetailProjection do
     |> Map.new()
   end
 
-  defp load_variant_rows(product_id, options) do
+  defp load_variant_rows(product_id, options, digital?) do
     required_option_ids =
       options
       |> Enum.filter(& &1.selection_required)
@@ -213,13 +213,13 @@ defmodule Store.Catalog.ProductDetailProjection do
     )
     |> Repo.all()
     |> Enum.group_by(& &1.variant.id)
-    |> Enum.map(&build_variant_row(&1, required_option_ids))
+    |> Enum.map(&build_variant_row(&1, required_option_ids, digital?))
     |> Enum.sort_by(fn %{variant: variant} ->
       {variant.inserted_at, BinaryUuidSort.normalize_raw16!(variant.id)}
     end)
   end
 
-  defp build_variant_row({_variant_id, rows}, required_option_ids) do
+  defp build_variant_row({_variant_id, rows}, required_option_ids, digital?) do
     %{variant: variant, inventory: inventory} = hd(rows)
     selection_map = selection_map(rows)
     required_complete? = Enum.all?(required_option_ids, &Map.has_key?(selection_map, &1))
@@ -229,7 +229,7 @@ defmodule Store.Catalog.ProductDetailProjection do
       selection_by_option_id: selection_map,
       required_complete?: required_complete?,
       sellable?: required_complete?,
-      in_stock?: variant_in_stock?(inventory)
+      in_stock?: digital? or variant_in_stock?(inventory)
     }
   end
 

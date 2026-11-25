@@ -155,6 +155,14 @@ defmodule Store.Orders.Order do
       public?(true)
     end
 
+    attribute :billing_country_code, :string do
+      allow_nil?(true)
+    end
+
+    attribute :billing_region_code, :string do
+      allow_nil?(true)
+    end
+
     attribute :shipping_country_code, :string do
       allow_nil?(true)
       public?(true)
@@ -358,6 +366,8 @@ defmodule Store.Orders.Order do
         :free_shipping_reason,
         :shipping_tax_minor,
         :tax_total_minor,
+        :billing_country_code,
+        :billing_region_code,
         :shipping_country_code,
         :shipping_region_code,
         :shipping_postal_code,

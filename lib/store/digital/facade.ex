@@ -27,6 +27,7 @@ defmodule Store.Digital.Facade do
   alias Store.Digital.Workers.IssueGrantsForPaidOrderWorker
   alias Store.Orders.{Order, OrderLineItem}
   alias Store.Payments.Refund
+  alias Store.Repo
   alias Store.Support.Errors.{Error, Normalize}
   alias Store.Support.RateLimit
 
@@ -177,12 +178,18 @@ defmodule Store.Digital.Facade do
     end
   end
 
+  @doc "Queues grant issuance on Store.Repo so it commits with the payment application when called in that transaction."
   @spec enqueue_paid_order_download_grants_for_system(Ecto.UUID.t()) ::
           {:ok, Oban.Job.t()} | {:error, term()}
   def enqueue_paid_order_download_grants_for_system(order_id) when is_binary(order_id) do
-    %{"order_id" => order_id}
-    |> IssueGrantsForPaidOrderWorker.new()
-    |> Oban.insert()
+    changeset = IssueGrantsForPaidOrderWorker.new(%{"order_id" => order_id})
+    multi = Oban.insert(Ecto.Multi.new(), :grant_job, changeset)
+
+    case Repo.transaction(multi) do
+      {:ok, %{grant_job: job}} -> {:ok, job}
+      {:error, :grant_job, reason, _changes} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @spec order_has_digital_assets_for_system(Ecto.UUID.t()) :: {:ok, boolean()} | {:error, term()}

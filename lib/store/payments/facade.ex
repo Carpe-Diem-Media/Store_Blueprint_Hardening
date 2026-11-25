@@ -19,6 +19,10 @@ defmodule Store.Payments.Facade do
   alias Store.Payments.Refunds
   alias Store.Support.Errors.Normalize
 
+  @doc "Returns the enabled gateway that the storefront may explicitly select for a purchase."
+  @spec purchase_provider_for_public() :: Providers.known_provider() | nil
+  defdelegate purchase_provider_for_public(), to: Providers, as: :default_purchase_provider_for_ui
+
   @spec observe_payment_intent_for_system(ObservePaymentIntentInput.t()) ::
           {:ok, ObservationReconciliation.result()} | {:error, term()}
   def observe_payment_intent_for_system(%ObservePaymentIntentInput{} = input) do
@@ -115,6 +119,8 @@ defmodule Store.Payments.Facade do
   @spec ingest_webhook_receipt_for_system(WebhookReceiptIngestInput.t()) ::
           {:ok, %{receipt: WebhookReceipt.t(), duplicate?: boolean()}} | {:error, term()}
   def ingest_webhook_receipt_for_system(%WebhookReceiptIngestInput{} = input) do
+    candidate_id = Ash.UUIDv7.generate()
+
     attrs =
       input
       |> Map.from_struct()
@@ -123,8 +129,9 @@ defmodule Store.Payments.Facade do
 
     WebhookReceipt
     |> Ash.Changeset.for_create(:ingest, attrs)
+    |> Ash.Changeset.force_change_attribute(:id, candidate_id)
     |> Ash.create(domain: Store.Payments, context: %{system?: true}, authorize?: false)
-    |> normalize_result()
+    |> normalize_ingest_result(candidate_id)
   end
 
   @spec get_webhook_receipt_for_system(Ecto.UUID.t()) ::
@@ -239,16 +246,16 @@ defmodule Store.Payments.Facade do
     end
   end
 
-  defp normalize_result({:ok, %WebhookReceipt{} = receipt}) do
+  defp normalize_ingest_result({:ok, %WebhookReceipt{} = receipt}, candidate_id) do
     {:ok,
      %{
        receipt: receipt,
-       duplicate?: Ash.Resource.get_metadata(receipt, :upsert_skipped) == true
+       duplicate?: receipt.id != candidate_id
      }}
   end
 
-  defp normalize_result({:ok, result}), do: {:ok, result}
-  defp normalize_result({:error, error}), do: {:error, Normalize.normalize(error)}
+  defp normalize_ingest_result({:error, error}, _candidate_id),
+    do: {:error, Normalize.normalize(error)}
 
   defp mark_processing(%WebhookReceipt{processing_status: "processed"} = receipt),
     do: {:ok, receipt}
