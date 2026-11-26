@@ -109,6 +109,8 @@ defmodule Store.Payments do
              :ok <- ensure_payable_total(checkout),
              :ok <- Providers.ensure_enabled_provider(input.provider),
              {:ok, has_subscription_lines?} <- order_has_subscription_lines(checkout.order_id),
+             {:ok, provider_context} <-
+               checkout_provider_context(input.provider, actor, checkout, has_subscription_lines?),
              {:ok, intent_result} <- create_or_reuse_intent_for_checkout(checkout, input),
              {:ok, payment_intent, checkout} <-
                ensure_provider_setup(
@@ -116,7 +118,7 @@ defmodule Store.Payments do
                  checkout,
                  intent_result.payment_intent_key,
                  input,
-                 has_subscription_lines?
+                 provider_context
                ) do
           {:ok, build_checkout_intent_result(checkout, intent_result, payment_intent)}
         end
@@ -235,18 +237,51 @@ defmodule Store.Payments do
       order_id: checkout.order_id,
       amount_received_minor: checkout.grand_total_minor,
       currency: checkout.currency_code,
-      provider: input.provider
+      provider: input.provider,
+      provider_request_reference: checkout_request_reference(input.provider, checkout.order_id)
     }
 
     create_or_reuse_payment_intent(attrs, context: %{system?: true})
   end
+
+  defp checkout_request_reference(:paystack, order_id),
+    do: "checkout-" <> String.replace(order_id, "-", "")
+
+  defp checkout_request_reference(_provider, _order_id), do: nil
+
+  defp checkout_provider_context(:paystack, _actor, _checkout, true) do
+    {:error,
+     Error.new("PAYMENT_PROVIDER_UNSUPPORTED", "Paystack subscription checkout is disabled")}
+  end
+
+  defp checkout_provider_context(
+         :paystack,
+         %{id: user_id, email: email},
+         %{user_id: user_id, currency_code: "ZAR", grand_total_minor: amount},
+         false
+       )
+       when is_binary(user_id) and amount > 0 and
+              (is_binary(email) or is_struct(email, Ash.CiString)) do
+    {:ok, %{has_subscription_lines?: false, customer_email: to_string(email)}}
+  end
+
+  defp checkout_provider_context(:paystack, _actor, _checkout, _subscription_lines?) do
+    {:error,
+     Error.new(
+       "VALIDATION_ERROR",
+       "Paystack checkout requires a signed-in customer and a positive ZAR total"
+     )}
+  end
+
+  defp checkout_provider_context(_provider, _actor, _checkout, has_subscription_lines?),
+    do: {:ok, %{has_subscription_lines?: has_subscription_lines?, customer_email: nil}}
 
   defp ensure_provider_reference(
          payment_intent,
          checkout,
          payment_intent_key,
          input,
-         has_subscription_lines?
+         provider_context
        ) do
     case provider_reference_present?(payment_intent) do
       true ->
@@ -259,7 +294,7 @@ defmodule Store.Payments do
                  checkout,
                  payment_intent_key,
                  input,
-                 has_subscription_lines?
+                 provider_context
                ) do
           update_provider_reference(payment_intent, provider_payload, input.provider)
         end
@@ -271,7 +306,7 @@ defmodule Store.Payments do
          checkout,
          payment_intent_key,
          input,
-         has_subscription_lines?
+         provider_context
        ) do
     ProviderTask.execute(
       fn ->
@@ -279,9 +314,9 @@ defmodule Store.Payments do
           input.provider,
           provider_create_intent_attrs(
             checkout,
-            payment_intent.id,
+            payment_intent,
             payment_intent_key,
-            has_subscription_lines?
+            provider_context
           ),
           []
         )
@@ -298,7 +333,7 @@ defmodule Store.Payments do
          checkout,
          payment_intent_key,
          input,
-         has_subscription_lines?
+         provider_context
        ) do
     with {:ok, payment_intent, checkout} <-
            ensure_provider_reference_for_checkout(
@@ -306,7 +341,7 @@ defmodule Store.Payments do
              checkout,
              payment_intent_key,
              input,
-             has_subscription_lines?
+             provider_context
            ) do
       time_provider_setup_phase(:local_finalize, input.provider, fn ->
         reconcile_local_provider_setup(payment_intent, checkout, source: :request)
@@ -319,7 +354,7 @@ defmodule Store.Payments do
          checkout,
          payment_intent_key,
          input,
-         has_subscription_lines?
+         provider_context
        ) do
     case provider_reference_present?(payment_intent) do
       true ->
@@ -331,7 +366,7 @@ defmodule Store.Payments do
           checkout,
           payment_intent_key,
           input,
-          has_subscription_lines?
+          provider_context
         )
     end
   end
@@ -341,7 +376,7 @@ defmodule Store.Payments do
          checkout,
          payment_intent_key,
          input,
-         has_subscription_lines?
+         provider_context
        ) do
     case mark_provider_setup_pending(checkout) do
       {:ok, updated_checkout} ->
@@ -350,7 +385,7 @@ defmodule Store.Payments do
           updated_checkout,
           payment_intent_key,
           input,
-          has_subscription_lines?
+          provider_context
         )
         |> finalize_provider_request(updated_checkout, payment_intent)
 
@@ -404,9 +439,9 @@ defmodule Store.Payments do
 
   defp provider_create_intent_attrs(
          checkout,
-         local_intent_id,
+         payment_intent,
          payment_intent_key,
-         has_subscription_lines?
+         %{has_subscription_lines?: has_subscription_lines?, customer_email: customer_email}
        ) do
     urls = provider_return_urls(checkout.checkout_key)
     checkout_mode = provider_checkout_mode(checkout.grand_total_minor, has_subscription_lines?)
@@ -415,11 +450,13 @@ defmodule Store.Payments do
       order_ref: checkout.order_ref,
       order_id: checkout.order_id,
       checkout_key: checkout.checkout_key,
-      local_intent_id: local_intent_id,
+      local_intent_id: payment_intent.id,
       amount_minor: checkout.grand_total_minor,
       currency: checkout.currency_code,
       payment_intent_key: payment_intent_key,
       idempotency_key: payment_intent_key,
+      provider_request_reference: payment_intent.provider_request_reference,
+      customer_email: customer_email,
       has_subscription_lines?: has_subscription_lines?,
       save_payment_method_for_off_session?: has_subscription_lines?,
       checkout_mode: checkout_mode,
@@ -787,7 +824,7 @@ defmodule Store.Payments do
          updated_checkout,
          payment_intent_key,
          input,
-         has_subscription_lines?
+         provider_context
        ) do
     time_provider_setup_phase(:provider_request, input.provider, fn ->
       ensure_provider_reference(
@@ -795,7 +832,7 @@ defmodule Store.Payments do
         updated_checkout,
         payment_intent_key,
         input,
-        has_subscription_lines?
+        provider_context
       )
     end)
   end

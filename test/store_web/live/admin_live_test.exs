@@ -4,6 +4,8 @@ defmodule StoreWeb.AdminLiveTest do
   import Phoenix.LiveViewTest
 
   alias AshAuthentication.Plug.Helpers
+  alias Store.Catalog.Product
+  alias Store.Repo
   alias Store.TestFixtures
 
   test "redirects unauthenticated users to sign-in", %{conn: conn} do
@@ -48,6 +50,35 @@ defmodule StoreWeb.AdminLiveTest do
 
     assert {:error, {:redirect, %{to: "/"}}} = live(conn, ~p"/admin")
     assert {:ok, _view, _html} = live(conn, ~p"/admin/subscriptions")
+  end
+
+  test "an admin can create a digital download product", %{conn: conn} do
+    admin = signed_in_user(TestFixtures.unique_email("digital_catalog_admin"))
+    _role = TestFixtures.assign_role!(admin, :admin)
+    conn = conn |> init_test_session(%{}) |> Helpers.store_in_session(admin)
+    assert {:ok, view, _html} = live(conn, ~p"/admin/products/new")
+    slug = "newyou-download-#{System.unique_integer([:positive])}"
+
+    assert has_element?(
+             view,
+             "#product-form select[name='product[product_kind]'] option[value=digital]"
+           )
+
+    view
+    |> form("#product-form", %{
+      "product" => %{
+        "slug" => slug,
+        "title" => "NewYou download",
+        "product_kind" => "digital",
+        "base_variant_sku" => slug,
+        "base_variant_currency_code" => "ZAR",
+        "base_variant_price_minor" => "2000",
+        "base_variant_stock_on_hand" => "0"
+      }
+    })
+    |> render_submit()
+
+    assert %Product{product_kind: :digital, status: :draft} = Repo.get_by!(Product, slug: slug)
   end
 
   defp signed_in_user(email) do

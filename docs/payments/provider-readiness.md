@@ -13,7 +13,7 @@ This document is the operational truth for payment provider readiness. It separa
 | --- | --- | --- | --- | --- |
 | Stripe | Implemented | Implemented | Implemented | Implemented |
 | PayFast | Scaffold only | Scaffold only | Scaffold only | Not production-ready |
-| Paystack | Scaffold only | Scaffold only | Scaffold only | Not production-ready |
+| Paystack | One-time ZAR card checkout and exact-reference verification in Test Mode. Off-session charging disabled. | Dedicated Test Mode signing secret and timestamped HMAC | Signed `charge.success` for one-time checkout | Sandbox only. See the [Paystack integration reference](paystack-integration.md). |
 | Yoco | Scaffold only | Scaffold only | Scaffold only | Not production-ready |
 | Peach Payments | Scaffold only | Scaffold only | Scaffold only | Not production-ready |
 

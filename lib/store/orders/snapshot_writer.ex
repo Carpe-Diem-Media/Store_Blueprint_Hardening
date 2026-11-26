@@ -82,6 +82,7 @@ defmodule Store.Orders.SnapshotWriter do
           product_title_snapshot: line.product_title_snapshot,
           variant_title_snapshot: line.variant_title_snapshot,
           variant_id_snapshot: line.line_id,
+          digital_only_snapshot: Map.get(line, :digital_only_snapshot, false),
           subscription_plan_id_snapshot: Map.get(line, :subscription_plan_id_snapshot),
           subscription_plan_revision_id_snapshot:
             Map.get(line, :subscription_plan_revision_id_snapshot),

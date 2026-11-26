@@ -157,7 +157,7 @@ defmodule Store.Payments.Providers do
     end
   end
 
-  @spec normalize_webhook(provider(), map()) :: {:ok, term()} | {:error, term()}
+  @spec normalize_webhook(provider(), map()) :: {:ok, term()} | :ignore | {:error, term()}
   def normalize_webhook(provider, payload) when is_map(payload) do
     with {:ok, module} <- adapter(provider) do
       module.normalize_webhook(payload)

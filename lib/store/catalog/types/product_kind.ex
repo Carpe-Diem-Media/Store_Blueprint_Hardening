@@ -4,5 +4,5 @@ defmodule Store.Catalog.Types.ProductKind do
   """
 
   use Ash.Type.Enum,
-    values: [:simple, :subscription]
+    values: [:simple, :subscription, :digital]
 end

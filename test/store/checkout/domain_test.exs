@@ -8,9 +8,11 @@ defmodule Store.CheckoutTest do
   alias Store.Carts.Cart
   alias Store.Carts.Facade, as: CartsFacade
   alias Store.Carts.Inputs.CartItemInput
-  alias Store.Catalog.InventoryItem
+  alias Store.Catalog.{InventoryItem, Product}
   alias Store.Checkout
   alias Store.Checkout.Inputs.{CheckoutFinalizeInput, CheckoutShippingInput, CheckoutStartInput}
+  alias Store.Fulfillment
+  alias Store.Fulfillment.FulfillmentItem
   alias Store.Orders.{InventoryReservation, Order, OrderAdjustment, OrderLineItem}
   alias Store.Pricing.TaxRate
   alias Store.Repo
@@ -268,8 +270,8 @@ defmodule Store.CheckoutTest do
       assert checkout.totals_finalized? == false
       assert length(checkout.items) == 1
 
-      assert 0 ==
-               Ash.count!(OrderLineItem, domain: Store.Orders, authorize?: false)
+      order_lines = Ash.Query.filter(OrderLineItem, expr(order_id == ^start_result.order_id))
+      assert Ash.count!(order_lines, domain: Store.Orders, authorize?: false) == 0
 
       order = load_order!(start_result.order_id)
       assert order.shipping_quote_hash == selection.quote_hash
@@ -386,6 +388,152 @@ defmodule Store.CheckoutTest do
              Checkout.finalize_totals(checkout.actor, checkout.checkout_key, finalize_input)
 
     assert error.code == "VALIDATION_ERROR"
+  end
+
+  test "digital checkout records billing tax without a shipping quote, charge, or stock hold" do
+    buyer = TestFixtures.register_user!(email: TestFixtures.unique_email("digital_checkout"))
+    token = Ash.UUIDv7.generate()
+    {variant_id, admin, product} = published_variant_with_admin!(:digital, "ZAR", 0)
+    pricing = create_pricing_rules!("ZA", "WC", "ZAR")
+    {:ok, add} = CartItemInput.new(%{"variant_id" => variant_id, "qty" => 1})
+    assert {:ok, _} = CartsFacade.add_item_for_user(buyer, token, add)
+    {:ok, start} = CheckoutStartInput.new(%{})
+    assert {:ok, checkout} = Checkout.start_from_cart(buyer, token, start)
+    order_id = checkout.order_id
+
+    assert {:ok, %{shipping_required?: false, shipping_quote_options: []}} =
+             Checkout.get_checkout_for_user(buyer, checkout.checkout_key)
+
+    {:ok, shipping} =
+      CheckoutShippingInput.new(%{
+        "recipient_name" => "Digital Buyer",
+        "address_line1" => "1 Main St",
+        "city" => "Cape Town",
+        "country_code" => "ZA",
+        "region_code" => "WC",
+        "postal_code" => "8001",
+        "phone" => "0215551212",
+        "quote_hash" => String.duplicate("a", 64),
+        "shipping_method_code" => pricing.method.code
+      })
+
+    assert {:error,
+            %{
+              code: "VALIDATION_ERROR",
+              message: "Digital-only checkout does not require shipping"
+            }} =
+             Checkout.set_shipping(buyer, checkout.checkout_key, shipping)
+
+    {:ok, missing_location} = CheckoutFinalizeInput.new(%{})
+
+    assert {:error, %{code: "INVALID_ADDRESS"}} =
+             Checkout.finalize_totals(buyer, checkout.checkout_key, missing_location)
+
+    assert Repo.all(from row in OrderLineItem, where: row.order_id == ^order_id) == []
+
+    {:ok, unknown_location} =
+      CheckoutFinalizeInput.new(%{billing_country_code: "ZA", billing_region_code: "ZZ"})
+
+    assert {:error, %{code: "TAX_RATE_NOT_FOUND"}} =
+             Checkout.finalize_totals(buyer, checkout.checkout_key, unknown_location)
+
+    assert {:ok, input} =
+             CheckoutFinalizeInput.new(%{
+               "billing_country_code" => "ZA",
+               "billing_region_code" => "WC"
+             })
+
+    assert {:ok,
+            %{shipping_total_minor: 0, tax_total_minor: 160, grand_total_minor: 2160} = result} =
+             Checkout.finalize_totals(buyer, checkout.checkout_key, input)
+
+    assert %{
+             billing_country_code: "ZA",
+             billing_region_code: "WC",
+             shipping_country_code: nil,
+             shipping_quote_hash: nil,
+             tax_as_of: %DateTime{}
+           } = Repo.get!(Order, order_id)
+
+    assert [
+             %{
+               id: line_id,
+               digital_only_snapshot: true,
+               tax_minor: 160,
+               tax_rate_bps_snapshot: 800
+             }
+           ] =
+             Repo.all(from row in OrderLineItem, where: row.order_id == ^order_id)
+
+    assert Repo.all(from row in InventoryReservation, where: row.order_id == ^order_id) == []
+
+    assert Repo.all(
+             from row in OrderAdjustment,
+               where: row.order_id == ^order_id and row.kind == "shipping"
+           ) == []
+
+    product
+    |> Ash.Changeset.for_update(:unpublish, %{})
+    |> Ash.update!(domain: Store.Catalog, actor: admin)
+    |> Ash.Changeset.for_update(:update_draft, %{product_kind: :simple})
+    |> Ash.update!(domain: Store.Catalog, actor: admin)
+    |> Ash.Changeset.for_update(:publish, %{})
+    |> Ash.update!(domain: Store.Catalog, actor: admin)
+
+    assert %Product{product_kind: :simple} = Repo.get!(Product, product.id)
+
+    pricing.tax
+    |> Ash.Changeset.for_update(:update, %{rate_basis_points: 1500}, context: %{system?: true})
+    |> Ash.update!(domain: Store.Pricing, authorize?: false, context: %{system?: true})
+
+    assert {:ok, repeated} = Checkout.finalize_totals(buyer, checkout.checkout_key, input)
+    refute repeated.shipping_required?
+    assert repeated.grand_total_minor == result.grand_total_minor
+
+    assert [
+             %{
+               id: ^line_id,
+               digital_only_snapshot: true,
+               tax_minor: 160,
+               tax_rate_bps_snapshot: 800
+             }
+           ] =
+             Repo.all(from row in OrderLineItem, where: row.order_id == ^order_id)
+  end
+
+  test "mixed checkout reserves only the physical item and still charges shipping" do
+    {digital, _, _} = published_variant_with_admin!(:digital, "USD", 0)
+    checkout = setup_checkout_with_shipping!([digital])
+    order_id = checkout.order_id
+    physical = checkout.variant_id
+    {:ok, input} = CheckoutFinalizeInput.new(%{})
+
+    assert {:ok, %{shipping_required?: true, shipping_total_minor: 500}} =
+             Checkout.finalize_totals(checkout.actor, checkout.checkout_key, input)
+
+    assert [%{variant_id: ^physical}] =
+             Repo.all(from row in InventoryReservation, where: row.order_id == ^order_id)
+
+    assert MapSet.new(
+             Repo.all(
+               from row in OrderLineItem,
+                 where: row.order_id == ^order_id,
+                 select: {row.variant_id_snapshot, row.digital_only_snapshot}
+             )
+           ) == MapSet.new([{physical, false}, {digital, true}])
+
+    order_id
+    |> load_order!()
+    |> Ash.Changeset.for_update(:mark_paid, %{}, context: %{system?: true})
+    |> Ash.update!(domain: Store.Orders, authorize?: false, context: %{system?: true})
+
+    assert {:ok, %{fulfillment_order: %{id: fulfillment_id}}} =
+             Fulfillment.ensure_fulfillment_for_paid_order(order_id)
+
+    assert [%{variant_id: ^physical}] =
+             Repo.all(
+               from item in FulfillmentItem, where: item.fulfillment_order_id == ^fulfillment_id
+             )
   end
 
   test "finalize_totals succeeds using stored quote evidence after rule changes" do
@@ -525,7 +673,7 @@ defmodule Store.CheckoutTest do
     variant_id
   end
 
-  defp published_variant_with_admin! do
+  defp published_variant_with_admin!(kind \\ :simple, currency \\ "USD", stock \\ 50) do
     admin = TestFixtures.register_user!(email: TestFixtures.unique_email("checkout_admin"))
     _role = TestFixtures.assign_role!(admin, :admin)
 
@@ -537,9 +685,10 @@ defmodule Store.CheckoutTest do
           slug: "phase20-checkout-#{System.unique_integer([:positive])}",
           title: "Phase 20 Checkout Product",
           base_variant_sku: "P20-CHK-#{System.unique_integer([:positive])}",
-          base_variant_currency_code: "USD",
+          product_kind: kind,
+          base_variant_currency_code: currency,
           base_variant_price_minor: 2_000,
-          base_variant_stock_on_hand: 50
+          base_variant_stock_on_hand: stock
         }
       )
       |> Ash.create!(domain: Store.Catalog, actor: admin)
@@ -552,7 +701,7 @@ defmodule Store.CheckoutTest do
     {published.default_variant_id, admin, published}
   end
 
-  defp create_pricing_rules! do
+  defp create_pricing_rules!(country \\ "US", region \\ "CA", currency \\ "USD") do
     unique = System.unique_integer([:positive])
     method_code = "GROUND-#{unique}"
 
@@ -569,7 +718,12 @@ defmodule Store.CheckoutTest do
       ShippingZone
       |> Ash.Changeset.for_create(
         :create,
-        %{code: "US-CA-#{unique}", country_code: "US", region_code: "CA", active: true},
+        %{
+          code: "#{country}-#{region}-#{unique}",
+          country_code: country,
+          region_code: region,
+          active: true
+        },
         context: %{system?: true}
       )
       |> Ash.create!(domain: Store.Shipping, authorize?: false, context: %{system?: true})
@@ -582,7 +736,7 @@ defmodule Store.CheckoutTest do
           code: "GROUND_RULE_#{unique}",
           shipping_zone_id: zone.id,
           shipping_method_id: method.id,
-          currency: "USD",
+          currency: currency,
           shipping_cost_minor: 500,
           active: true,
           precedence_rank: 10
@@ -596,9 +750,9 @@ defmodule Store.CheckoutTest do
       |> Ash.Changeset.for_create(
         :create,
         %{
-          code: "CA-STANDARD-#{unique}",
-          country_code: "US",
-          region_code: "CA",
+          code: "#{region}-STANDARD-#{unique}",
+          country_code: country,
+          region_code: region,
           product_tax_category: "STANDARD",
           rate_basis_points: 800,
           shipping_taxable: true,
@@ -628,7 +782,7 @@ defmodule Store.CheckoutTest do
     }
   end
 
-  defp setup_checkout_with_shipping! do
+  defp setup_checkout_with_shipping!(extra_variants \\ []) do
     token = Ash.UUIDv7.generate()
     actor = %{cart_token: token}
     variant_id = published_variant_id!()
@@ -636,6 +790,12 @@ defmodule Store.CheckoutTest do
 
     assert {:ok, add_input} = CartItemInput.new(%{"variant_id" => variant_id, "qty" => 1})
     assert {:ok, _cart} = CartsFacade.add_item_for_user(nil, token, add_input)
+
+    Enum.each(extra_variants, fn extra_variant ->
+      {:ok, add} = CartItemInput.new(%{"variant_id" => extra_variant, "qty" => 1})
+      assert {:ok, _} = CartsFacade.add_item_for_user(nil, token, add)
+    end)
+
     assert {:ok, start_input} = CheckoutStartInput.new(%{})
     assert {:ok, start_result} = Checkout.start_from_cart(nil, token, start_input)
 

@@ -38,6 +38,12 @@ Tax computation inputs must be explicit:
 - product tax category (if used)
 - tax rate table effective window
 
+For an order containing only products classified as digital downloads, use the
+buyer’s billing country and region. Store records these separately from the
+shipping address. A digital-only order has no shipping quote, shipping tax, or
+shipping charge. A mixed cart still uses its shipping destination for tax and
+requires a shipping quote for the physical items.
+
 ### 3.2 Deterministic tax calculation (MUST)
 - Compute per line item tax from priced snapshot evidence (`net_line_total_minor`, post-discount).
 - Use round half up at the line level to minor units.

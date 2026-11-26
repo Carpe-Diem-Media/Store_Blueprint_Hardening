@@ -8,6 +8,7 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
   alias Store.Checkout
   alias Store.Orders
   alias Store.Payments
+  alias Store.Payments.Facade, as: PaymentsFacade
   alias Store.Support.Errors.Normalize
   alias Store.Support.Telemetry.RepoStats
   alias StoreWeb.Live.StaticToLive
@@ -26,6 +27,7 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
       |> assign(:cart_token, Map.get(session, "cart_token"))
       |> assign(:checkout_key, nil)
       |> assign(:payment_intent, nil)
+      |> assign(:purchase_provider, PaymentsFacade.purchase_provider_for_public())
       |> assign(:hydrating?, true)
       |> assign(:resume_state, :loading)
       |> assign(:order_topic, nil)
@@ -104,13 +106,15 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
   end
 
   @impl true
-  def handle_event("finalize_totals", _params, socket) do
+  def handle_event("finalize_totals", params, socket) do
     if return_mode?(socket) or expired_resume?(socket) do
       {:noreply, socket}
     else
       actor = checkout_actor(socket)
 
-      with {:ok, input} <- CheckoutFinalizeParams.input(%{}),
+      billing = Map.take(params, ["billing_country_code", "billing_region_code"])
+
+      with {:ok, input} <- CheckoutFinalizeParams.input(billing),
            {:ok, checkout} <- Checkout.finalize_totals(actor, socket.assigns.checkout_key, input) do
         {:noreply,
          socket
@@ -127,13 +131,15 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
   end
 
   @impl true
-  def handle_event("create_payment_intent", params, socket) do
+  def handle_event("create_payment_intent", _params, socket) do
     if return_mode?(socket) or expired_resume?(socket) do
       {:noreply, socket}
     else
       actor = checkout_actor(socket)
 
-      with {:ok, input} <- CreateIntentForOrderParams.input(params),
+      with provider when not is_nil(provider) <-
+             PaymentsFacade.purchase_provider_for_public(),
+           {:ok, input} <- CreateIntentForOrderParams.input(%{provider: provider}),
            {:ok, intent} <-
              Payments.create_intent_for_order(actor, socket.assigns.checkout_key, input),
            {:ok, checkout} <- Checkout.get_checkout_for_user(actor, socket.assigns.checkout_key) do
@@ -144,6 +150,12 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
 
         {:noreply, maybe_redirect_to_payment(socket, intent)}
       else
+        nil ->
+          {:noreply,
+           socket
+           |> assign(:purchase_provider, nil)
+           |> put_flash(:error, "Payment is currently unavailable.")}
+
         {:error, error} ->
           {:noreply, put_flash(socket, :error, checkout_error_message(error, :payment_intent))}
 
@@ -236,7 +248,7 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
       <section id="checkout-live" class="space-y-6">
         <header class="space-y-2">
           <h1 class="text-2xl font-semibold">Checkout</h1>
-          <p class="text-sm text-base-content/70">
+          <p :if={@checkout && @checkout.shipping_required?} class="text-sm text-base-content/70">
             Review shipping, finalize totals, then continue to payment.
           </p>
         </header>
@@ -283,7 +295,10 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
         </div>
 
         <div :if={@checkout} class="grid gap-4 lg:grid-cols-2">
-          <article class="space-y-4 rounded-xl border border-base-300 bg-base-200/50 p-4">
+          <article
+            :if={@checkout.shipping_required?}
+            class="space-y-4 rounded-xl border border-base-300 bg-base-200/50 p-4"
+          >
             <h2 class="text-base font-semibold">Shipping</h2>
 
             <form :if={@live_action == :index} phx-submit="set_shipping" class="grid gap-3">
@@ -397,6 +412,44 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
             </div>
           </article>
 
+          <article
+            :if={!@checkout.shipping_required?}
+            class="space-y-4 rounded-xl border border-base-300 bg-base-200/50 p-4"
+          >
+            <h2 class="text-base font-semibold">Billing location</h2>
+            <form
+              :if={@live_action == :index && !@checkout.totals_finalized?}
+              id="digital-billing"
+              phx-submit="finalize_totals"
+              class="grid gap-3"
+            >
+              <.input
+                id="billing-country-code"
+                name="billing_country_code"
+                type="text"
+                value={@checkout.billing_country_code || ""}
+                label="Country code"
+                placeholder="ZA"
+                maxlength="2"
+                required
+              />
+              <.input
+                id="billing-region-code"
+                name="billing_region_code"
+                type="text"
+                value={@checkout.billing_region_code || ""}
+                label="Region code"
+                placeholder="WC"
+                maxlength="12"
+                required
+              />
+              <.button type="submit">Finalize Totals</.button>
+            </form>
+            <p :if={@checkout.billing_country_code} class="text-sm">
+              {@checkout.billing_country_code}, {@checkout.billing_region_code}
+            </p>
+          </article>
+
           <article class="space-y-4 rounded-xl border border-base-300 bg-base-200/50 p-4">
             <h2 class="text-base font-semibold">Summary</h2>
 
@@ -418,7 +471,11 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
                 </span>
               </div>
 
-              <div class="flex items-center justify-between">
+              <div
+                :if={@checkout.shipping_required?}
+                id="checkout-shipping-total"
+                class="flex items-center justify-between"
+              >
                 <span>Shipping</span>
                 <span class="font-semibold">
                   {format_money(@checkout.shipping_total_minor, @checkout.currency_code)}
@@ -441,16 +498,23 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
             </div>
 
             <div :if={@live_action == :index} class="space-y-2">
-              <.button id="finalize-totals" phx-click="finalize_totals" class="w-full">
+              <.button
+                :if={@checkout.shipping_required?}
+                id="finalize-totals"
+                phx-click="finalize_totals"
+                class="w-full"
+              >
                 Finalize Totals
               </.button>
 
               <.button
                 id="pay-now"
                 phx-click="create_payment_intent"
-                phx-value-provider="stripe"
                 class="w-full"
-                disabled={!@checkout.totals_finalized? or @resume_state == :expired_restart_required}
+                disabled={
+                  is_nil(@purchase_provider) or !@checkout.totals_finalized? or
+                    @resume_state == :expired_restart_required
+                }
               >
                 {payment_button_label(@resume_state)}
               </.button>
@@ -553,6 +617,12 @@ defmodule StoreWeb.CheckoutLive.Placeholder do
 
       "OUT_OF_STOCK" ->
         "One or more items are no longer available. Review your cart and try again."
+
+      "INVALID_ADDRESS" when context == :finalize ->
+        "Enter a valid billing country and region."
+
+      "TAX_RATE_NOT_FOUND" when context == :finalize ->
+        "Tax could not be calculated for this location."
 
       _ ->
         fallback_checkout_error_message(context)

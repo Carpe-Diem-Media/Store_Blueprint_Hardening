@@ -38,7 +38,7 @@ defmodule Store.Payments.Providers.Behaviour do
   @callback verify_webhook(map(), binary(), keyword()) ::
               {:ok, map()} | {:error, term()}
 
-  @callback normalize_webhook(map()) :: {:ok, CanonicalReceipt.t()} | {:error, term()}
+  @callback normalize_webhook(map()) :: {:ok, CanonicalReceipt.t()} | :ignore | {:error, term()}
 
   @callback observe_payment(map(), keyword()) ::
               {:ok, ProviderObservation.t()} | {:error, term()}

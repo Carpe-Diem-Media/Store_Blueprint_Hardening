@@ -9,6 +9,107 @@ defmodule StoreWeb.WebhookControllerTest do
   alias Store.Workers.ProcessRefundWebhookReceiptWorker
   alias Store.Workers.ProcessWebhookReceiptWorker
 
+  setup do
+    {:ok, initial_receipt_count: webhook_receipt_count()}
+  end
+
+  test "Paystack acknowledges after enqueue and repairs a missing handoff on resend", %{
+    conn: conn,
+    initial_receipt_count: initial_receipt_count
+  } do
+    configure_paystack_signing!()
+    raw_body = paystack_event()
+    response = post_paystack(conn, raw_body)
+    assert %{"data" => %{"webhook_receipt_id" => receipt_id}} = json_response(response, 200)
+
+    receipt = Store.Repo.get!(WebhookReceipt, receipt_id)
+    assert receipt.provider_event_id == "charge.success:123456"
+    assert receipt.payload_sha256 == Base.encode16(:crypto.hash(:sha256, raw_body), case: :lower)
+    assert receipt.headers == %{}
+    refute receipt.raw_body =~ "AUTH_fixture"
+    refute receipt.raw_body =~ "payer@example.test"
+
+    assert [job] = all_enqueued(worker: ProcessWebhookReceiptWorker)
+    assert {:ok, _job} = Store.DirectRepo.delete(job)
+
+    parent = self()
+    handler_id = {__MODULE__, :paystack_replay, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:store, :payments, :webhook_received],
+      fn _, _, metadata, _ -> send(parent, {:paystack_receipt, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    resend = post_paystack(recycle(conn), raw_body, -1)
+    assert json_response(resend, 200)["data"]["webhook_receipt_id"] == receipt_id
+    assert_receive {:paystack_receipt, %{receipt_id: ^receipt_id, duplicate: true}}
+
+    replay = post_paystack(recycle(conn), raw_body)
+    assert json_response(replay, 200)["data"]["webhook_receipt_id"] == receipt_id
+
+    assert [%Oban.Job{args: %{"webhook_receipt_id" => ^receipt_id}}] =
+             all_enqueued(worker: ProcessWebhookReceiptWorker)
+
+    assert webhook_receipt_count() == initial_receipt_count + 1
+  end
+
+  test "Paystack acknowledges a signed ping and rejects unsigned events", %{
+    conn: conn,
+    initial_receipt_count: initial_receipt_count
+  } do
+    configure_paystack_signing!()
+    assert response(post_paystack(conn, ~s({"event":"ping"})), 200) == ""
+
+    invalid =
+      conn
+      |> recycle()
+      |> put_req_header("content-type", "application/json")
+      |> post(~p"/api/webhooks/paystack", paystack_event())
+
+    assert json_response(invalid, 401)["errors"]["code"] == "PAYMENT_SIGNATURE_MISSING"
+    assert webhook_receipt_count() == initial_receipt_count
+    refute_enqueued(worker: ProcessWebhookReceiptWorker)
+  end
+
+  defp configure_paystack_signing! do
+    previous = Application.get_env(:store, :payments, [])
+    config = [webhook_signing_secret: "whsec_controller_fixture"]
+    Application.put_env(:store, :payments, Keyword.put(previous, :paystack, config))
+    on_exit(fn -> Application.put_env(:store, :payments, previous) end)
+  end
+
+  defp post_paystack(conn, raw_body, clock_offset \\ 0) do
+    timestamp = Integer.to_string(System.system_time(:second) + clock_offset)
+    signed = [timestamp, ".", raw_body]
+    digest = :crypto.mac(:hmac, :sha512, "whsec_controller_fixture", signed)
+    signature = "t=#{timestamp},v1=whk_fixture:" <> Base.encode16(digest, case: :lower)
+
+    conn
+    |> put_req_header("content-type", "application/json")
+    |> put_req_header("paystack-signature", signature)
+    |> post(~p"/api/webhooks/paystack", raw_body)
+  end
+
+  defp paystack_event do
+    Jason.encode!(%{
+      event: "charge.success",
+      data: %{
+        id: 123_456,
+        status: "success",
+        reference: "checkout-018f4a1c7b2d7a918f0162e0a3c4b5d6",
+        domain: "test",
+        amount: 1000,
+        currency: "ZAR",
+        authorization: %{authorization_code: "AUTH_fixture"},
+        customer: %{email: "payer@example.test"}
+      }
+    })
+  end
+
   test "controller stores raw receipt, enqueues worker, and leaves transition to worker", %{
     conn: conn
   } do
@@ -146,7 +247,10 @@ defmodule StoreWeb.WebhookControllerTest do
     )
   end
 
-  test "missing stripe signature is rejected", %{conn: conn} do
+  test "missing stripe signature is rejected", %{
+    conn: conn,
+    initial_receipt_count: initial_receipt_count
+  } do
     payment_intent = create_submitted_payment_intent!()
     raw_body = stripe_payment_event_raw_body(payment_intent, "evt_sig_missing_001")
 
@@ -159,10 +263,13 @@ defmodule StoreWeb.WebhookControllerTest do
 
     refute_enqueued(worker: ProcessWebhookReceiptWorker)
     refute_enqueued(worker: ProcessRefundWebhookReceiptWorker)
-    assert webhook_receipt_count() == 0
+    assert webhook_receipt_count() == initial_receipt_count
   end
 
-  test "invalid stripe signature is rejected", %{conn: conn} do
+  test "invalid stripe signature is rejected", %{
+    conn: conn,
+    initial_receipt_count: initial_receipt_count
+  } do
     payment_intent = create_submitted_payment_intent!()
     raw_body = stripe_payment_event_raw_body(payment_intent, "evt_sig_invalid_001")
 
@@ -176,10 +283,13 @@ defmodule StoreWeb.WebhookControllerTest do
 
     refute_enqueued(worker: ProcessWebhookReceiptWorker)
     refute_enqueued(worker: ProcessRefundWebhookReceiptWorker)
-    assert webhook_receipt_count() == 0
+    assert webhook_receipt_count() == initial_receipt_count
   end
 
-  test "unknown provider is rejected before persistence", %{conn: conn} do
+  test "unknown provider is rejected before persistence", %{
+    conn: conn,
+    initial_receipt_count: initial_receipt_count
+  } do
     raw_body = Jason.encode!(%{"id" => "evt_unknown_provider"})
 
     conn =
@@ -191,7 +301,7 @@ defmodule StoreWeb.WebhookControllerTest do
 
     refute_enqueued(worker: ProcessWebhookReceiptWorker)
     refute_enqueued(worker: ProcessRefundWebhookReceiptWorker)
-    assert webhook_receipt_count() == 0
+    assert webhook_receipt_count() == initial_receipt_count
   end
 
   test "signature verification uses exact raw body bytes", %{conn: conn} do

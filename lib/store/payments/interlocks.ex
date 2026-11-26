@@ -14,6 +14,7 @@ defmodule Store.Payments.Interlocks do
 
   alias Store.Payments.{
     ObservationEvidence,
+    ObservationReconciliation,
     PaymentAttempt,
     PaymentIntent,
     PaymentOutcomeCertification,
@@ -23,6 +24,7 @@ defmodule Store.Payments.Interlocks do
     WebhookReceipt
   }
 
+  alias Store.Payments.Inputs.ObservePaymentIntentInput
   alias Store.Payments.Inputs.RenewalOrderPaymentApplicationInput
   alias Store.Payments.Inputs.RenewalPaymentApplicationInput
   alias Store.Payments.Inputs.ValidateRenewalCollectionOutcomeInput
@@ -74,7 +76,35 @@ defmodule Store.Payments.Interlocks do
 
   @spec process_payment_webhook_receipt(WebhookReceipt.t(), keyword()) ::
           :ok | {:discard, String.t()} | {:error, term()}
-  def process_payment_webhook_receipt(%WebhookReceipt{} = receipt, _opts \\ []) do
+  def process_payment_webhook_receipt(receipt, opts \\ [])
+
+  def process_payment_webhook_receipt(
+        %WebhookReceipt{provider: :paystack, processing_status: "processed"},
+        _opts
+      ),
+      do: :ok
+
+  def process_payment_webhook_receipt(%WebhookReceipt{provider: :paystack} = receipt, _opts) do
+    with :ok <- ensure_receipt_verified(receipt),
+         :ok <- Providers.ensure_enabled_provider(:paystack),
+         {:ok, payload} <- decode_webhook_payload(receipt.raw_body),
+         {:ok, canonical} <- normalize_canonical_receipt(:paystack, payload),
+         {:ok, payment_intent} <- fetch_paystack_checkout(canonical.provider_request_reference),
+         {:ok, verified} <- verify_paystack_checkout(payment_intent, canonical),
+         {:ok, _event_key} <- ingest_provider_event(receipt, canonical),
+         {:ok, %{outcome: outcome}}
+         when outcome in [:authoritative_success, :already_applied_success] <-
+           apply_observed_payment_outcome(verified) do
+      :ok
+    else
+      :ignore -> {:discard, "Paystack event is outside sandbox checkout"}
+      {:ok, _outcome} -> paystack_outcome_unresolved()
+      {:discard, _} = result -> result
+      {:error, _} = result -> result
+    end
+  end
+
+  def process_payment_webhook_receipt(%WebhookReceipt{} = receipt, _opts) do
     with :ok <- ensure_receipt_verified(receipt),
          :ok <- Providers.ensure_enabled_provider(receipt.provider),
          {:ok, payload} <- decode_webhook_payload(receipt.raw_body),
@@ -98,6 +128,51 @@ defmodule Store.Payments.Interlocks do
       {:discard, reason} -> {:discard, reason}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp fetch_paystack_checkout(reference) do
+    case fetch_payment_intent_by_provider_request_reference(:paystack, reference) do
+      {:ok, %PaymentIntent{purpose: :order_checkout} = intent} -> {:ok, intent}
+      {:ok, _intent} -> {:discard, "Paystack checkout reference has no Store payment intent"}
+      {:error, _} = result -> result
+    end
+  end
+
+  defp verify_paystack_checkout(payment_intent, %CanonicalReceipt{
+         provider_payment_id: transaction_id,
+         amount_minor: amount,
+         currency: currency,
+         provider_environment: environment
+       }) do
+    input = %ObservePaymentIntentInput{payment_intent_id: payment_intent.id}
+
+    case ObservationReconciliation.observe_payment_intent(input) do
+      {:ok,
+       %{
+         eligibility: :eligible,
+         observation: %ProviderObservation{
+           provider_transaction_id: ^transaction_id,
+           amount_minor: ^amount,
+           currency: ^currency,
+           provider_environment: ^environment
+         }
+       } = verified} ->
+        {:ok, verified}
+
+      {:ok, _observation} ->
+        paystack_outcome_unresolved()
+
+      {:error, _} = result ->
+        result
+    end
+  end
+
+  defp paystack_outcome_unresolved do
+    {:error,
+     Error.new(
+       "PAYMENT_OUTCOME_UNRESOLVED",
+       "Paystack webhook and checkout verification do not match"
+     )}
   end
 
   @spec apply_payment_success_once(PaymentIntent.t() | String.t(), keyword()) ::
@@ -569,7 +644,6 @@ defmodule Store.Payments.Interlocks do
                :payment_succeeded
              ),
            :ok <- maybe_enqueue_fulfillment(result),
-           :ok <- maybe_enqueue_digital_grants(result, renewal_attempt_lookup),
            :ok <-
              maybe_record_renewal_collection_outcome(
                payment_intent,
@@ -643,6 +717,25 @@ defmodule Store.Payments.Interlocks do
     with {:ok, preflight_intent} <- read_preflight_payment_intent(request) do
       create_or_reuse_payment_intent_from_preflight(request, preflight_intent, ash_opts)
     end
+  end
+
+  defp create_or_reuse_payment_intent_from_preflight(
+         %{provider: :paystack, provider_request_reference: reference, payment_intent_key: key},
+         %PaymentIntent{
+           provider: :paystack,
+           provider_request_reference: nil,
+           purpose: :order_checkout,
+           payment_intent_key: key
+         },
+         _ash_opts
+       )
+       when is_binary(reference) do
+    {:error,
+     Error.new(
+       "PAYMENT_OUTCOME_UNRESOLVED",
+       "This payment needs a support review.",
+       %{reason: :missing_durable_reference}
+     )}
   end
 
   defp create_or_reuse_payment_intent_from_preflight(
@@ -1734,12 +1827,14 @@ defmodule Store.Payments.Interlocks do
              current_intent,
              renewal_attempt_lookup,
              certified_payment_attempt_id
-           ) do
+           ),
+         result = apply_once_result(status, updated_order, updated_intent),
+         :ok <- maybe_enqueue_digital_grants(result, renewal_attempt_lookup) do
       notifications = intent_notifications ++ order_notifications
 
       {:ok,
        %{
-         result: apply_once_result(status, updated_order, updated_intent),
+         result: result,
          renewal_attempt_lookup: renewal_attempt_lookup,
          inventory_variant_ids_to_invalidate:
            Map.get(settlement_result, :inventory_variant_ids_to_invalidate, [])
@@ -1834,28 +1929,26 @@ defmodule Store.Payments.Interlocks do
          %PaymentIntent{state: state} = payment_intent,
          _verified_correction?
        )
-       when state in [:submitted, :requires_action] do
-    payment_intent
-    |> Ash.Changeset.for_update(:mark_succeeded, %{}, context: %{system?: true})
-    |> Ash.update(payment_ash_opts(return_notifications?: true))
-    |> case do
-      {:ok, updated_intent, notifications} -> {:ok, updated_intent, notifications}
-      {:error, reason} -> {:error, reason}
-    end
-  end
+       when state in [:submitted, :requires_action],
+       do: mark_payment_intent_succeeded(payment_intent, :mark_succeeded)
+
+  defp maybe_mark_payment_intent_succeeded(
+         %PaymentIntent{
+           state: :created,
+           provider: :paystack,
+           purpose: :order_checkout,
+           provider_request_reference: reference
+         } = payment_intent,
+         true
+       )
+       when is_binary(reference) and reference != "",
+       do: mark_payment_intent_succeeded(payment_intent, :recover_verified_paystack_checkout)
 
   defp maybe_mark_payment_intent_succeeded(
          %PaymentIntent{state: :failed} = payment_intent,
          true
-       ) do
-    payment_intent
-    |> Ash.Changeset.for_update(:correct_to_succeeded, %{}, context: %{system?: true})
-    |> Ash.update(payment_ash_opts(return_notifications?: true))
-    |> case do
-      {:ok, updated_intent, notifications} -> {:ok, updated_intent, notifications}
-      {:error, reason} -> {:error, reason}
-    end
-  end
+       ),
+       do: mark_payment_intent_succeeded(payment_intent, :correct_to_succeeded)
 
   defp maybe_mark_payment_intent_succeeded(_payment_intent, _verified_correction?) do
     {:error,
@@ -1863,6 +1956,12 @@ defmodule Store.Payments.Interlocks do
        "PAYMENT_EVENT_UNVERIFIED",
        "payment intent is not in a success-transitionable state"
      )}
+  end
+
+  defp mark_payment_intent_succeeded(payment_intent, action) do
+    payment_intent
+    |> Ash.Changeset.for_update(action, %{}, context: %{system?: true})
+    |> Ash.update(payment_ash_opts(return_notifications?: true))
   end
 
   defp maybe_mark_payment_intent_failed(%PaymentIntent{state: :failed}),
@@ -2093,6 +2192,10 @@ defmodule Store.Payments.Interlocks do
 
   defp maybe_enqueue_order_receipt(_result), do: :ok
 
+  defp maybe_enqueue_fulfillment(%{order: %Order{billing_country_code: country}})
+       when is_binary(country),
+       do: :ok
+
   defp maybe_enqueue_fulfillment(%{applied?: true, order: %Order{} = order}) do
     case SubscriptionsFacade.order_is_subscription_only_for_system(order.id) do
       {:ok, true} ->
@@ -2140,7 +2243,13 @@ defmodule Store.Payments.Interlocks do
   end
 
   defp maybe_enqueue_digital_grants(%{applied?: true, order: %Order{} = order}, :none) do
-    enqueue_digital_grants(order.id)
+    case DigitalFacade.enqueue_paid_order_download_grants_for_system(order.id) do
+      {:ok, _job} ->
+        :ok
+
+      {:error, _reason} ->
+        {:error, Error.new("INTERNAL_ERROR", "Unable to queue paid order download grants")}
+    end
   end
 
   defp maybe_enqueue_digital_grants(
@@ -2155,20 +2264,6 @@ defmodule Store.Payments.Interlocks do
   end
 
   defp maybe_enqueue_digital_grants(_result, _renewal_attempt_lookup), do: :ok
-
-  defp enqueue_digital_grants(order_id) do
-    case DigitalFacade.enqueue_paid_order_download_grants_for_system(order_id) do
-      {:ok, _job} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning(
-          "issue_digital_grants_enqueue_failed order_id=#{order_id} reason=#{inspect(reason)}"
-        )
-
-        :ok
-    end
-  end
 
   defp maybe_enqueue_subscriptions(
          %{order: %Order{} = order},

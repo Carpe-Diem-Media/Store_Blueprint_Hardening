@@ -125,6 +125,10 @@ defmodule StoreWeb.PaymentCallbackController do
     end
   end
 
+  defp verify_and_normalize(:paystack, _headers, _raw_body, _route) do
+    {:error, Error.new("PAYMENT_PROVIDER_UNSUPPORTED", "Paystack events use the webhook route")}
+  end
+
   defp verify_and_normalize(provider, headers, raw_body, route) do
     PaymentIngressTelemetry.measure(:verify, route, provider, fn ->
       with {:ok, payload} <- Providers.verify_webhook(provider, headers, raw_body, []) do
